@@ -3,7 +3,7 @@ modules = ["nodejs-24"]
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
-build = ["sh", "-c", "pnpm install && pnpm run build"]
+build = ["sh", "-c", "pnpm install && pnpm --filter @workspace/api-server run build"]
 run = ["sh", "-c", "cd artifacts/api-server && pnpm start"]
 
 [deployment.postBuild]
