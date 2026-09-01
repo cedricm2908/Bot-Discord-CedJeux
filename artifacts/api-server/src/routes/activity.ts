@@ -14,6 +14,7 @@ const router: IRouter = Router();
 
 const CLIENT_ID = process.env["DISCORD_CLIENT_ID"] ?? "1544005975307059250";
 const CLIENT_SECRET = process.env["DISCORD_CLIENT_SECRET"];
+const REDIRECT_URI = "https://cedricm2908.github.io/CedJeux/activity/";
 
 router.post("/activity/token", async (req, res) => {
   try {
@@ -31,6 +32,7 @@ router.post("/activity/token", async (req, res) => {
       client_secret: CLIENT_SECRET,
       grant_type: "authorization_code",
       code,
+      redirect_uri: REDIRECT_URI,
     });
     const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
