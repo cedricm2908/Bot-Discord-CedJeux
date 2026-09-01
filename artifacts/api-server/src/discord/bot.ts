@@ -18,7 +18,8 @@ import {
   MAX_PLOTS,
   RECIPES,
 } from "./constants";
-import { FarmStore } from "./store";
+import { getFarmStore } from "./sharedStore";
+import type { FarmStore } from "./store";
 import { handleCodexComponent, handleSlashCommand } from "./presenters";
 import { cropById } from "./constants";
 import { isReady } from "./farm";
@@ -157,8 +158,7 @@ async function notifyReadyCrops(client: Client, store: FarmStore): Promise<void>
 }
 
 export async function startDiscordBot(): Promise<void> {
-  const store = new FarmStore();
-  await store.init();
+  const store = await getFarmStore();
   const token = process.env["DISCORD_TOKEN"];
   if (!token) {
     logger.warn("DISCORD_TOKEN absent : le serveur API démarre, mais le bot Discord reste en attente du Secret.");
