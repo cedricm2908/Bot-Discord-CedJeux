@@ -1,6 +1,54 @@
 {
   "version": 1,
-  "players": {},
+  "players": {
+    "440158020274618378": {
+      "userId": "440158020274618378",
+      "coins": 92,
+      "level": 1,
+      "xp": 0,
+      "plots": [
+        {
+          "cropId": null,
+          "plantedAt": null,
+          "notifiedReady": false
+        },
+        {
+          "cropId": null,
+          "plantedAt": null,
+          "notifiedReady": false
+        },
+        {
+          "cropId": null,
+          "plantedAt": null,
+          "notifiedReady": false
+        },
+        {
+          "cropId": null,
+          "plantedAt": null,
+          "notifiedReady": false
+        }
+      ],
+      "inventory": {
+        "wheat": 0,
+        "carrot": 0,
+        "potato": 0,
+        "beetroot": 0,
+        "melon": 0,
+        "pumpkin": 0,
+        "sugar_cane": 0,
+        "cocoa": 0,
+        "nether_wart": 0,
+        "chorus_fruit": 0
+      },
+      "irrigationLevel": 0,
+      "fertilizerLevel": 0,
+      "lastDailyAt": 1788250755486,
+      "autoReplant": false,
+      "weeklySnapshotCoins": 50,
+      "createdAt": 1788250690147,
+      "updatedAt": 1788250755486
+    }
+  },
   "global": {
     "marketMultiplier": 1,
     "previousMarketMultiplier": 1,
@@ -16,6 +64,7 @@
       "bonusMultiplier": 1.6,
       "renewedAt": 1788250348003
     },
-    "weeklyStartedAt": 1788250348003
+    "weeklyStartedAt": 1788250348003,
+    "weatherExpiresAt": null
   }
 }
