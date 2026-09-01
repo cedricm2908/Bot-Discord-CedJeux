@@ -2,7 +2,9 @@ import type {
   CropDefinition,
   CropId,
   GlobalState,
+  PlotSkinId,
   ProductId,
+  QuestType,
   RecipeDefinition,
   WeatherKey,
 } from "./types";
@@ -61,6 +63,39 @@ export const DAILY_COOLDOWN_MS = 20 * 60 * 60 * 1000;
 export const MARKET_INTERVAL_MS = 30 * 60 * 1000;
 export const CONTRACT_INTERVAL_MS = 4 * 60 * 60 * 1000;
 export const WEEKLY_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+export const QUEST_RESET_INTERVAL_MS = 24 * 60 * 60 * 1000;
+export const DAILY_CHALLENGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+export const FORECAST_COST = 15;
+
+export const PLOT_SKINS: Record<
+  PlotSkinId,
+  { name: string; emoji: string; unlockLevel: number; color: string }
+> = {
+  classic: { name: "Classique", emoji: "🟩", unlockLevel: 1, color: "#3f6b2f" },
+  autumn: { name: "Automne", emoji: "🍂", unlockLevel: 8, color: "#a8541f" },
+  snow: { name: "Hiver", emoji: "❄️", unlockLevel: 15, color: "#4f86c6" },
+  desert: { name: "Désert", emoji: "🏜️", unlockLevel: 25, color: "#c9a227" },
+};
+
+export const QUEST_TEMPLATES: readonly {
+  type: QuestType;
+  label: string;
+  target: number;
+  rewardCoins: number;
+}[] = [
+  { type: "harvest", label: "Récolter 10 cultures", target: 10, rewardCoins: 40 },
+  { type: "sell_value", label: "Vendre pour 100 pièces de valeur", target: 100, rewardCoins: 50 },
+  { type: "plant", label: "Planter 5 cultures", target: 5, rewardCoins: 30 },
+];
+
+export const DAILY_CHALLENGE_TARGETS: readonly { cropId: CropId; target: number; rewardCoins: number }[] = [
+  { cropId: "wheat", target: 200, rewardCoins: 80 },
+  { cropId: "carrot", target: 150, rewardCoins: 90 },
+  { cropId: "potato", target: 100, rewardCoins: 110 },
+  { cropId: "beetroot", target: 100, rewardCoins: 110 },
+  { cropId: "melon", target: 60, rewardCoins: 140 },
+  { cropId: "pumpkin", target: 60, rewardCoins: 150 },
+];
 
 export function cropById(id: CropId): CropDefinition {
   const crop = CROPS.find((candidate) => candidate.id === id);
@@ -74,6 +109,24 @@ export function recipeById(id: ProductId): RecipeDefinition {
   return recipe;
 }
 
+export function randomWeatherType(): WeatherKey {
+  return Math.random() < 0.5 ? "rain" : "pests";
+}
+
+export function randomDailyChallenge(now: number) {
+  const pick = DAILY_CHALLENGE_TARGETS[randomBetween(0, DAILY_CHALLENGE_TARGETS.length - 1)];
+  return {
+    cropId: pick.cropId,
+    target: pick.target,
+    progress: 0,
+    contributors: [] as string[],
+    rewardCoins: pick.rewardCoins,
+    startedAt: now,
+    completed: false,
+    rewarded: false,
+  };
+}
+
 export function defaultGlobalState(now = Date.now()): GlobalState {
   return {
     marketMultiplier: 1,
@@ -84,6 +137,7 @@ export function defaultGlobalState(now = Date.now()): GlobalState {
     weatherChangedAt: null,
     weatherExpiresAt: null,
     nextWeatherAt: now + randomBetween(2 * 60 * 60 * 1000, 4 * 60 * 60 * 1000),
+    nextWeatherType: randomWeatherType(),
     contract: {
       cropId: "wheat",
       required: 20,
@@ -92,9 +146,21 @@ export function defaultGlobalState(now = Date.now()): GlobalState {
       renewedAt: now,
     },
     weeklyStartedAt: now,
+    dailyChallenge: randomDailyChallenge(now),
   };
 }
 
 export function randomBetween(min: number, max: number): number {
   return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+export function freshQuests(): import("./types").QuestProgress[] {
+  return QUEST_TEMPLATES.map((template) => ({
+    type: template.type,
+    label: template.label,
+    target: template.target,
+    progress: 0,
+    rewardCoins: template.rewardCoins,
+    claimed: false,
+  }));
 }

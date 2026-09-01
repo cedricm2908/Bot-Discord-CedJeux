@@ -6,6 +6,9 @@ import {
   STARTING_COINS,
   STARTING_PLOTS,
   defaultGlobalState,
+  freshQuests,
+  randomDailyChallenge,
+  randomWeatherType,
 } from "./constants";
 import type { FarmDatabase, PlayerState } from "./types";
 
@@ -32,7 +35,23 @@ function createPlayer(userId: string, now = Date.now()): PlayerState {
     weeklySnapshotCoins: STARTING_COINS,
     createdAt: now,
     updatedAt: now,
+    totalHarvested: 0,
+    quests: freshQuests(),
+    questsResetAt: now,
+    plotSkin: "classic",
+    unlockedSkins: ["classic"],
+    weatherForecast: null,
   };
+}
+
+function migratePlayer(player: PlayerState): PlayerState {
+  player.totalHarvested ??= 0;
+  player.quests ??= freshQuests();
+  player.questsResetAt ??= Date.now();
+  player.plotSkin ??= "classic";
+  player.unlockedSkins ??= ["classic"];
+  if (player.weatherForecast === undefined) player.weatherForecast = null;
+  return player;
 }
 
 export class FarmStore {
@@ -47,6 +66,11 @@ export class FarmStore {
         throw new Error("format de données Farm2Win inconnu");
       }
       parsed.global.weatherExpiresAt ??= null;
+      parsed.global.nextWeatherType ??= randomWeatherType();
+      parsed.global.dailyChallenge ??= randomDailyChallenge(Date.now());
+      for (const player of Object.values(parsed.players)) {
+        migratePlayer(player);
+      }
       this.database = parsed;
     } catch (error) {
       const code = error instanceof Error && "code" in error ? error.code : "";
@@ -67,7 +91,7 @@ export class FarmStore {
   getPlayer(userId: string): PlayerState {
     const database = this.getDatabase();
     const player = database.players[userId] ?? createPlayer(userId);
-    database.players[userId] = player;
+    database.players[userId] = migratePlayer(player);
     return player;
   }
 

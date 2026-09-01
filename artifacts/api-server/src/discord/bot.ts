@@ -8,6 +8,7 @@ import {
 } from "discord.js";
 import { logger } from "../lib/logger";
 import {
+  distributeDailyChallengeReward,
   enrichGlobalState,
   resetWeeklyIfNeeded,
 } from "./farm";
@@ -175,14 +176,18 @@ export async function startDiscordBot(): Promise<void> {
       logger.info("Discord gateway ready; synchronizing CedJeux commands");
       const globalChanged = enrichGlobalState(store.global);
       const weeklyChanged = resetWeeklyIfNeeded(store);
-      if (globalChanged || weeklyChanged) await store.save();
+      const challengeChanged = distributeDailyChallengeReward(store);
+      if (globalChanged || weeklyChanged || challengeChanged) await store.save();
       await registerCommands(readyClient);
       readyClient.user.setActivity("Farm2Win · /list");
       logger.info({ tag: readyClient.user.tag, guilds: readyClient.guilds.cache.size }, "CedJeux Discord bot ready");
       await notifyReadyCrops(readyClient, store);
       setInterval(() => {
         void (async () => {
-          const changed = enrichGlobalState(store.global) || resetWeeklyIfNeeded(store);
+          const changed =
+            enrichGlobalState(store.global) ||
+            resetWeeklyIfNeeded(store) ||
+            distributeDailyChallengeReward(store);
           if (changed) await store.save();
           await notifyReadyCrops(readyClient, store);
         })().catch((error) => logger.error({ err: error }, "Farm2Win scheduler failed"));

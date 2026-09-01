@@ -41,6 +41,19 @@ export interface Plot {
   notifiedReady: boolean;
 }
 
+export type QuestType = "harvest" | "sell_value" | "plant";
+
+export interface QuestProgress {
+  type: QuestType;
+  label: string;
+  target: number;
+  progress: number;
+  rewardCoins: number;
+  claimed: boolean;
+}
+
+export type PlotSkinId = "classic" | "autumn" | "snow" | "desert";
+
 export interface PlayerState {
   userId: string;
   coins: number;
@@ -55,6 +68,12 @@ export interface PlayerState {
   weeklySnapshotCoins: number;
   createdAt: number;
   updatedAt: number;
+  totalHarvested: number;
+  quests: QuestProgress[];
+  questsResetAt: number;
+  plotSkin: PlotSkinId;
+  unlockedSkins: PlotSkinId[];
+  weatherForecast: WeatherKey | null;
 }
 
 export interface ContractState {
@@ -63,6 +82,17 @@ export interface ContractState {
   remaining: number;
   bonusMultiplier: number;
   renewedAt: number;
+}
+
+export interface DailyChallengeState {
+  cropId: CropId;
+  target: number;
+  progress: number;
+  contributors: string[];
+  rewardCoins: number;
+  startedAt: number;
+  completed: boolean;
+  rewarded: boolean;
 }
 
 export interface GlobalState {
@@ -74,8 +104,10 @@ export interface GlobalState {
   weatherChangedAt: number | null;
   weatherExpiresAt: number | null;
   nextWeatherAt: number;
+  nextWeatherType: WeatherKey;
   contract: ContractState;
   weeklyStartedAt: number;
+  dailyChallenge: DailyChallengeState;
 }
 
 export interface FarmDatabase {

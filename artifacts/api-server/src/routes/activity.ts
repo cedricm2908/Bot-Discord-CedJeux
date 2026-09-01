@@ -1,10 +1,13 @@
 import { Router, type IRouter } from "express";
 import { getFarmStore } from "../discord/sharedStore";
-import { CROPS, RECIPES } from "../discord/constants";
+import { CROPS, PLOT_SKINS, RECIPES } from "../discord/constants";
 import {
   FarmError,
   buyUpgrade,
+  buyWeatherForecast,
+  chooseSkin,
   claimDaily,
+  claimQuest,
   craft,
   currentCropPrice,
   growMinutes,
@@ -12,12 +15,14 @@ import {
   isReady,
   harvest,
   plant,
+  resetQuestsIfNeeded,
   sell,
   totalInventoryValue,
+  unlockedAchievements,
   xpToNextLevel,
 } from "../discord/farm";
 import type { FarmStore } from "../discord/store";
-import type { CropId, InventoryId, PlayerState, ProductId } from "../discord/types";
+import type { CropId, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
 
 const router: IRouter = Router();
 
@@ -74,6 +79,28 @@ function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: Fa
       weather: store.global.weather,
       marketMultiplier: store.global.marketMultiplier,
     },
+    totalHarvested: player.totalHarvested,
+    quests: player.quests,
+    achievements: unlockedAchievements(player).map((achievement) => ({
+      id: achievement.id,
+      label: achievement.label,
+      emoji: achievement.emoji,
+    })),
+    plotSkin: player.plotSkin,
+    skins: (Object.keys(PLOT_SKINS) as PlotSkinId[]).map((id) => ({
+      id,
+      ...PLOT_SKINS[id],
+      unlocked: player.unlockedSkins.includes(id) || player.level >= PLOT_SKINS[id].unlockLevel,
+    })),
+    dailyChallenge: {
+      cropId: store.global.dailyChallenge.cropId,
+      target: store.global.dailyChallenge.target,
+      progress: store.global.dailyChallenge.progress,
+      rewardCoins: store.global.dailyChallenge.rewardCoins,
+      completed: store.global.dailyChallenge.completed,
+      contributed: store.global.dailyChallenge.contributors.includes(player.userId),
+    },
+    weatherForecast: player.weatherForecast,
   };
 }
 
@@ -124,6 +151,7 @@ router.get("/activity/me", async (req, res) => {
     }
     const store = await getFarmStore();
     const player = store.getPlayer(discordUser.id);
+    if (resetQuestsIfNeeded(player)) await store.save();
     res.json(buildMePayload(discordUser, player, store));
   } catch (error) {
     res.status(500).json({
@@ -292,6 +320,84 @@ router.post("/activity/daily", async (req, res) => {
     const store = await getFarmStore();
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       claimDaily(p);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/quest-claim", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const questIndex = typeof req.body?.questIndex === "number" ? req.body.questIndex : -1;
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      claimQuest(p, questIndex);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/skin", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const skinId = req.body?.skinId as PlotSkinId | undefined;
+    if (!skinId) {
+      res.status(400).json({ error: "Thème invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      chooseSkin(p, skinId);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/forecast", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      buyWeatherForecast(p, store.global);
     });
     res.json(buildMePayload(discordUser, player, store));
   } catch (error) {

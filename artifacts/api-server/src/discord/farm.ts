@@ -1,17 +1,24 @@
 import {
   CONTRACT_INTERVAL_MS,
   CROPS,
+  DAILY_CHALLENGE_INTERVAL_MS,
   DAILY_COOLDOWN_MS,
+  FORECAST_COST,
   MAX_FERTILIZER,
   MAX_IRRIGATION,
   MAX_PLOTS,
   MARKET_INTERVAL_MS,
+  PLOT_SKINS,
+  QUEST_RESET_INTERVAL_MS,
   RECIPES,
   STARTING_PLOTS,
   WEEKLY_INTERVAL_MS,
   WEATHER_INFO,
   cropById,
+  freshQuests,
   randomBetween,
+  randomDailyChallenge,
+  randomWeatherType,
   recipeById,
 } from "./constants";
 import type {
@@ -19,7 +26,9 @@ import type {
   GlobalState,
   InventoryId,
   PlayerState,
+  PlotSkinId,
   ProductId,
+  QuestType,
   WeatherKey,
 } from "./types";
 import { FarmStore } from "./store";
@@ -92,13 +101,14 @@ export function enrichGlobalState(global: GlobalState, now = Date.now()): boolea
   }
 
   if (now >= global.nextWeatherAt) {
-    const weather: WeatherKey = Math.random() < 0.5 ? "rain" : "pests";
+    const weather: WeatherKey = global.nextWeatherType;
     global.weather = weather;
     global.weatherMultiplier = WEATHER_INFO[weather].multiplier;
     global.weatherChangedAt = now;
     global.weatherExpiresAt =
       now + randomBetween(30 * 60 * 1000, 60 * 60 * 1000);
     global.nextWeatherAt = global.weatherExpiresAt;
+    global.nextWeatherType = randomWeatherType();
     changed = true;
   } else if (
     global.weather !== "normal" &&
@@ -129,7 +139,24 @@ export function enrichGlobalState(global: GlobalState, now = Date.now()): boolea
     changed = true;
   }
 
+  if (now - global.dailyChallenge.startedAt >= DAILY_CHALLENGE_INTERVAL_MS) {
+    global.dailyChallenge = randomDailyChallenge(now);
+    changed = true;
+  }
+
   return changed;
+}
+
+export function distributeDailyChallengeReward(store: FarmStore): boolean {
+  const challenge = store.global.dailyChallenge;
+  if (!challenge.completed || challenge.rewarded) return false;
+  for (const userId of challenge.contributors) {
+    const player = store.getPlayer(userId);
+    player.coins += challenge.rewardCoins;
+    player.updatedAt = Date.now();
+  }
+  challenge.rewarded = true;
+  return true;
 }
 
 export function resetWeeklyIfNeeded(store: FarmStore, now = Date.now()): boolean {
@@ -157,6 +184,81 @@ export function assertCropUnlocked(player: PlayerState, cropId: CropId): void {
   }
 }
 
+export function resetQuestsIfNeeded(player: PlayerState, now = Date.now()): boolean {
+  if (now - player.questsResetAt < QUEST_RESET_INTERVAL_MS) return false;
+  player.quests = freshQuests();
+  player.questsResetAt = now;
+  return true;
+}
+
+function trackQuestProgress(player: PlayerState, type: QuestType, amount: number): void {
+  for (const quest of player.quests) {
+    if (quest.type === type && !quest.claimed) {
+      quest.progress = Math.min(quest.target, quest.progress + amount);
+    }
+  }
+}
+
+export function claimQuest(player: PlayerState, questIndex: number): number {
+  const quest = player.quests[questIndex];
+  if (!quest) throw new FarmError("Cette mission n'existe pas.");
+  if (quest.claimed) throw new FarmError("Cette mission a déjà été récupérée.");
+  if (quest.progress < quest.target) throw new FarmError("Cette mission n'est pas encore terminée.");
+  quest.claimed = true;
+  player.coins += quest.rewardCoins;
+  return quest.rewardCoins;
+}
+
+export interface AchievementDefinition {
+  id: string;
+  label: string;
+  emoji: string;
+  check: (player: PlayerState) => boolean;
+}
+
+export const ACHIEVEMENTS: readonly AchievementDefinition[] = [
+  { id: "level10", label: "Niveau 10 atteint", emoji: "⭐", check: (p) => p.level >= 10 },
+  { id: "level25", label: "Niveau 25 atteint", emoji: "🌟", check: (p) => p.level >= 25 },
+  { id: "rich1000", label: "1000 pièces amassées", emoji: "💎", check: (p) => p.coins >= 1000 },
+  { id: "harvest100", label: "100 récoltes cumulées", emoji: "🧺", check: (p) => p.totalHarvested >= 100 },
+  { id: "harvest500", label: "500 récoltes cumulées", emoji: "🏆", check: (p) => p.totalHarvested >= 500 },
+  {
+    id: "chorus",
+    label: "Premier Fruit Chorus récolté",
+    emoji: "🟪",
+    check: (p) => (p.inventory.chorus_fruit ?? 0) > 0,
+  },
+  { id: "plots20", label: "20 parcelles possédées", emoji: "🟫", check: (p) => p.plots.length >= 20 },
+];
+
+export function unlockedAchievements(player: PlayerState): AchievementDefinition[] {
+  return ACHIEVEMENTS.filter((achievement) => achievement.check(player));
+}
+
+export function availableSkins(player: PlayerState): PlotSkinId[] {
+  return (Object.keys(PLOT_SKINS) as PlotSkinId[]).filter(
+    (id) => player.level >= PLOT_SKINS[id].unlockLevel,
+  );
+}
+
+export function chooseSkin(player: PlayerState, skinId: PlotSkinId): void {
+  if (!PLOT_SKINS[skinId]) throw new FarmError("Ce thème n'existe pas.");
+  if (player.level < PLOT_SKINS[skinId].unlockLevel) {
+    throw new FarmError(`Ce thème se débloque au niveau ${PLOT_SKINS[skinId].unlockLevel}.`);
+  }
+  player.plotSkin = skinId;
+  if (!player.unlockedSkins.includes(skinId)) player.unlockedSkins.push(skinId);
+}
+
+export function buyWeatherForecast(player: PlayerState, global: GlobalState): WeatherKey {
+  if (player.coins < FORECAST_COST) {
+    throw new FarmError(`Il te faut ${FORECAST_COST} pièces pour une prévision météo.`);
+  }
+  player.coins -= FORECAST_COST;
+  player.weatherForecast = global.nextWeatherType;
+  return global.nextWeatherType;
+}
+
 export function plant(
   player: PlayerState,
   cropId: CropId,
@@ -180,6 +282,8 @@ export function plant(
   }
   player.coins -= crop.seedCost;
   player.plots[index] = { cropId, plantedAt: now, notifiedReady: false };
+  resetQuestsIfNeeded(player, now);
+  trackQuestProgress(player, "plant", 1);
   return index + 1;
 }
 
@@ -190,6 +294,7 @@ export function harvest(
 ): HarvestResult {
   const harvested: HarvestResult["harvested"] = [];
   let totalXp = 0;
+  let totalHarvestedAmount = 0;
   for (const plot of player.plots) {
     if (!plot.cropId || !isReady(player, player.plots.indexOf(plot), now)) continue;
     const crop = cropById(plot.cropId);
@@ -201,6 +306,16 @@ export function harvest(
     player.inventory[crop.id] = (player.inventory[crop.id] ?? 0) + amount;
     player.xp += crop.xp;
     totalXp += crop.xp;
+    totalHarvestedAmount += amount;
+    if (crop.id === global.dailyChallenge.cropId && !global.dailyChallenge.completed) {
+      global.dailyChallenge.progress += amount;
+      if (!global.dailyChallenge.contributors.includes(player.userId)) {
+        global.dailyChallenge.contributors.push(player.userId);
+      }
+      if (global.dailyChallenge.progress >= global.dailyChallenge.target) {
+        global.dailyChallenge.completed = true;
+      }
+    }
     let replanted = false;
     if (player.autoReplant && player.coins >= crop.seedCost && player.level >= crop.unlockLevel) {
       player.coins -= crop.seedCost;
@@ -218,6 +333,9 @@ export function harvest(
     player.xp -= xpToNextLevel(player.level);
     player.level += 1;
   }
+  player.totalHarvested += totalHarvestedAmount;
+  resetQuestsIfNeeded(player, now);
+  trackQuestProgress(player, "harvest", totalHarvestedAmount);
   return { harvested, totalXp, leveledUpTo: player.level };
 }
 
@@ -257,6 +375,8 @@ export function sell(
   if (!sold.length) throw new FarmError("Tu n'as aucune ressource de ce type à vendre.");
   player.coins += earned;
   global.contract.remaining = Math.max(0, remainingContract);
+  resetQuestsIfNeeded(player);
+  trackQuestProgress(player, "sell_value", earned);
   return { sold, earned };
 }
 
