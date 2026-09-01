@@ -1,0 +1,74 @@
+Construis le bot Discord "CedJeux" en TypeScript avec discord.js, en lisant DISCORD_TOKEN depuis les Secrets Replit.
+
+=== COMMANDE DE BASE ===
+/list : affiche un embed "Mini-jeux disponibles" listant les mini-jeux, avec une constante centralisée (MINI_GAMES) facile à compléter. Pour l'instant elle contient une seule entrée : "🌾 Farm2Win" avec la description "Cultive des ressources façon Minecraft, améliore ta production et deviens numéro 1 de l'économie du serveur !"
+
+=== MINI-JEU FARM2WIN ===
+
+CULTURES (id, nom, emoji, niveau de déblocage, coût de graine, temps de pousse en minutes, rendement de base, prix de base, xp) :
+- wheat, Blé, 🌾, niveau 1, 5 pièces, 5 min, rendement 3, prix 4, xp 2
+- carrot, Carotte, 🥕, niveau 1, 8 pièces, 8 min, rendement 3, prix 6, xp 3
+- potato, Pomme de terre, 🥔, niveau 5, 12 pièces, 12 min, rendement 4, prix 9, xp 5
+- beetroot, Betterave, 🟥, niveau 5, 14 pièces, 14 min, rendement 4, prix 10, xp 5
+- melon, Melon, 🍈, niveau 12, 20 pièces, 20 min, rendement 6, prix 15, xp 8
+- pumpkin, Citrouille, 🎃, niveau 12, 25 pièces, 25 min, rendement 6, prix 18, xp 9
+- sugar_cane, Canne à sucre, 🎋, niveau 20, 35 pièces, 30 min, rendement 8, prix 25, xp 12
+- cocoa, Cacao, 🍫, niveau 20, 40 pièces, 35 min, rendement 8, prix 28, xp 13
+- nether_wart, Verrue du Nether, 🔥, niveau 30, 60 pièces, 45 min, rendement 10, prix 45, xp 20
+- chorus_fruit, Fruit chorus, 🟪, niveau 45, 100 pièces, 60 min, rendement 12, prix 80, xp 35
+
+CONFIG : pièces de départ 50, parcelles de départ 4, parcelles max 40, niveau max irrigation 15, niveau max engrais 20, récompense quotidienne 40 pièces + (niveau × 2) avec cooldown 20h, marché mis à jour toutes les 30 min (multiplicateur entre ×0.65 et ×1.4, variation aléatoire ±0.16 max par mise à jour).
+
+DONNÉES PAR JOUEUR : pièces, niveau, xp, parcelles (culture + horodatage de plantation + flag "notifiedReady"), inventaire (cultures ET produits transformés), niveau irrigation, niveau engrais, horodatage dernière récompense quotidienne, autoReplant (booléen), instantané hebdomadaire de pièces pour le classement.
+
+FORMULES :
+- Seuil xp niveau suivant : round(50 × niveau^1.5) + 50
+- Coût parcelle supplémentaire : round(120 × 1.55^(parcelles actuelles - 4))
+- Coût niveau d'amélioration : round(200 × 1.45^niveau actuel)
+- Temps de pousse réel = temps de base × (1 - min(0.45, niveau irrigation × 0.03))
+- Rendement réel = round(rendement de base × (1 + niveau engrais × 0.05)) × multiplicateur météo au moment de la récolte
+- Prix de vente actuel = round(prix de base × multiplicateur marché), minimum 1
+
+COMMANDES SLASH :
+1. /plant [culture] [parcelle optionnelle] — plante sur une parcelle libre, vérifie niveau/coût
+2. /farm — état des parcelles avec indicateur de stade visuel (🌱 0-33%, 🌿 33-66%, 🌾 66-99%, ✅ prêt)
+3. /harvest — récolte tout ce qui est prêt, ajoute xp, gère la replantation automatique si autoReplant est activé (replante la même culture si assez de pièces)
+4. /inventory — ressources ET produits transformés avec valeur estimée
+5. /sell [culture ou "tout vendre"] [quantité] — vend au prix du marché ; si un contrat spécial actif correspond à la culture vendue, applique le prix bonus sur la portion couverte
+6. /market — prix actuels avec tendance (📈📉➖)
+7. /buy [parcelle/irrigation/engrais] [quantité] — achète des améliorations en boucle
+8. /craft [recette] [quantité] — transforme des cultures en produits (voir recettes plus bas)
+9. /contract — affiche le contrat spécial en cours (voir plus bas)
+10. /profile — niveau, pièces, parcelles, xp, niveaux d'amélioration
+11. /leaderboard — top 10 richesse totale (pièces + valeur inventaire), médailles 🥇🥈🥉
+12. /weekly — top 10 des gains de la semaine en cours (pièces actuelles − instantané début de semaine), médailles
+13. /daily — récompense quotidienne
+14. /codex — voir section dédiée plus bas
+
+RECETTES DE TRANSFORMATION :
+- Pain 🍞 : 3 Blé → 1 Pain, prix de vente 18
+- Tarte à la citrouille 🥧 : 2 Citrouille + 1 Blé → 1 Tarte, prix de vente 55
+- Sirop de canne 🍯 : 4 Canne à sucre → 1 Sirop, prix de vente 95
+
+MÉTÉO GLOBALE : état "normal" / "☔ Pluie bénie" (rendement ×1.25) / "🐛 Invasion de parasites" (rendement ×0.75), change aléatoirement toutes les 2-4h pour une durée de 30-60 min, affichée dans /farm et /codex.
+
+CONTRAT SPÉCIAL : se renouvelle toutes les 4h, culture aléatoire de niveau 1-20, quantité à fournir 20-60, bonus ×1.6 à ×2.0, quantité restante qui diminue via /sell.
+
+CLASSEMENT HEBDOMADAIRE : reset automatique tous les 7 jours (tâche récurrente depuis le démarrage), calcule le classement final avant reset et donne un bonus automatique : 🥇 500, 🥈 300, 🥉 150 pièces. Ne réinitialise JAMAIS les pièces/niveau/inventaire réels, seulement l'instantané de suivi.
+
+=== PANNEAU /codex ===
+Crée une catégorie "🌾 Farm2Win" si elle n'existe pas, un salon privé "farm-{pseudo}" par joueur (permissions restreintes à ce joueur + le bot — nécessite la permission "Gérer les salons"). Si le salon existe déjà, renvoie juste un lien vers celui-ci en éphémère.
+
+Le panneau (embed + composants, mis à jour sur place via interaction.update, jamais de nouveau message) :
+- setAuthor "CEDJEUX · CODEX FARM2WIN"
+- Titre = emoji + nom de la culture sélectionnée
+- Couleur d'embed dynamique par palier : Plaine (niv.1) #3f6b2f, Village (niv.5) #8a6420, Verger (niv.12) #a8541f, Jungle (niv.20) #1f6f60, Nether (niv.30) #8c2f2f, End (niv.45) #5b3c96
+- Thumbnail : image Twemoji correspondant à l'emoji de la culture
+- Description : ligne "Pousse : " + 10 blocs 🟩/⬜ (proportion selon temps de pousse / 60 min max) + "(X min)", en texte simple sans spoiler ni formatage caché ; puis "🟢/🟡/🟠/🔵/🔴/🟣 Palier {nom} · niveau {n}" ; puis "Météo actuelle : {état}"
+- Champs en grille 2 colonnes stricte (insérer un champ invisible name:"\u200b" value:"\u200b" entre chaque paire pour forcer le retour à la ligne) : COÛT GRAINE | PRIX DE VENTE, TEMPS DE POUSSE | RENDEMENT, XP GAGNÉE | MARCHÉ
+- Section "Simulateur de récolte" utilisant les VRAIS niveaux d'irrigation/engrais du joueur : parcelles simulées (ajustable par boutons ➖/➕, défaut = parcelles libres du joueur), coût total, temps réel, récolte totale, profit estimé
+- Menu déroulant de sélection de culture
+- Menu déroulant de filtre par palier (Tous les paliers / Plaine / Village / Verger / Jungle / Nether / End) qui met à jour les options du menu de cultures
+- Boutons : "🌱 Planter cette culture", "🔄 Actualiser le prix", "➖ Parcelles" / "➕ Parcelles", "🔁 Replantation auto : ON/OFF"
+
+Toutes les réponses utilisent des embeds. Enregistre toutes les commandes slash auprès de Discord, démarre le bot, vérifie que le typage passe sans erreur.
