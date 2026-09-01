@@ -1,81 +1,329 @@
-import express from 'express';
-import cors from 'cors';
+import { Router, type IRouter } from "express";
+import { getFarmStore } from "../discord/sharedStore";
+import { CROPS, RECIPES } from "../discord/constants";
+import {
+  FarmError,
+  buyUpgrade,
+  claimDaily,
+  craft,
+  currentCropPrice,
+  growMinutes,
+  growthPercent,
+  isReady,
+  harvest,
+  plant,
+  sell,
+  totalInventoryValue,
+  xpToNextLevel,
+} from "../discord/farm";
+import type { FarmStore } from "../discord/store";
+import type { CropId, InventoryId, PlayerState, ProductId } from "../discord/types";
 
-const REPLIT_BASE = 'https://bot-discord-ced-jeux--cedricmacedonia.replit.app';
+const router: IRouter = Router();
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const CLIENT_ID = process.env["DISCORD_CLIENT_ID"] ?? "1544005975307059250";
+const CLIENT_SECRET = process.env["DISCORD_CLIENT_SECRET"];
+const REDIRECT_URI = "https://cedricm2908.github.io/CedJeux/activity/";
 
-async function forwardGet(path, req, res) {
-  try {
-    const upstream = await fetch(`${REPLIT_BASE}${path}`, {
-      headers: { Authorization: req.headers.authorization ?? '' },
-    });
-    const data = await upstream.json();
-    res.status(upstream.status).json(data);
-  } catch (err) {
-    res.status(502).json({ error: 'Relay error', detail: String(err) });
-  }
+interface DiscordUser {
+  id: string;
+  username: string;
+  global_name?: string;
 }
 
-async function forwardPost(path, req, res) {
-  try {
-    const upstream = await fetch(`${REPLIT_BASE}${path}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: req.headers.authorization ?? '',
-      },
-      body: JSON.stringify(req.body ?? {}),
-    });
-    const data = await upstream.json();
-    res.status(upstream.status).json(data);
-  } catch (err) {
-    res.status(502).json({ error: 'Relay error', detail: String(err) });
-  }
+async function requireDiscordUser(
+  authHeader: string | undefined,
+): Promise<DiscordUser | null> {
+  if (!authHeader?.startsWith("Bearer ")) return null;
+  const accessToken = authHeader.slice("Bearer ".length);
+  const userResponse = await fetch("https://discord.com/api/users/@me", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!userResponse.ok) return null;
+  return (await userResponse.json()) as DiscordUser;
 }
 
-app.get(['/healthz', '/api/healthz'], (_req, res) => {
-  res.json({ status: 'ok', relay: true });
+function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: FarmStore) {
+  const now = Date.now();
+  return {
+    user: { id: discordUser.id, username: discordUser.global_name ?? discordUser.username },
+    coins: player.coins,
+    level: player.level,
+    xp: player.xp,
+    xpToNext: xpToNextLevel(player.level),
+    irrigationLevel: player.irrigationLevel,
+    fertilizerLevel: player.fertilizerLevel,
+    autoReplant: player.autoReplant,
+    inventoryValue: totalInventoryValue(player, store.global),
+    inventory: Object.fromEntries(
+      Object.entries(player.inventory).filter(([, amount]) => (amount ?? 0) > 0),
+    ),
+    plots: player.plots.map((plot, index) => {
+      if (!plot.cropId) return { index, empty: true };
+      return {
+        index,
+        cropId: plot.cropId,
+        ready: isReady(player, index, now),
+        percent: growthPercent(player, index, now),
+        plantedAt: plot.plantedAt,
+        growMinutes: growMinutes(player, plot.cropId),
+        price: currentCropPrice(store.global, plot.cropId),
+      };
+    }),
+    global: {
+      weather: store.global.weather,
+      marketMultiplier: store.global.marketMultiplier,
+    },
+  };
+}
+
+router.post("/activity/token", async (req, res) => {
+  try {
+    const code = req.body?.code;
+    if (!code || typeof code !== "string") {
+      res.status(400).json({ error: "code manquant" });
+      return;
+    }
+    if (!CLIENT_SECRET) {
+      res.status(500).json({ error: "DISCORD_CLIENT_SECRET non configuré" });
+      return;
+    }
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REDIRECT_URI,
+    });
+    const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params,
+    });
+    if (!tokenResponse.ok) {
+      const text = await tokenResponse.text();
+      res.status(502).json({ error: "Échange du code impossible", detail: text });
+      return;
+    }
+    const tokenData = (await tokenResponse.json()) as { access_token: string };
+    res.json({ access_token: tokenData.access_token });
+  } catch (error) {
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
-app.post(['/activity/token', '/api/activity/token'], (req, res) =>
-  forwardPost('/api/activity/token', req, res),
-);
-app.get(['/activity/me', '/api/activity/me'], (req, res) =>
-  forwardGet('/api/activity/me', req, res),
-);
-app.get(['/activity/crops', '/api/activity/crops'], (req, res) =>
-  forwardGet('/api/activity/crops', req, res),
-);
-app.post(['/activity/plant', '/api/activity/plant'], (req, res) =>
-  forwardPost('/api/activity/plant', req, res),
-);
-app.post(['/activity/harvest', '/api/activity/harvest'], (req, res) =>
-  forwardPost('/api/activity/harvest', req, res),
-);
-app.post(['/activity/sell', '/api/activity/sell'], (req, res) =>
-  forwardPost('/api/activity/sell', req, res),
-);
-app.post(['/activity/buy', '/api/activity/buy'], (req, res) =>
-  forwardPost('/api/activity/buy', req, res),
-);
-app.post(['/activity/craft', '/api/activity/craft'], (req, res) =>
-  forwardPost('/api/activity/craft', req, res),
-);
-app.post(['/activity/daily', '/api/activity/daily'], (req, res) =>
-  forwardPost('/api/activity/daily', req, res),
-);
-app.post(['/activity/autoreplant', '/api/activity/autoreplant'], (req, res) =>
-  forwardPost('/api/activity/autoreplant', req, res),
-);
-
-app.use((req, res) => {
-  res.status(404).json({ error: 'Relay: no route for', path: req.path });
+router.get("/activity/me", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = store.getPlayer(discordUser.id);
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Relay listening on ${port}, forwarding to ${REPLIT_BASE}`);
+router.get("/activity/crops", (_req, res) => {
+  res.json({ crops: CROPS, recipes: RECIPES });
 });
+
+router.post("/activity/plant", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const cropId = req.body?.cropId as CropId | undefined;
+    const plotNumber = typeof req.body?.plot === "number" ? req.body.plot : null;
+    if (!cropId || !CROPS.some((c) => c.id === cropId)) {
+      res.status(400).json({ error: "Culture invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      plant(p, cropId, plotNumber);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/harvest", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    let result: ReturnType<typeof harvest> | undefined;
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      result = harvest(p, store.global);
+    });
+    if (!result?.harvested.length) {
+      res.status(400).json({ error: "Aucune parcelle n'est prête pour le moment." });
+      return;
+    }
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/sell", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const itemId = (req.body?.itemId as InventoryId | "all" | undefined) ?? "all";
+    const amount = typeof req.body?.amount === "number" ? req.body.amount : null;
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      sell(p, store.global, itemId, amount);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/buy", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const kind = req.body?.kind as "plots" | "irrigation" | "fertilizer" | undefined;
+    const quantity = typeof req.body?.quantity === "number" ? req.body.quantity : 1;
+    if (!kind) {
+      res.status(400).json({ error: "Amélioration invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      buyUpgrade(p, kind, quantity);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/craft", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const recipeId = req.body?.recipeId as ProductId | undefined;
+    const quantity = typeof req.body?.quantity === "number" ? req.body.quantity : 1;
+    if (!recipeId) {
+      res.status(400).json({ error: "Recette invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      craft(p, recipeId, quantity);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/daily", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      claimDaily(p);
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    if (error instanceof FarmError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+router.post("/activity/autoreplant", async (req, res) => {
+  try {
+    const discordUser = await requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const store = await getFarmStore();
+    const player = await store.mutatePlayer(discordUser.id, (p) => {
+      p.autoReplant = !p.autoReplant;
+    });
+    res.json(buildMePayload(discordUser, player, store));
+  } catch (error) {
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+export default router;
