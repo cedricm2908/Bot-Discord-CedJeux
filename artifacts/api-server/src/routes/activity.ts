@@ -1,124 +1,81 @@
-import { Router, type IRouter } from "express";
-import { getFarmStore } from "../discord/sharedStore";
-import { CROPS, RECIPES } from "../discord/constants";
-import {
-  currentCropPrice,
-  growMinutes,
-  growthPercent,
-  isReady,
-  totalInventoryValue,
-  xpToNextLevel,
-} from "../discord/farm";
+import express from 'express';
+import cors from 'cors';
 
-const router: IRouter = Router();
+const REPLIT_BASE = 'https://bot-discord-ced-jeux--cedricmacedonia.replit.app';
 
-const CLIENT_ID = process.env["DISCORD_CLIENT_ID"] ?? "1544005975307059250";
-const CLIENT_SECRET = process.env["DISCORD_CLIENT_SECRET"];
-const REDIRECT_URI = "https://cedricm2908.github.io/CedJeux/activity/";
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-router.post("/activity/token", async (req, res) => {
+async function forwardGet(path, req, res) {
   try {
-    const code = req.body?.code;
-    if (!code || typeof code !== "string") {
-      res.status(400).json({ error: "code manquant" });
-      return;
-    }
-    if (!CLIENT_SECRET) {
-      res.status(500).json({ error: "DISCORD_CLIENT_SECRET non configuré" });
-      return;
-    }
-    const params = new URLSearchParams({
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: REDIRECT_URI,
+    const upstream = await fetch(`${REPLIT_BASE}${path}`, {
+      headers: { Authorization: req.headers.authorization ?? '' },
     });
-    const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params,
-    });
-    if (!tokenResponse.ok) {
-      const text = await tokenResponse.text();
-      res.status(502).json({ error: "Échange du code impossible", detail: text });
-      return;
-    }
-    const tokenData = (await tokenResponse.json()) as { access_token: string };
-    res.json({ access_token: tokenData.access_token });
-  } catch (error) {
-    res.status(500).json({
-      error: "Erreur serveur",
-      detail: error instanceof Error ? error.message : String(error),
-    });
+    const data = await upstream.json();
+    res.status(upstream.status).json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'Relay error', detail: String(err) });
   }
-});
+}
 
-router.get("/activity/me", async (req, res) => {
+async function forwardPost(path, req, res) {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) {
-      res.status(401).json({ error: "Token manquant" });
-      return;
-    }
-    const accessToken = authHeader.slice("Bearer ".length);
-    const userResponse = await fetch("https://discord.com/api/users/@me", {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    if (!userResponse.ok) {
-      res.status(401).json({ error: "Token Discord invalide" });
-      return;
-    }
-    const discordUser = (await userResponse.json()) as {
-      id: string;
-      username: string;
-      global_name?: string;
-    };
-
-    const store = await getFarmStore();
-    const player = store.getPlayer(discordUser.id);
-    const now = Date.now();
-
-    res.json({
-      user: { id: discordUser.id, username: discordUser.global_name ?? discordUser.username },
-      coins: player.coins,
-      level: player.level,
-      xp: player.xp,
-      xpToNext: xpToNextLevel(player.level),
-      irrigationLevel: player.irrigationLevel,
-      fertilizerLevel: player.fertilizerLevel,
-      autoReplant: player.autoReplant,
-      inventoryValue: totalInventoryValue(player, store.global),
-      inventory: Object.fromEntries(
-        Object.entries(player.inventory).filter(([, amount]) => (amount ?? 0) > 0),
-      ),
-      plots: player.plots.map((plot, index) => {
-        if (!plot.cropId) return { index, empty: true };
-        return {
-          index,
-          cropId: plot.cropId,
-          ready: isReady(player, index, now),
-          percent: growthPercent(player, index, now),
-          plantedAt: plot.plantedAt,
-          growMinutes: growMinutes(player, plot.cropId),
-          price: currentCropPrice(store.global, plot.cropId),
-        };
-      }),
-      global: {
-        weather: store.global.weather,
-        marketMultiplier: store.global.marketMultiplier,
+    const upstream = await fetch(`${REPLIT_BASE}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: req.headers.authorization ?? '',
       },
+      body: JSON.stringify(req.body ?? {}),
     });
-  } catch (error) {
-    res.status(500).json({
-      error: "Erreur serveur",
-      detail: error instanceof Error ? error.message : String(error),
-    });
+    const data = await upstream.json();
+    res.status(upstream.status).json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'Relay error', detail: String(err) });
   }
+}
+
+app.get(['/healthz', '/api/healthz'], (_req, res) => {
+  res.json({ status: 'ok', relay: true });
 });
 
-router.get("/activity/crops", (_req, res) => {
-  res.json({ crops: CROPS, recipes: RECIPES });
+app.post(['/activity/token', '/api/activity/token'], (req, res) =>
+  forwardPost('/api/activity/token', req, res),
+);
+app.get(['/activity/me', '/api/activity/me'], (req, res) =>
+  forwardGet('/api/activity/me', req, res),
+);
+app.get(['/activity/crops', '/api/activity/crops'], (req, res) =>
+  forwardGet('/api/activity/crops', req, res),
+);
+app.post(['/activity/plant', '/api/activity/plant'], (req, res) =>
+  forwardPost('/api/activity/plant', req, res),
+);
+app.post(['/activity/harvest', '/api/activity/harvest'], (req, res) =>
+  forwardPost('/api/activity/harvest', req, res),
+);
+app.post(['/activity/sell', '/api/activity/sell'], (req, res) =>
+  forwardPost('/api/activity/sell', req, res),
+);
+app.post(['/activity/buy', '/api/activity/buy'], (req, res) =>
+  forwardPost('/api/activity/buy', req, res),
+);
+app.post(['/activity/craft', '/api/activity/craft'], (req, res) =>
+  forwardPost('/api/activity/craft', req, res),
+);
+app.post(['/activity/daily', '/api/activity/daily'], (req, res) =>
+  forwardPost('/api/activity/daily', req, res),
+);
+app.post(['/activity/autoreplant', '/api/activity/autoreplant'], (req, res) =>
+  forwardPost('/api/activity/autoreplant', req, res),
+);
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Relay: no route for', path: req.path });
 });
 
-export default router;
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Relay listening on ${port}, forwarding to ${REPLIT_BASE}`);
+});
