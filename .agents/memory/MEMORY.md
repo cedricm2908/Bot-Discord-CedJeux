@@ -1,0 +1,1 @@
+- [Workspace dependency scope](workspace-dependency-scope.md) — keep third-party packages in the owning workspace package, not the monorepo root.

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "players": {},
+  "global": {
+    "marketMultiplier": 1,
+    "previousMarketMultiplier": 1,
+    "marketUpdatedAt": 1788250348003,
+    "weather": "normal",
+    "weatherMultiplier": 1,
+    "weatherChangedAt": null,
+    "nextWeatherAt": 1788262699603,
+    "contract": {
+      "cropId": "wheat",
+      "required": 20,
+      "remaining": 20,
+      "bonusMultiplier": 1.6,
+      "renewedAt": 1788250348003
+    },
+    "weeklyStartedAt": 1788250348003
+  }
+}
