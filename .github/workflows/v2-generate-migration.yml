@@ -1,0 +1,71 @@
+name: "V2 - Generate Drizzle migration (temporaire)"
+
+# Workflow TEMPORAIRE, a but unique : produire les fichiers de migration
+# Drizzle pour le schema V2 (8 tables) sur un environnement Linux, puisque
+# `drizzle-kit generate` ne peut pas s'executer sur la machine Windows du
+# developpement local (binaire esbuild win32 absent du monorepo).
+#
+# Ce workflow ne se connecte a AUCUNE base de donnees et n'utilise AUCUN
+# secret : `drizzle-kit generate` ne fait que diffuser le schema TypeScript
+# en SQL, sans jamais ouvrir de connexion reseau. Aucun DATABASE_URL n'est
+# defini ici -- lib/db/drizzle.config.ts retombe sur un placeholder local
+# non fonctionnel quand la variable est absente.
+#
+# A supprimer une fois la premiere migration generee et recuperee.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  generate-migration:
+    # Garde-fou explicite : n'execute rien si jamais declenche depuis une
+    # autre branche que v2-postgres (main comprise).
+    if: github.ref == 'refs/heads/v2-postgres'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout v2-postgres
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Verifie la branche checkoutee
+        run: |
+          echo "Branche : ${{ github.ref_name }}"
+          test "${{ github.ref_name }}" = "v2-postgres"
+
+      - name: Installe Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Installe pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.25.0"
+
+      - name: Installe les dependances (lockfile fige)
+        run: pnpm install --frozen-lockfile
+
+      - name: Genere la migration Drizzle (aucune connexion DB)
+        # Aucune variable DATABASE_URL definie ici, intentionnellement.
+        run: pnpm --filter @workspace/db run generate
+
+      - name: Verifie que lib/db/drizzle/ a ete cree
+        run: |
+          if [ ! -d "lib/db/drizzle" ] || [ -z "$(find lib/db/drizzle -type f)" ]; then
+            echo "Echec : aucun fichier de migration genere dans lib/db/drizzle/."
+            exit 1
+          fi
+
+      - name: Liste les fichiers generes (noms uniquement, aucune variable d'environnement)
+        run: find lib/db/drizzle -type f | sort
+
+      - name: Publie lib/db/drizzle/ comme artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-drizzle-migration
+          path: lib/db/drizzle/
+          retention-days: 14
