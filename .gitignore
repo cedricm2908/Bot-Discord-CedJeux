@@ -47,3 +47,8 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Secrets d'environnement (V2 : jamais de token/DB de test ou de prod commite)
+.env
+.env.*
+!.env.*.example
