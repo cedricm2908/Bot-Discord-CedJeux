@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --test src/**/*.test.ts",
     "diagnose:db": "tsx src/discord/db/diagnose.ts",
-    "diagnose:farm-repository": "tsx src/discord/db/diagnoseFarmRepository.ts"
+    "diagnose:farm-repository": "tsx src/discord/db/diagnoseFarmRepository.ts",
+    "test:save-player-integration": "tsx src/discord/db/testSavePlayerIntegration.ts"
   },
   "dependencies": {
     "@workspace/api-zod": "workspace:*",
