@@ -47,6 +47,42 @@ const EXPECTED_INVENTORY_ENTRY_COUNT = 2;
 const EXPECTED_INITIAL_COINS = 50;
 const MODIFIED_COINS = 51;
 
+// savePlayer() met a jour updatedAt=now() a chaque appel (comportement
+// attendu, voir farmRepository.ts) -- ce n'est donc jamais compare par
+// egalite stricte contre un etat "avant". A la place : les champs metier
+// (tout sauf updatedAt, createdAt INCLUS -- doit rester strictement
+// identique) sont compares par egalite stricte, et updatedAt est verifie
+// separement : valeur valide (nombre fini positif) ET >= une reference
+// (l'updatedAt d'AVANT cet appel precis a savePlayer).
+function assertPlayerStateMatches(
+  actual: PlayerState | null,
+  expectedExceptUpdatedAt: PlayerState,
+  minUpdatedAt: number,
+  context: string,
+): void {
+  assert.ok(actual, `${context} : joueur introuvable.`);
+  const { updatedAt: actualUpdatedAt, ...actualRest } = actual;
+  const { updatedAt: _expectedUpdatedAt, ...expectedRest } = expectedExceptUpdatedAt;
+  assert.deepStrictEqual(
+    actualRest,
+    expectedRest,
+    `${context} : champs metier (hors updatedAt) different de l'attendu -- createdAt inclus dans cette comparaison, doit rester identique.`,
+  );
+  assert.equal(
+    typeof actualUpdatedAt,
+    "number",
+    `${context} : updatedAt doit etre un nombre (epoch ms), recu ${typeof actualUpdatedAt}.`,
+  );
+  assert.ok(
+    Number.isFinite(actualUpdatedAt) && actualUpdatedAt > 0,
+    `${context} : updatedAt doit etre une valeur valide, recu ${actualUpdatedAt}.`,
+  );
+  assert.ok(
+    actualUpdatedAt >= minUpdatedAt,
+    `${context} : updatedAt (${actualUpdatedAt}) doit etre >= la reference attendue (${minUpdatedAt}).`,
+  );
+}
+
 console.log(`[test-save-player] NODE_ENV actuel : ${process.env.NODE_ENV ?? "(non defini)"} (indicatif uniquement, ne bloque pas).`);
 
 if (process.env.ALLOW_SAVEPLAYER_INTEGRATION_TEST !== "yes-saveplayer-test-db") {
@@ -115,6 +151,10 @@ async function run(): Promise<void> {
     // erreurs des deux phases sont capturees separement, jamais l'une
     // n'ecrase l'autre. ---
     const errors: string[] = [];
+    // Reference pour la verification updatedAt de la phase de restauration :
+    // par defaut l'updatedAt initial (si la phase modification n'a jamais
+    // reussi a relire l'etat apres sauvegarde), mise a jour si elle reussit.
+    let updatedAtAfterModify = initialState.updatedAt;
 
     try {
       console.log(`[test-save-player] Modification : coins ${EXPECTED_INITIAL_COINS} -> ${MODIFIED_COINS}...`);
@@ -122,13 +162,16 @@ async function run(): Promise<void> {
       await savePlayer(modifiedState);
 
       const afterModify = await getPlayer(TEST_PLAYER_ID);
-      assert.ok(afterModify, "Relecture apres modification : joueur introuvable.");
-      assert.deepStrictEqual(
+      assertPlayerStateMatches(
         afterModify,
         { ...initialState, coins: MODIFIED_COINS },
-        "Etat apres modification ne correspond pas exactement a l'attendu (coins modifie, reste identique).",
+        initialState.updatedAt,
+        "Apres modification",
       );
-      console.log(`[test-save-player] Modification verifiee avec succes (coins=${MODIFIED_COINS}, reste identique).`);
+      updatedAtAfterModify = afterModify!.updatedAt;
+      console.log(
+        `[test-save-player] Modification verifiee avec succes (coins=${MODIFIED_COINS}, reste identique, updatedAt avance).`,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`Phase modification : ${message}`);
@@ -138,13 +181,8 @@ async function run(): Promise<void> {
       try {
         await savePlayer(initialState);
         const afterRestore = await getPlayer(TEST_PLAYER_ID);
-        assert.ok(afterRestore, "Relecture apres restauration : joueur introuvable.");
-        assert.deepStrictEqual(
-          afterRestore,
-          initialState,
-          "Etat apres restauration ne correspond pas exactement a l'etat initial.",
-        );
-        console.log("[test-save-player] Restauration verifiee avec succes (etat initial retrouve a l'identique).");
+        assertPlayerStateMatches(afterRestore, initialState, updatedAtAfterModify, "Apres restauration");
+        console.log("[test-save-player] Restauration verifiee avec succes (etat initial retrouve, updatedAt avance).");
       } catch (restoreError) {
         const message = restoreError instanceof Error ? restoreError.message : String(restoreError);
         errors.push(
