@@ -20,7 +20,7 @@ import {
   randomDailyChallenge,
   randomWeatherType,
   recipeById,
-} from "./constants";
+} from "./constants.ts";
 import type {
   CropId,
   GlobalState,
@@ -31,7 +31,7 @@ import type {
   QuestType,
   WeatherKey,
 } from "./types";
-import { FarmStore } from "./store";
+import type { FarmStore } from "./store";
 
 export class FarmError extends Error {}
 
@@ -248,6 +248,20 @@ export function chooseSkin(player: PlayerState, skinId: PlotSkinId): void {
   }
   player.plotSkin = skinId;
   if (!player.unlockedSkins.includes(skinId)) player.unlockedSkins.push(skinId);
+}
+
+/**
+ * Bascule la replantation automatique. Aucune contrainte metier (pas de
+ * cout, pas de niveau requis) -- meme comportement que le simple `!` deja
+ * applique directement en V1 dans presenters.ts (bouton codex "replant")
+ * et routes/activity.ts (route /activity/autoreplant), extrait ici en
+ * fonction pure pour que ces deux couches (et la future couche
+ * PostgreSQL) partagent une seule implementation au lieu de dupliquer la
+ * regle.
+ */
+export function toggleAutoReplant(player: PlayerState): boolean {
+  player.autoReplant = !player.autoReplant;
+  return player.autoReplant;
 }
 
 export function buyWeatherForecast(player: PlayerState, global: GlobalState): WeatherKey {
