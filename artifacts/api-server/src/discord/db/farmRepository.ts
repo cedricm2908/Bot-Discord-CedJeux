@@ -20,12 +20,20 @@
 // declencherait immediatement la verification DATABASE_URL de
 // lib/db/src/index.ts des le chargement de ce fichier (donc aussi pendant
 // les tests), ce que ce fichier evite deliberement.
-import { eq, sql } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { toGlobalState } from "./globalStateAdapter.ts";
 import { toPlayerState } from "./playerAdapter.ts";
 import type { GlobalState, PlayerState } from "../types";
 import type { GlobalStateRecord, PlayerRecord } from "@workspace/db/repositories";
-import type { db as DbInstance, NewInventoryItem, NewPlayer, NewPlot, Player } from "@workspace/db";
+import type {
+  db as DbInstance,
+  InventoryItem as InventoryItemRow,
+  NewInventoryItem,
+  NewPlayer,
+  NewPlot,
+  Player,
+  Plot as PlotRow,
+} from "@workspace/db";
 
 export interface FarmRepositoryDeps {
   getPlayerRecord: (playerId: string) => Promise<PlayerRecord | null>;
@@ -91,12 +99,17 @@ export async function getGlobalState(): Promise<GlobalState | null> {
 // PlayerState fourni a ete lu/mute avant l'ouverture de CETTE transaction --
 // un appelant qui ferait `getPlayer()` (hors transaction), mute l'objet, puis
 // appelle `savePlayer()` plus tard reste expose a ce qu'un autre appel
-// concurrent ecrase son resultat. La garantie complete anti-lost-update
-// viendra de la future `mutatePlayer()` : BEGIN -> SELECT ... FOR UPDATE ->
-// reconstruction PlayerState -> mutation metier -> savePlayerWithTx(...) ->
-// COMMIT, le tout dans UNE SEULE transaction ouverte de bout en bout.
-// savePlayerWithTx/savePlayer ne doivent donc pas encore etre branches sur
-// des commandes concurrentes.
+// concurrent ecrase son resultat. La garantie complete anti-lost-update est
+// fournie par `mutatePlayer()` (plus bas dans ce fichier) : BEGIN -> SELECT
+// ... FOR UPDATE -> reconstruction PlayerState -> mutation metier ->
+// ecriture -> COMMIT, le tout dans UNE SEULE transaction ouverte de bout en
+// bout, avec un SEUL SELECT ... FOR UPDATE (mutatePlayer n'appelle jamais
+// savePlayerWithTx -- il ecrit directement via writePlayerStateAssumingLock
+// pour ne pas re-verrouiller une ligne qu'il detient deja). savePlayerWithTx/
+// savePlayer restent la voie a utiliser pour une ecriture autonome (pas de
+// lecture-mutation-ecriture atomique necessaire) ; ils ne doivent pas etre
+// branches sur des commandes concurrentes qui font lire-modifier-ecrire hors
+// transaction.
 //
 // Type du parametre `tx` : derive mecaniquement du type reel de
 // `db.transaction` (via `import type { db }`, efface a la compilation --
@@ -106,11 +119,19 @@ type Tx = Parameters<typeof DbInstance.transaction>[0] extends (tx: infer T, ...
   ? T
   : never;
 
-export interface PlayerWriteDeps {
-  lockAndGetPlayer: (tx: Tx, playerId: string) => Promise<Player | null>;
+// Separee de PlayerWriteDeps (qui ajoute lockAndGetPlayer) pour que
+// writePlayerStateAssumingLock -- le coeur d'ecriture partage par
+// savePlayerWithTx ET mutatePlayer -- ne recoive jamais de quoi reverrouiller
+// le joueur : cette dependance-la n'existe tout simplement pas dans son
+// parametre `deps`.
+export interface PlayerWriteCoreDeps {
   updatePlayerRow: (tx: Tx, playerId: string, values: Omit<NewPlayer, "id" | "createdAt">) => Promise<void>;
   upsertPlots: (tx: Tx, rows: NewPlot[]) => Promise<void>;
   upsertInventoryItems: (tx: Tx, rows: NewInventoryItem[]) => Promise<void>;
+}
+
+export interface PlayerWriteDeps extends PlayerWriteCoreDeps {
+  lockAndGetPlayer: (tx: Tx, playerId: string) => Promise<Player | null>;
 }
 
 // Les tables (players/plots/inventoryItems) sont importees DYNAMIQUEMENT,
@@ -173,6 +194,23 @@ async function realUpsertInventoryItems(tx: Tx, rows: NewInventoryItem[]): Promi
   });
 }
 
+// SELECT sans FOR UPDATE : plots/inventory_items n'ont pas de verrou propre
+// -- elles sont protegees TRANSITIVEMENT par le verrou deja detenu sur la
+// ligne players correspondante (voir le commentaire au-dessus de `type Tx`).
+// Ordre par plot_index PRESERVE : toPlayerState() reconstruit Plot[] par
+// position de tableau, pas par un champ explicite (meme requete que
+// lib/db/src/repositories/playerRepository.ts, mais sur `tx` plutot que
+// `db` pour rester dans la transaction courante).
+async function realGetPlotsForUpdate(tx: Tx, playerId: string): Promise<PlotRow[]> {
+  const { plots } = await getSchemaTables();
+  return tx.select().from(plots).where(eq(plots.playerId, playerId)).orderBy(asc(plots.plotIndex));
+}
+
+async function realGetInventoryItemsForUpdate(tx: Tx, playerId: string): Promise<InventoryItemRow[]> {
+  const { inventoryItems } = await getSchemaTables();
+  return tx.select().from(inventoryItems).where(eq(inventoryItems.playerId, playerId));
+}
+
 const realPlayerWriteDeps: PlayerWriteDeps = {
   lockAndGetPlayer: realLockAndGetPlayer,
   updatePlayerRow: realUpdatePlayerRow,
@@ -181,30 +219,35 @@ const realPlayerWriteDeps: PlayerWriteDeps = {
 };
 
 /**
- * Sauvegarde l'etat complet d'un joueur EXISTANT. Suppose une transaction
- * deja ouverte (tx) -- ne l'ouvre pas, ne la commit pas, ne la rollback pas
- * elle-meme (delegue entierement a Drizzle : toute exception ici remonte a
- * l'appelant, qui doit etre dans un db.transaction()).
+ * Coeur d'ecriture PARTAGE par savePlayerWithTx et mutatePlayer : ecrit
+ * players/plots/inventory_items pour un joueur EN SUPPOSANT QUE LE VERROU
+ * (SELECT ... FOR UPDATE) EST DEJA DETENU par l'appelant, dans la MEME
+ * transaction -- ne verrouille pas, ne verifie pas l'existence du joueur, ne
+ * fait donc AUCUN second SELECT ... FOR UPDATE.
  *
- * - Verrouille et verifie l'existence du joueur (SELECT ... FOR UPDATE).
- *   Absent -> erreur, AUCUNE ecriture n'est tentee ensuite.
+ * `updatedAt` est un parametre explicite (calcule UNE SEULE FOIS par
+ * l'appelant, avant cet appel) plutot qu'un `new Date()` genere ici -- pour
+ * que l'appelant (notamment mutatePlayer) puisse reporter EXACTEMENT la
+ * meme valeur dans le PlayerState qu'il retourne, sans avoir a relire la DB
+ * seulement pour ce champ. `created_at` n'est jamais touche par cette
+ * fonction (absent de son UPDATE) : `createdAt` ne peut donc jamais changer
+ * ici, ni via savePlayerWithTx ni via mutatePlayer.
+ *
+ * Ne JAMAIS exposer/appeler en dehors d'un verrou deja acquis dans la
+ * transaction courante : ce serait rouvrir la fenetre de lost update que
+ * savePlayerWithTx/mutatePlayer existent justement pour fermer.
+ *
  * - UPDATE cible de players (jamais de suppression/recreation du joueur).
  * - Upsert par lot des plots, cle (player_id, plot_index) -- jamais de DELETE.
  * - Upsert par lot de inventory_items, cle (player_id, item_id) -- une
  *   quantite de 0 reste une ligne valide (n'est jamais retiree).
  */
-export async function savePlayerWithTx(
+async function writePlayerStateAssumingLock(
   tx: Tx,
   playerState: PlayerState,
-  deps: PlayerWriteDeps = realPlayerWriteDeps,
+  updatedAt: Date,
+  deps: PlayerWriteCoreDeps,
 ): Promise<void> {
-  const existing = await deps.lockAndGetPlayer(tx, playerState.userId);
-  if (!existing) {
-    throw new Error(
-      `savePlayerWithTx : joueur "${playerState.userId}" introuvable -- aucune creation automatique, aucune ecriture effectuee.`,
-    );
-  }
-
   await deps.updatePlayerRow(tx, playerState.userId, {
     coins: playerState.coins,
     level: playerState.level,
@@ -220,7 +263,7 @@ export async function savePlayerWithTx(
     plotSkin: playerState.plotSkin,
     unlockedSkins: playerState.unlockedSkins,
     weatherForecast: playerState.weatherForecast,
-    updatedAt: new Date(),
+    updatedAt,
   });
 
   if (playerState.plots.length > 0) {
@@ -248,6 +291,39 @@ export async function savePlayerWithTx(
   }
 }
 
+/**
+ * Sauvegarde l'etat complet d'un joueur EXISTANT, de facon AUTONOME :
+ * verrouille elle-meme le joueur (SELECT ... FOR UPDATE) puis delegue
+ * l'ecriture a writePlayerStateAssumingLock. Suppose une transaction deja
+ * ouverte (tx) -- ne l'ouvre pas, ne la commit pas, ne la rollback pas
+ * elle-meme (delegue entierement a Drizzle : toute exception ici remonte a
+ * l'appelant, qui doit etre dans un db.transaction()).
+ *
+ * Reservee aux appelants qui n'ont PAS deja verrouille le joueur dans la
+ * transaction courante (ex. savePlayer, appel autonome). mutatePlayer
+ * verrouille deja le joueur pour ses propres besoins (lire plots/inventory
+ * de facon coherente avec la mutation) et appelle directement
+ * writePlayerStateAssumingLock plutot que cette fonction, pour eviter un
+ * second SELECT ... FOR UPDATE redondant sur la meme ligne.
+ *
+ * - Verrouille et verifie l'existence du joueur (SELECT ... FOR UPDATE).
+ *   Absent -> erreur, AUCUNE ecriture n'est tentee ensuite.
+ */
+export async function savePlayerWithTx(
+  tx: Tx,
+  playerState: PlayerState,
+  deps: PlayerWriteDeps = realPlayerWriteDeps,
+): Promise<void> {
+  const existing = await deps.lockAndGetPlayer(tx, playerState.userId);
+  if (!existing) {
+    throw new Error(
+      `savePlayerWithTx : joueur "${playerState.userId}" introuvable -- aucune creation automatique, aucune ecriture effectuee.`,
+    );
+  }
+
+  await writePlayerStateAssumingLock(tx, playerState, new Date(), deps);
+}
+
 type TransactionRunner = <T>(fn: (tx: Tx) => Promise<T>) => Promise<T>;
 
 async function getRealTransactionRunner(): Promise<TransactionRunner> {
@@ -271,5 +347,110 @@ export async function savePlayer(
   const run = runTransaction ?? (await getRealTransactionRunner());
   await run(async (tx) => {
     await savePlayerWithTx(tx, playerState, deps);
+  });
+}
+
+// ===========================================================================
+// MUTATION ATOMIQUE : mutatePlayer
+// ===========================================================================
+//
+// Ferme la fenetre de lost update que savePlayer(playerState) seul laisse
+// ouverte (voir commentaire au-dessus de `type Tx`) : lit le joueur, ses
+// plots et son inventaire APRES avoir pose le verrou (SELECT ... FOR
+// UPDATE), applique une mutation metier EN MEMOIRE, puis ecrit -- le tout
+// dans UNE SEULE transaction, sans jamais relacher le verrou entre la
+// lecture et l'ecriture.
+//
+// UN SEUL SELECT ... FOR UPDATE par appel : mutatePlayer verrouille le
+// joueur lui-meme (deps.lockAndGetPlayer) puis appelle directement
+// writePlayerStateAssumingLock -- jamais savePlayerWithTx, qui
+// re-verrouillerait inutilement la meme ligne deja detenue.
+//
+// INVARIANTE DE VERROUILLAGE (a ne jamais casser) : plots et
+// inventory_items n'ont pas de verrou propre. Ils ne sont proteges contre
+// les lost updates que PARCE QUE toute ecriture sur ces tables passe
+// exclusivement par writePlayerStateAssumingLock, elle-meme appelee
+// uniquement apres un verrou pose sur la ligne players correspondante (par
+// savePlayerWithTx ou mutatePlayer). Un futur code qui ecrirait
+// plots/inventory_items sans passer par ce chemin (ex. un `tx.update(plots)`
+// direct ailleurs dans le code) casserait cette garantie silencieusement.
+//
+// LE MUTATOR DOIT RESTER UNE OPERATION METIER EN MEMOIRE : il s'execute
+// pendant que le verrou PostgreSQL est detenu. Un mutator qui ferait de
+// l'I/O reseau/externe (appel HTTP, autre requete DB hors tx, etc.)
+// garderait ce verrou pose pendant toute la duree de cette I/O, bloquant
+// toute autre commande concurrente visant le meme joueur et immobilisant
+// une connexion du pool plus longtemps que necessaire.
+export interface MutatePlayerDeps extends PlayerWriteDeps {
+  getPlotsForUpdate: (tx: Tx, playerId: string) => Promise<PlotRow[]>;
+  getInventoryItemsForUpdate: (tx: Tx, playerId: string) => Promise<InventoryItemRow[]>;
+  toPlayerState: (record: PlayerRecord) => PlayerState;
+}
+
+const realMutatePlayerDeps: MutatePlayerDeps = {
+  ...realPlayerWriteDeps,
+  getPlotsForUpdate: realGetPlotsForUpdate,
+  getInventoryItemsForUpdate: realGetInventoryItemsForUpdate,
+  toPlayerState,
+};
+
+/**
+ * Lit, mute et sauvegarde l'etat d'un joueur dans UNE SEULE transaction,
+ * verrou pose du debut a la fin -- ferme la fenetre de lost update que
+ * savePlayer(playerState) seul ne couvre pas (voir commentaire au-dessus de
+ * `type Tx`).
+ *
+ * Deroulement : SELECT ... FOR UPDATE sur players -> (absent -> throw, rien
+ * d'autre n'est lu/ecrit) -> SELECT plots (meme tx) -> SELECT
+ * inventory_items (meme tx) -> toPlayerState(...) -> mutator(player) EN
+ * MEMOIRE -> writePlayerStateAssumingLock (AUCUN second verrou) -> COMMIT.
+ * Le PlayerState retourne porte le meme `updatedAt` que celui reellement
+ * ecrit en DB (calcule une seule fois, transmis a l'ecriture puis reporte
+ * dans l'objet retourne -- pas de relecture DB).
+ *
+ * `mutator` mute `player` EN PLACE (retour `void`/`Promise<void>`) : cet
+ * objet est fraichement construit a l'interieur de cette transaction, sans
+ * aucune autre reference externe -- aucun besoin de le cloner avant de le
+ * transmettre. `createdAt` n'est jamais modifie ici (writePlayerStateAssumingLock
+ * n'ecrit jamais cette colonne).
+ *
+ * Si `mutator` leve (sync ou async) ou si l'ecriture echoue, l'erreur
+ * remonte telle quelle et la transaction entiere est annulee par Drizzle
+ * (rollback automatique) -- aucune ecriture partielle possible.
+ *
+ * Concurrence : deux mutatePlayer ciblant le MEME joueur sont serialises
+ * par le SELECT ... FOR UPDATE (le second bloque jusqu'a ce que le premier
+ * commit/rollback, puis relit l'etat deja mis a jour -- deux `coins += 1`
+ * partant de 50 donnent bien 52, jamais 51). Deux mutatePlayer ciblant des
+ * joueurs DIFFERENTS ne se bloquent jamais entre eux (verrous sur des
+ * lignes distinctes).
+ */
+export async function mutatePlayer(
+  playerId: string,
+  mutator: (player: PlayerState) => void | Promise<void>,
+  deps: MutatePlayerDeps = realMutatePlayerDeps,
+  runTransaction?: TransactionRunner,
+): Promise<PlayerState> {
+  const run = runTransaction ?? (await getRealTransactionRunner());
+
+  return run(async (tx) => {
+    const playerRow = await deps.lockAndGetPlayer(tx, playerId);
+    if (!playerRow) {
+      throw new Error(
+        `mutatePlayer : joueur "${playerId}" introuvable -- aucune creation automatique, aucune mutation effectuee.`,
+      );
+    }
+
+    const plotRows = await deps.getPlotsForUpdate(tx, playerId);
+    const inventoryRows = await deps.getInventoryItemsForUpdate(tx, playerId);
+    const player = deps.toPlayerState({ player: playerRow, plots: plotRows, inventoryItems: inventoryRows });
+
+    await mutator(player);
+
+    const updatedAt = new Date();
+    await writePlayerStateAssumingLock(tx, player, updatedAt, deps);
+    player.updatedAt = updatedAt.getTime();
+
+    return player;
   });
 }

@@ -8,12 +8,14 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import type { GlobalStateRecord, PlayerRecord } from "@workspace/db/repositories";
-import type { Player } from "@workspace/db";
+import type { InventoryItem as InventoryItemRow, Player, Plot as PlotRow } from "@workspace/db";
 import {
   createFarmRepository,
+  mutatePlayer,
   savePlayer,
   savePlayerWithTx,
   type FarmRepositoryDeps,
+  type MutatePlayerDeps,
   type PlayerWriteDeps,
 } from "./farmRepository.ts";
 import { toGlobalState } from "./globalStateAdapter.ts";
@@ -395,3 +397,275 @@ test("9. savePlayer ouvre une transaction et delegue au coeur transactionnel", a
 // l'import (voir commentaire dans farmRepository.ts). Verifie a la place
 // par recherche statique (grep) sur farmRepository.ts, rapportee dans le
 // resume de cette etape : confirmé qu'aucun `.delete(` n'y apparait.
+
+// ===========================================================================
+// mutatePlayer -- verrou + lecture (plots/inventory) + mutation en memoire +
+// ecriture, dans UNE seule transaction, UN seul SELECT ... FOR UPDATE.
+// Mocks/fakes uniquement, jamais de vraie base (meme approche que
+// savePlayerWithTx ci-dessus).
+// ===========================================================================
+
+function buildFullPlayerRow(id: string, overrides: Partial<Player> = {}): Player {
+  return {
+    id,
+    coins: 50,
+    level: 1,
+    xp: 0,
+    irrigationLevel: 0,
+    fertilizerLevel: 0,
+    lastDailyAt: null,
+    autoReplant: false,
+    weeklySnapshotCoins: 50,
+    totalHarvested: 0,
+    quests: [],
+    questsResetAt: NOW,
+    plotSkin: "classic",
+    unlockedSkins: ["classic"],
+    weatherForecast: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  } as Player;
+}
+
+function buildPlotRow(overrides: Partial<PlotRow> = {}): PlotRow {
+  return {
+    id: 1,
+    playerId: TEST_PLAYER_ID,
+    plotIndex: 0,
+    cropId: null,
+    plantedAt: null,
+    notifiedReady: false,
+    ...overrides,
+  };
+}
+
+function buildInventoryItemRow(overrides: Partial<InventoryItemRow> = {}): InventoryItemRow {
+  return {
+    id: 1,
+    playerId: TEST_PLAYER_ID,
+    itemId: "wheat",
+    quantity: 3,
+    ...overrides,
+  };
+}
+
+function buildMutateDeps(overrides: Partial<MutatePlayerDeps> = {}): MutatePlayerDeps {
+  return {
+    lockAndGetPlayer: async (_tx, id) => buildFullPlayerRow(id),
+    updatePlayerRow: async () => {},
+    upsertPlots: async () => {},
+    upsertInventoryItems: async () => {},
+    getPlotsForUpdate: async () => [],
+    getInventoryItemsForUpdate: async () => [],
+    toPlayerState,
+    ...overrides,
+  };
+}
+
+// Ouvre une "fausse transaction" qui delegue directement a FAKE_TX -- meme
+// principe que le test 9 de savePlayer (fakeRunTransaction), reutilise ici
+// pour chaque test de mutatePlayer.
+async function runMutatePlayer(
+  mutator: (player: PlayerState) => void | Promise<void>,
+  deps: MutatePlayerDeps,
+): Promise<PlayerState> {
+  return mutatePlayer(TEST_PLAYER_ID, mutator, deps, async (fn) => fn(FAKE_TX));
+}
+
+test("mutatePlayer 1. ordre strict : lock -> plots -> inventory -> adapter -> mutator -> ecriture, UN SEUL lock", async () => {
+  const callOrder: string[] = [];
+  const lockAndGetPlayer = mock.fn(async (_tx: never, id: string) => {
+    callOrder.push("lock");
+    return buildFullPlayerRow(id);
+  });
+  const getPlotsForUpdate = mock.fn(async (..._args: Parameters<MutatePlayerDeps["getPlotsForUpdate"]>) => {
+    callOrder.push("plots");
+    return [];
+  });
+  const getInventoryItemsForUpdate = mock.fn(
+    async (..._args: Parameters<MutatePlayerDeps["getInventoryItemsForUpdate"]>) => {
+      callOrder.push("inventory");
+      return [];
+    },
+  );
+  const toPlayerStateSpy = mock.fn((record: PlayerRecord) => {
+    callOrder.push("adapter");
+    return toPlayerState(record);
+  });
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<PlayerWriteDeps["updatePlayerRow"]>) => {
+    callOrder.push("write");
+  });
+
+  const deps = buildMutateDeps({
+    lockAndGetPlayer,
+    getPlotsForUpdate,
+    getInventoryItemsForUpdate,
+    toPlayerState: toPlayerStateSpy,
+    updatePlayerRow,
+  });
+
+  await runMutatePlayer((player) => {
+    callOrder.push("mutator");
+    player.coins += 1;
+  }, deps);
+
+  assert.deepEqual(callOrder, ["lock", "plots", "inventory", "adapter", "mutator", "write"]);
+  assert.equal(lockAndGetPlayer.mock.calls.length, 1);
+});
+
+test("mutatePlayer 2. joueur absent : rejette, aucune lecture plots/inventory, mutator jamais appele, aucune ecriture", async () => {
+  const getPlotsForUpdate = mock.fn(async (..._args: Parameters<MutatePlayerDeps["getPlotsForUpdate"]>) => []);
+  const getInventoryItemsForUpdate = mock.fn(
+    async (..._args: Parameters<MutatePlayerDeps["getInventoryItemsForUpdate"]>) => [],
+  );
+  const mutator = mock.fn((_player: PlayerState) => {});
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<PlayerWriteDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutateDeps({
+    lockAndGetPlayer: async () => null,
+    getPlotsForUpdate,
+    getInventoryItemsForUpdate,
+    updatePlayerRow,
+  });
+
+  await assert.rejects(() => runMutatePlayer(mutator, deps), /introuvable/);
+
+  assert.equal(getPlotsForUpdate.mock.calls.length, 0);
+  assert.equal(getInventoryItemsForUpdate.mock.calls.length, 0);
+  assert.equal(mutator.mock.calls.length, 0);
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayer 3. mutator synchrone qui leve : l'erreur remonte telle quelle, aucune ecriture", async () => {
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<PlayerWriteDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutateDeps({ updatePlayerRow });
+
+  await assert.rejects(
+    () =>
+      runMutatePlayer(() => {
+        throw new Error("echec metier simule (sync)");
+      }, deps),
+    /echec metier simule \(sync\)/,
+  );
+
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayer 4. mutator asynchrone qui rejette : l'erreur remonte telle quelle, aucune ecriture", async () => {
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<PlayerWriteDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutateDeps({ updatePlayerRow });
+
+  await assert.rejects(
+    () =>
+      runMutatePlayer(async () => {
+        throw new Error("echec metier simule (async)");
+      }, deps),
+    /echec metier simule \(async\)/,
+  );
+
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayer 5. erreur pendant l'ecriture : rejette, mais le mutator a deja ete execute", async () => {
+  const mutator = mock.fn((player: PlayerState) => {
+    player.coins += 1;
+  });
+  const deps = buildMutateDeps({
+    updatePlayerRow: async () => {
+      throw new Error("echec simule de l'UPDATE");
+    },
+  });
+
+  await assert.rejects(() => runMutatePlayer(mutator, deps), /echec simule de l'UPDATE/);
+  assert.equal(mutator.mock.calls.length, 1);
+});
+
+test("mutatePlayer 6. la mutation appliquee par le mutator est transmise a l'ecriture", async () => {
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<PlayerWriteDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutateDeps({ updatePlayerRow });
+
+  await runMutatePlayer((player) => {
+    player.coins = 999;
+  }, deps);
+
+  assert.equal(updatePlayerRow.mock.calls.length, 1);
+  const [, , values] = updatePlayerRow.mock.calls[0]!.arguments;
+  assert.equal(values.coins, 999);
+});
+
+test("mutatePlayer 7. la valeur retournee reflete la mutation appliquee", async () => {
+  const result = await runMutatePlayer((player) => {
+    player.coins = 999;
+  }, buildMutateDeps());
+
+  assert.equal(result.coins, 999);
+});
+
+test("mutatePlayer 8. updatedAt retourne == timestamp ecrit ; createdAt jamais modifie", async () => {
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<PlayerWriteDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutateDeps({ updatePlayerRow });
+
+  const result = await runMutatePlayer((player) => {
+    player.coins += 1;
+  }, deps);
+
+  const [, , values] = updatePlayerRow.mock.calls[0]!.arguments;
+  assert.ok(values.updatedAt instanceof Date);
+  assert.equal(result.updatedAt, values.updatedAt.getTime());
+  assert.equal(result.createdAt, NOW.getTime());
+  assert.ok(!("createdAt" in values), "createdAt ne doit jamais faire partie des valeurs ecrites");
+});
+
+test("mutatePlayer 9. plots et inventaire vides : fonctionne sans erreur", async () => {
+  const result = await runMutatePlayer(
+    (player) => {
+      player.coins += 1;
+    },
+    buildMutateDeps({ getPlotsForUpdate: async () => [], getInventoryItemsForUpdate: async () => [] }),
+  );
+
+  assert.deepEqual(result.plots, []);
+  assert.deepEqual(result.inventory, {});
+});
+
+test("mutatePlayer 10. ouvre une seule transaction", async () => {
+  let transactionCalls = 0;
+  const fakeRunTransaction = async (fn: (tx: never) => Promise<PlayerState>) => {
+    transactionCalls += 1;
+    return fn(FAKE_TX);
+  };
+
+  await mutatePlayer(
+    TEST_PLAYER_ID,
+    (player) => {
+      player.coins += 1;
+    },
+    buildMutateDeps(),
+    fakeRunTransaction as never,
+  );
+
+  assert.equal(transactionCalls, 1);
+});
+
+test("mutatePlayer 11. l'adaptateur est appele avec exactement {player, plots, inventoryItems} construits a partir des lectures", async () => {
+  const playerRow = buildFullPlayerRow(TEST_PLAYER_ID);
+  const plotRows = [buildPlotRow({ id: 1, plotIndex: 0 })];
+  const inventoryRows = [buildInventoryItemRow({ id: 1, itemId: "wheat", quantity: 3 })];
+  const toPlayerStateSpy = mock.fn((r: PlayerRecord) => toPlayerState(r));
+
+  const deps = buildMutateDeps({
+    lockAndGetPlayer: async () => playerRow,
+    getPlotsForUpdate: async () => plotRows,
+    getInventoryItemsForUpdate: async () => inventoryRows,
+    toPlayerState: toPlayerStateSpy,
+  });
+
+  await runMutatePlayer(() => {}, deps);
+
+  assert.equal(toPlayerStateSpy.mock.calls.length, 1);
+  assert.deepEqual(toPlayerStateSpy.mock.calls[0]!.arguments[0], {
+    player: playerRow,
+    plots: plotRows,
+    inventoryItems: inventoryRows,
+  });
+});
