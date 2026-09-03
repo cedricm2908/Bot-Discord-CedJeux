@@ -1,0 +1,703 @@
+{
+  "id": "b5ef45c8-86f1-4cc1-9048-10d5d6426b42",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.players": {
+      "name": "players",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "coins": {
+          "name": "coins",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 50
+        },
+        "level": {
+          "name": "level",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "xp": {
+          "name": "xp",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "irrigation_level": {
+          "name": "irrigation_level",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "fertilizer_level": {
+          "name": "fertilizer_level",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_daily_at": {
+          "name": "last_daily_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "auto_replant": {
+          "name": "auto_replant",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "weekly_snapshot_coins": {
+          "name": "weekly_snapshot_coins",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 50
+        },
+        "total_harvested": {
+          "name": "total_harvested",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "quests": {
+          "name": "quests",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
+        },
+        "quests_reset_at": {
+          "name": "quests_reset_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "plot_skin": {
+          "name": "plot_skin",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'classic'"
+        },
+        "unlocked_skins": {
+          "name": "unlocked_skins",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::text[]"
+        },
+        "weather_forecast": {
+          "name": "weather_forecast",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "players_coins_non_negative": {
+          "name": "players_coins_non_negative",
+          "value": "\"players\".\"coins\" >= 0"
+        },
+        "players_xp_non_negative": {
+          "name": "players_xp_non_negative",
+          "value": "\"players\".\"xp\" >= 0"
+        },
+        "players_level_positive": {
+          "name": "players_level_positive",
+          "value": "\"players\".\"level\" >= 1"
+        },
+        "players_irrigation_level_non_negative": {
+          "name": "players_irrigation_level_non_negative",
+          "value": "\"players\".\"irrigation_level\" >= 0"
+        },
+        "players_fertilizer_level_non_negative": {
+          "name": "players_fertilizer_level_non_negative",
+          "value": "\"players\".\"fertilizer_level\" >= 0"
+        },
+        "players_total_harvested_non_negative": {
+          "name": "players_total_harvested_non_negative",
+          "value": "\"players\".\"total_harvested\" >= 0"
+        },
+        "players_weekly_snapshot_coins_non_negative": {
+          "name": "players_weekly_snapshot_coins_non_negative",
+          "value": "\"players\".\"weekly_snapshot_coins\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.plots": {
+      "name": "plots",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "player_id": {
+          "name": "player_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "plot_index": {
+          "name": "plot_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "crop_id": {
+          "name": "crop_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "planted_at": {
+          "name": "planted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "notified_ready": {
+          "name": "notified_ready",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "plots_player_id_players_id_fk": {
+          "name": "plots_player_id_players_id_fk",
+          "tableFrom": "plots",
+          "tableTo": "players",
+          "columnsFrom": [
+            "player_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "plots_player_id_plot_index_unique": {
+          "name": "plots_player_id_plot_index_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "player_id",
+            "plot_index"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "plots_plot_index_non_negative": {
+          "name": "plots_plot_index_non_negative",
+          "value": "\"plots\".\"plot_index\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.inventory_items": {
+      "name": "inventory_items",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "player_id": {
+          "name": "player_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "item_id": {
+          "name": "item_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "quantity": {
+          "name": "quantity",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "inventory_items_player_id_players_id_fk": {
+          "name": "inventory_items_player_id_players_id_fk",
+          "tableFrom": "inventory_items",
+          "tableTo": "players",
+          "columnsFrom": [
+            "player_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "inventory_items_player_id_item_id_unique": {
+          "name": "inventory_items_player_id_item_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "player_id",
+            "item_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "inventory_items_quantity_non_negative": {
+          "name": "inventory_items_quantity_non_negative",
+          "value": "\"inventory_items\".\"quantity\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.global_state": {
+      "name": "global_state",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "default": 1
+        },
+        "market_multiplier": {
+          "name": "market_multiplier",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "previous_market_multiplier": {
+          "name": "previous_market_multiplier",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "market_updated_at": {
+          "name": "market_updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "weather": {
+          "name": "weather",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'normal'"
+        },
+        "weather_multiplier": {
+          "name": "weather_multiplier",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "weather_changed_at": {
+          "name": "weather_changed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "weather_expires_at": {
+          "name": "weather_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_weather_at": {
+          "name": "next_weather_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "next_weather_type": {
+          "name": "next_weather_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'rain'"
+        },
+        "weekly_started_at": {
+          "name": "weekly_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "global_state_singleton": {
+          "name": "global_state_singleton",
+          "value": "\"global_state\".\"id\" = 1"
+        },
+        "global_state_market_multiplier_range": {
+          "name": "global_state_market_multiplier_range",
+          "value": "\"global_state\".\"market_multiplier\" >= 0.65 AND \"global_state\".\"market_multiplier\" <= 1.4"
+        },
+        "global_state_weather_multiplier_positive": {
+          "name": "global_state_weather_multiplier_positive",
+          "value": "\"global_state\".\"weather_multiplier\" > 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.contract": {
+      "name": "contract",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "default": 1
+        },
+        "crop_id": {
+          "name": "crop_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "required": {
+          "name": "required",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "remaining": {
+          "name": "remaining",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bonus_multiplier": {
+          "name": "bonus_multiplier",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "renewed_at": {
+          "name": "renewed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "contract_singleton": {
+          "name": "contract_singleton",
+          "value": "\"contract\".\"id\" = 1"
+        },
+        "contract_required_positive": {
+          "name": "contract_required_positive",
+          "value": "\"contract\".\"required\" > 0"
+        },
+        "contract_remaining_non_negative": {
+          "name": "contract_remaining_non_negative",
+          "value": "\"contract\".\"remaining\" >= 0"
+        },
+        "contract_remaining_le_required": {
+          "name": "contract_remaining_le_required",
+          "value": "\"contract\".\"remaining\" <= \"contract\".\"required\""
+        },
+        "contract_bonus_multiplier_positive": {
+          "name": "contract_bonus_multiplier_positive",
+          "value": "\"contract\".\"bonus_multiplier\" > 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.reward_claims": {
+      "name": "reward_claims",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "player_id": {
+          "name": "player_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "claim_type": {
+          "name": "claim_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "claimed_at": {
+          "name": "claimed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "reward_claims_player_id_players_id_fk": {
+          "name": "reward_claims_player_id_players_id_fk",
+          "tableFrom": "reward_claims",
+          "tableTo": "players",
+          "columnsFrom": [
+            "player_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "reward_claims_player_id_claim_type_unique": {
+          "name": "reward_claims_player_id_claim_type_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "player_id",
+            "claim_type"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.daily_challenge": {
+      "name": "daily_challenge",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "crop_id": {
+          "name": "crop_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target": {
+          "name": "target",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "progress": {
+          "name": "progress",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reward_coins": {
+          "name": "reward_coins",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "completed": {
+          "name": "completed",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "rewarded": {
+          "name": "rewarded",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "daily_challenge_target_positive": {
+          "name": "daily_challenge_target_positive",
+          "value": "\"daily_challenge\".\"target\" > 0"
+        },
+        "daily_challenge_progress_non_negative": {
+          "name": "daily_challenge_progress_non_negative",
+          "value": "\"daily_challenge\".\"progress\" >= 0"
+        },
+        "daily_challenge_reward_coins_non_negative": {
+          "name": "daily_challenge_reward_coins_non_negative",
+          "value": "\"daily_challenge\".\"reward_coins\" >= 0"
+        },
+        "daily_challenge_rewarded_implies_completed": {
+          "name": "daily_challenge_rewarded_implies_completed",
+          "value": "\"daily_challenge\".\"rewarded\" = false OR \"daily_challenge\".\"completed\" = true"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.daily_challenge_contributors": {
+      "name": "daily_challenge_contributors",
+      "schema": "",
+      "columns": {
+        "challenge_id": {
+          "name": "challenge_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "player_id": {
+          "name": "player_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contributed_at": {
+          "name": "contributed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "daily_challenge_contributors_challenge_id_daily_challenge_id_fk": {
+          "name": "daily_challenge_contributors_challenge_id_daily_challenge_id_fk",
+          "tableFrom": "daily_challenge_contributors",
+          "tableTo": "daily_challenge",
+          "columnsFrom": [
+            "challenge_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "daily_challenge_contributors_player_id_players_id_fk": {
+          "name": "daily_challenge_contributors_player_id_players_id_fk",
+          "tableFrom": "daily_challenge_contributors",
+          "tableTo": "players",
+          "columnsFrom": [
+            "player_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "daily_challenge_contributors_challenge_id_player_id_pk": {
+          "name": "daily_challenge_contributors_challenge_id_player_id_pk",
+          "columns": [
+            "challenge_id",
+            "player_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
