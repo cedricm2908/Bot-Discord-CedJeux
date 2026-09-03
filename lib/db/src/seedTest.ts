@@ -2,11 +2,15 @@
 // Reserve EXCLUSIVEMENT a la base V2 TEST. Ne doit jamais toucher V1/production.
 //
 // GARDE-FOUS (tous doivent passer, dans l'ordre) :
-//  1. Refuse si NODE_ENV === "production".
-//  2. Refuse si ALLOW_TEST_SEED n'est pas exactement "yes-seed-test-db" --
-//     opt-in explicite et volontaire, distinct de DATABASE_URL. Necessaire
-//     en plus du (1) : aucun Build/Start Railway de ce projet ne fixe
-//     NODE_ENV pour l'instant, donc s'y fier seul serait insuffisant.
+//  1. Refuse si ALLOW_TEST_SEED n'est pas exactement "yes-seed-test-db".
+//  2. Refuse si TEST_DATABASE_CONFIRMATION n'est pas exactement
+//     "cedjeux-v2-test".
+//     Ces deux variables (1+2) sont dediees exclusivement a ce script, opt-in
+//     explicite et volontaire, distinctes de DATABASE_URL. NODE_ENV n'est
+//     PAS utilise comme blocage a lui seul : Railway fixe NODE_ENV=production
+//     automatiquement sur TOUS ses services (y compris celui de test), donc
+//     s'y fier bloquerait le seed meme sur la base TEST legitime. NODE_ENV
+//     reste lu et logge (valeur non sensible) a titre informatif uniquement.
 //  3. DATABASE_URL doit etre presente (jamais affichee).
 //  4. Garde-fou de contenu (verifie DANS la transaction, avant toute
 //     ecriture) : si la base contient deja plus de 5 joueurs ET qu'aucun
@@ -42,14 +46,22 @@ const TEST_INVENTORY = [
   { itemId: "carrot", quantity: 2 },
 ] as const;
 
-if (process.env.NODE_ENV === "production") {
-  console.error("[seed-test] NODE_ENV=production detecte -- execution refusee.");
-  process.exit(1);
-}
+// NODE_ENV n'est plus un blocage : lu et logge a titre informatif
+// uniquement (valeur non sensible). Railway fixe NODE_ENV=production sur
+// tous ses services, y compris celui de test -- s'y fier comme garde-fou
+// bloquerait a tort une execution TEST legitime.
+console.log(`[seed-test] NODE_ENV actuel : ${process.env.NODE_ENV ?? "(non defini)"} (indicatif uniquement, ne bloque pas).`);
 
 if (process.env.ALLOW_TEST_SEED !== "yes-seed-test-db") {
   console.error(
     '[seed-test] Garde-fou : definir ALLOW_TEST_SEED="yes-seed-test-db" pour confirmer explicitement une execution volontaire sur la base TEST.',
+  );
+  process.exit(1);
+}
+
+if (process.env.TEST_DATABASE_CONFIRMATION !== "cedjeux-v2-test") {
+  console.error(
+    '[seed-test] Garde-fou : definir TEST_DATABASE_CONFIRMATION="cedjeux-v2-test" pour confirmer explicitement que la base ciblee est bien la base V2 TEST.',
   );
   process.exit(1);
 }
