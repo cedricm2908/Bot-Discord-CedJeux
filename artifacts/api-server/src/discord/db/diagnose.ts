@@ -12,6 +12,12 @@
 // Usage prevu (jamais depuis un poste local sans DATABASE_URL de TEST) :
 //   pnpm --filter @workspace/api-server run diagnose:db
 
+// Force le mode module (aucun import/export statique sinon, a cause des
+// imports dynamiques ci-dessous) : sans ça, ce fichier serait traite comme
+// un script en portee globale et entrerait en collision avec les autres
+// scripts de diagnostic du meme dossier (ex. databaseUrl declare deux fois).
+export {};
+
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   console.error(
