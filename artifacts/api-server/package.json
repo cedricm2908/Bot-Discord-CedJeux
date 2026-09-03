@@ -9,7 +9,7 @@
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --test src/**/*.test.ts",
-    "diagnose:db": "node --experimental-strip-types src/discord/db/diagnose.ts"
+    "diagnose:db": "tsx src/discord/db/diagnose.ts"
   },
   "dependencies": {
     "@workspace/api-zod": "workspace:*",
@@ -30,6 +30,7 @@
     "esbuild": "0.27.3",
     "esbuild-plugin-pino": "^2.3.3",
     "pino-pretty": "^13.1.3",
-    "thread-stream": "3.1.0"
+    "thread-stream": "3.1.0",
+    "tsx": "catalog:"
   }
 }
