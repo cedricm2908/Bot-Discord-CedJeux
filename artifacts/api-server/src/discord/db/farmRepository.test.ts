@@ -20,11 +20,15 @@ import type {
 } from "@workspace/db";
 import {
   createFarmRepository,
+  ensurePlayerExists,
   mutateGlobalState,
   mutatePlayer,
   mutatePlayerAndGlobal,
+  newPlayerRowDefaults,
+  newStartingPlotRows,
   savePlayer,
   savePlayerWithTx,
+  type EnsurePlayerExistsDeps,
   type FarmRepositoryDeps,
   type MutateGlobalStateDeps,
   type MutatePlayerAndGlobalDeps,
@@ -33,6 +37,7 @@ import {
 } from "./farmRepository.ts";
 import { toGlobalState } from "./globalStateAdapter.ts";
 import { toPlayerState } from "./playerAdapter.ts";
+import { STARTING_PLOTS } from "../constants.ts";
 import type { GlobalState, PlayerState } from "../types";
 
 const NOW = new Date(1_700_000_000_000);
@@ -683,6 +688,217 @@ test("mutatePlayer 11. l'adaptateur est appele avec exactement {player, plots, i
     plots: plotRows,
     inventoryItems: inventoryRows,
   });
+});
+
+// ===========================================================================
+// ensurePlayerExists -- bootstrap idempotent (LOT 6, infrastructure
+// uniquement -- aucune commande n'est branchee dessus). Deux niveaux de
+// tests :
+//  1. newPlayerRowDefaults()/newStartingPlotRows() : fonctions PURES (aucun
+//     mock necessaire) -- c'est ce qui prouve "reproduit EXACTEMENT
+//     createPlayer() V1", que la fonction reelle d'insertion
+//     (realTryInsertNewPlayer, non testable ici -- meme limitation
+//     d'import dynamique que realLockAndGetPlayer, voir le commentaire
+//     "10." plus haut) ne peut pas prouver elle-meme.
+//  2. ensurePlayerExists() : orchestration testee via deps mockees (ordre
+//     d'appel, non-ecrasement d'un joueur existant, comportement
+//     concurrent simule), meme convention que mutatePlayer ci-dessus.
+// ===========================================================================
+
+test("newPlayerRowDefaults 1. reproduit exactement createPlayer() V1 (store.ts)", () => {
+  const now = new Date(1_700_300_000_000);
+  const defaults = newPlayerRowDefaults(now);
+
+  assert.equal(defaults.coins, 50);
+  assert.equal(defaults.weeklySnapshotCoins, 50);
+  assert.equal(defaults.level, 1);
+  assert.equal(defaults.xp, 0);
+  assert.equal(defaults.irrigationLevel, 0);
+  assert.equal(defaults.fertilizerLevel, 0);
+  assert.equal(defaults.autoReplant, false);
+  assert.equal(defaults.totalHarvested, 0);
+  assert.equal(defaults.plotSkin, "classic");
+  assert.deepEqual(defaults.unlockedSkins, ["classic"]);
+  assert.equal(defaults.lastDailyAt, null);
+  assert.equal(defaults.weatherForecast, null);
+  assert.equal(defaults.createdAt, now);
+  assert.equal(defaults.updatedAt, now);
+  assert.equal(defaults.questsResetAt, now);
+});
+
+test("newPlayerRowDefaults 2. quests = freshQuests() (memes gabarits que V1, aucune progression, rien de reclame)", () => {
+  const defaults = newPlayerRowDefaults(NOW);
+  const quests = defaults.quests as { progress: number; claimed: boolean }[];
+  assert.ok(Array.isArray(quests));
+  assert.ok(quests.length > 0, "freshQuests() doit produire au moins une quete");
+  for (const quest of quests) {
+    assert.equal(quest.progress, 0);
+    assert.equal(quest.claimed, false);
+  }
+});
+
+test("newStartingPlotRows : exactement STARTING_PLOTS parcelles vides, index 0..STARTING_PLOTS-1", () => {
+  const rows = newStartingPlotRows(TEST_PLAYER_ID);
+  assert.equal(rows.length, STARTING_PLOTS);
+  rows.forEach((row, index) => {
+    assert.equal(row.playerId, TEST_PLAYER_ID);
+    assert.equal(row.plotIndex, index);
+    assert.equal(row.cropId, null);
+    assert.equal(row.plantedAt, null);
+    assert.equal(row.notifiedReady, false);
+  });
+});
+
+function buildEnsurePlayerExistsDeps(overrides: Partial<EnsurePlayerExistsDeps> = {}): EnsurePlayerExistsDeps {
+  return {
+    tryInsertNewPlayer: async () => true,
+    insertStartingPlots: async () => {},
+    lockAndGetPlayer: async (_tx, id) => buildFullPlayerRow(id),
+    updatePlayerRow: async () => {},
+    upsertPlots: async () => {},
+    upsertInventoryItems: async () => {},
+    getPlotsForUpdate: async () => [],
+    getInventoryItemsForUpdate: async () => [],
+    toPlayerState,
+    ...overrides,
+  };
+}
+
+async function runEnsurePlayerExists(
+  deps: EnsurePlayerExistsDeps,
+  now: Date = NOW,
+): Promise<{ player: PlayerState; created: boolean }> {
+  return ensurePlayerExists(TEST_PLAYER_ID, deps, async (fn) => fn(FAKE_TX), now);
+}
+
+test("ensurePlayerExists 1. joueur absent : cree (tryInsertNewPlayer=true), STARTING_PLOTS inserees, created=true", async () => {
+  const insertStartingPlots = mock.fn(
+    async (..._args: Parameters<EnsurePlayerExistsDeps["insertStartingPlots"]>) => {},
+  );
+  const deps = buildEnsurePlayerExistsDeps({ tryInsertNewPlayer: async () => true, insertStartingPlots });
+
+  const result = await runEnsurePlayerExists(deps);
+
+  assert.equal(result.created, true);
+  assert.equal(insertStartingPlots.mock.calls.length, 1);
+  assert.equal(insertStartingPlots.mock.calls[0]!.arguments[1], TEST_PLAYER_ID);
+});
+
+test("ensurePlayerExists 2. joueur deja existant (tryInsertNewPlayer=false) : STARTING_PLOTS jamais inserees, aucune reinitialisation", async () => {
+  const insertStartingPlots = mock.fn(
+    async (..._args: Parameters<EnsurePlayerExistsDeps["insertStartingPlots"]>) => {},
+  );
+  const existingPlayer = buildFullPlayerRow(TEST_PLAYER_ID, { coins: 12345, totalHarvested: 999 });
+  const deps = buildEnsurePlayerExistsDeps({
+    tryInsertNewPlayer: async () => false,
+    insertStartingPlots,
+    lockAndGetPlayer: async () => existingPlayer,
+  });
+
+  const result = await runEnsurePlayerExists(deps);
+
+  assert.equal(result.created, false);
+  assert.equal(insertStartingPlots.mock.calls.length, 0);
+  assert.equal(result.player.coins, 12345, "les coins existants ne doivent jamais etre ecrases");
+  assert.equal(result.player.totalHarvested, 999, "la progression existante ne doit jamais etre reinitialisee");
+});
+
+test("ensurePlayerExists 3. deux appels concurrents sur un joueur absent : un seul cree, l'autre lit le meme etat, aucun doublon", async () => {
+  let stored: Player | null = null;
+  const sharedTryInsertNewPlayer = async (_tx: never, playerId: string, now: Date) => {
+    if (stored) return false;
+    stored = buildFullPlayerRow(playerId, { createdAt: now, updatedAt: now, questsResetAt: now });
+    return true;
+  };
+  const sharedInsertStartingPlots = async () => {
+    assert.ok(stored, "insertStartingPlots ne doit etre appele qu'apres une creation reellement gagnee");
+  };
+  const sharedLockAndGetPlayer = async () => {
+    assert.ok(stored, "le joueur doit deja exister au moment de la relecture, dans les deux branches");
+    return stored;
+  };
+
+  const depsA = buildEnsurePlayerExistsDeps({
+    tryInsertNewPlayer: sharedTryInsertNewPlayer,
+    insertStartingPlots: sharedInsertStartingPlots,
+    lockAndGetPlayer: sharedLockAndGetPlayer,
+  });
+  const depsB = buildEnsurePlayerExistsDeps({
+    tryInsertNewPlayer: sharedTryInsertNewPlayer,
+    insertStartingPlots: sharedInsertStartingPlots,
+    lockAndGetPlayer: sharedLockAndGetPlayer,
+  });
+
+  const [resultA, resultB] = await Promise.all([runEnsurePlayerExists(depsA), runEnsurePlayerExists(depsB)]);
+
+  const createdCount = [resultA, resultB].filter((r) => r.created).length;
+  assert.equal(createdCount, 1, "un seul des deux appels doit avoir reellement cree le joueur");
+  assert.deepEqual(
+    resultA.player,
+    resultB.player,
+    "les deux appels doivent retourner exactement le meme etat joueur, sans doublon",
+  );
+});
+
+test("ensurePlayerExists 4. joueur nouvellement cree : inventaire initial vide (aucune ligne inventory_items)", async () => {
+  const getInventoryItemsForUpdate = mock.fn(
+    async (..._args: Parameters<EnsurePlayerExistsDeps["getInventoryItemsForUpdate"]>) => [],
+  );
+  const deps = buildEnsurePlayerExistsDeps({ getInventoryItemsForUpdate });
+
+  const result = await runEnsurePlayerExists(deps);
+
+  assert.deepEqual(result.player.inventory, {});
+});
+
+test("ensurePlayerExists 5. le timestamp `now` est transmis tel quel a tryInsertNewPlayer", async () => {
+  const specificNow = new Date(1_701_000_000_000);
+  const tryInsertNewPlayer = mock.fn(
+    async (..._args: Parameters<EnsurePlayerExistsDeps["tryInsertNewPlayer"]>) => true,
+  );
+  const deps = buildEnsurePlayerExistsDeps({ tryInsertNewPlayer });
+
+  await runEnsurePlayerExists(deps, specificNow);
+
+  assert.equal(tryInsertNewPlayer.mock.calls[0]!.arguments[2], specificNow);
+});
+
+test("ensurePlayerExists 6. etat incoherent (joueur introuvable juste apres la tentative de creation) : erreur explicite", async () => {
+  const deps = buildEnsurePlayerExistsDeps({ lockAndGetPlayer: async () => null });
+  await assert.rejects(() => runEnsurePlayerExists(deps), /introuvable/);
+});
+
+test("ensurePlayerExists 7. ordre strict (creation) : tryInsertNewPlayer -> insertStartingPlots -> lock -> plots -> inventory -> adapter", async () => {
+  const callOrder: string[] = [];
+  const deps = buildEnsurePlayerExistsDeps({
+    tryInsertNewPlayer: async () => {
+      callOrder.push("insert-player");
+      return true;
+    },
+    insertStartingPlots: async () => {
+      callOrder.push("insert-plots");
+    },
+    lockAndGetPlayer: async (_tx, id) => {
+      callOrder.push("lock");
+      return buildFullPlayerRow(id);
+    },
+    getPlotsForUpdate: async () => {
+      callOrder.push("plots");
+      return [];
+    },
+    getInventoryItemsForUpdate: async () => {
+      callOrder.push("inventory");
+      return [];
+    },
+    toPlayerState: (r: PlayerRecord) => {
+      callOrder.push("adapter");
+      return toPlayerState(r);
+    },
+  });
+
+  await runEnsurePlayerExists(deps);
+
+  assert.deepEqual(callOrder, ["insert-player", "insert-plots", "lock", "plots", "inventory", "adapter"]);
 });
 
 // ===========================================================================

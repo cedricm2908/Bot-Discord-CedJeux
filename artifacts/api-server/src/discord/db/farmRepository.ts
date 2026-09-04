@@ -43,7 +43,13 @@ import type {
   Plot as PlotRow,
   RewardClaim,
 } from "@workspace/db";
-import { WEEKLY_INTERVAL_MS, WEEKLY_LEADERBOARD_REWARDS } from "../constants.ts";
+import {
+  freshQuests,
+  STARTING_COINS,
+  STARTING_PLOTS,
+  WEEKLY_INTERVAL_MS,
+  WEEKLY_LEADERBOARD_REWARDS,
+} from "../constants.ts";
 
 export interface FarmRepositoryDeps {
   getPlayerRecord: (playerId: string) => Promise<PlayerRecord | null>;
@@ -480,6 +486,183 @@ export async function mutatePlayer(
     player.updatedAt = updatedAt.getTime();
 
     return player;
+  });
+}
+
+// ===========================================================================
+// BOOTSTRAP IDEMPOTENT : ensurePlayerExists
+// ===========================================================================
+//
+// LOT 6 (etape "infrastructure uniquement", AUCUNE commande branchee dessus
+// pour l'instant). Reproduit EXACTEMENT createPlayer() de ../store.ts (V1,
+// jamais modifiee ici) pour un joueur qui n'a pas encore de ligne `players`
+// -- necessaire car ni getPlayer() ni mutatePlayer() de ce fichier ne
+// creent jamais un joueur automatiquement (contrairement a
+// FarmStore.getPlayer(), qui le fait silencieusement a chaque premier
+// acces). Les CONSTANTES/FONCTIONS canoniques existantes sont reutilisees
+// telles quelles (STARTING_COINS, STARTING_PLOTS, freshQuests() de
+// ../constants.ts) -- aucune valeur n'est recopiee a la main.
+//
+// ATTENTION DEFAUTS SQL INSUFFISANTS : le defaut de colonne de
+// `players.unlocked_skins` est `'{}'::text[]` (tableau VIDE), alors que V1
+// initialise `unlockedSkins: ["classic"]` -- un simple
+// `INSERT ... DEFAULT VALUES` divergerait de V1 des la creation. Chaque
+// colonne est donc fixee EXPLICITEMENT ci-dessous (newPlayerRowDefaults),
+// sans dependre d'aucun defaut de colonne, meme quand la valeur coincide
+// avec V1 (defense en profondeur : un futur changement de defaut SQL ne
+// pourra jamais faire diverger silencieusement le bootstrap).
+//
+// STRATEGIE (INSERT ... ON CONFLICT DO NOTHING, PAS un simple
+// SELECT-puis-INSERT) : `players.id` est deja PRIMARY KEY (voir
+// lib/db/src/schema/players.ts) -- c'est la cle de conflit naturelle.
+// `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING ...` est atomique par
+// construction : sous deux transactions concurrentes visant le MEME
+// playerId absent, Postgres serialise reellement les deux INSERT sur
+// l'index unique (la deuxieme instruction BLOQUE jusqu'a ce que la
+// premiere transaction COMMITE ou ROLLBACK, puis reevalue le conflit) --
+// UNE SEULE des deux peut donc obtenir `created=true` ; l'autre
+// obtient `created=false` et sait, de facon garantie, que la premiere
+// transaction est deja entierement commitee (players + plots) au moment ou
+// elle relit l'etat pour construire son propre retour. Aucune ligne
+// dupliquee, aucun etat partiel observable, sans SELECT prealable ni
+// verrou explicite avant l'INSERT.
+//
+// Les PLOTS de depart (STARTING_PLOTS lignes vides) ne sont inserees QUE
+// si CE thread a reellement cree le joueur (created===true) -- jamais pour
+// un joueur deja existant (meme si, par hypothese, il avait moins de
+// STARTING_PLOTS lignes suite a un etat de seed particulier) : l'exigence
+// "ne jamais recreer/dupliquer ses parcelles" est ainsi respectee au sens
+// large, pas seulement pour la ligne `players` elle-meme. L'unique
+// contrainte (player_id, plot_index) sur `plots` (voir
+// lib/db/src/schema/plots.ts) protege quand meme cet INSERT par
+// ON CONFLICT DO NOTHING, en defense supplementaire.
+//
+// L'INVENTAIRE de depart reste INTENTIONNELLEMENT VIDE (aucune ligne
+// inventory_items inseree) : V1 initialise `inventory` avec toutes les
+// cultures a 0 (Object.fromEntries(CROPS.map(c => [c.id, 0]))), mais
+// playerAdapter.ts construit deja `inventory` comme un objet PARTIEL (une
+// cle absente se lit `?? 0` partout dans farm.ts, jamais `undefined` traite
+// differemment de `0`) -- confirme par le test existant
+// "inventory vide quand aucune ligne inventory_items" de
+// farmRepository.test.ts. Inserer des lignes a 0 pour chaque culture serait
+// un ajout de donnees sans effet observable, jamais fait ailleurs dans ce
+// fichier (voir writePlayerStateAssumingLock, qui n'ecrit QUE les entrees
+// presentes dans playerState.inventory).
+export interface EnsurePlayerExistsDeps extends MutatePlayerDeps {
+  tryInsertNewPlayer: (tx: Tx, playerId: string, now: Date) => Promise<boolean>;
+  insertStartingPlots: (tx: Tx, playerId: string) => Promise<void>;
+}
+
+// Valeurs EXACTES d'un nouveau joueur, reproduisant createPlayer() de
+// ../store.ts (V1, jamais modifiee) -- extraites en fonction PURE (aucun
+// import de @workspace/db/schema) pour rester directement testable par le
+// runner de test natif de Node, contrairement a realTryInsertNewPlayer
+// ci-dessous (qui importe dynamiquement le schema -- meme limitation deja
+// documentee pour realLockAndGetPlayer/realUpdatePlayerRow/etc., voir le
+// commentaire "10." dans farmRepository.test.ts).
+export function newPlayerRowDefaults(now: Date): Omit<NewPlayer, "id"> {
+  return {
+    coins: STARTING_COINS,
+    level: 1,
+    xp: 0,
+    irrigationLevel: 0,
+    fertilizerLevel: 0,
+    lastDailyAt: null,
+    autoReplant: false,
+    weeklySnapshotCoins: STARTING_COINS,
+    totalHarvested: 0,
+    quests: freshQuests(),
+    questsResetAt: now,
+    plotSkin: "classic",
+    unlockedSkins: ["classic"],
+    weatherForecast: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// STARTING_PLOTS lignes vides (index 0..STARTING_PLOTS-1), identique a
+// Array.from({length: STARTING_PLOTS}, () => ({cropId:null, ...})) de
+// createPlayer() (V1) -- meme raison d'extraction pure que ci-dessus.
+export function newStartingPlotRows(playerId: string): NewPlot[] {
+  return Array.from({ length: STARTING_PLOTS }, (_unused, index) => ({
+    playerId,
+    plotIndex: index,
+    cropId: null,
+    plantedAt: null,
+    notifiedReady: false,
+  }));
+}
+
+async function realTryInsertNewPlayer(tx: Tx, playerId: string, now: Date): Promise<boolean> {
+  const { players } = await getSchemaTables();
+  const inserted = await tx
+    .insert(players)
+    .values({ id: playerId, ...newPlayerRowDefaults(now) })
+    .onConflictDoNothing({ target: players.id })
+    .returning({ id: players.id });
+  return inserted.length > 0;
+}
+
+async function realInsertStartingPlots(tx: Tx, playerId: string): Promise<void> {
+  const { plots } = await getSchemaTables();
+  await tx
+    .insert(plots)
+    .values(newStartingPlotRows(playerId))
+    .onConflictDoNothing({ target: [plots.playerId, plots.plotIndex] });
+}
+
+const realEnsurePlayerExistsDeps: EnsurePlayerExistsDeps = {
+  ...realMutatePlayerDeps,
+  tryInsertNewPlayer: realTryInsertNewPlayer,
+  insertStartingPlots: realInsertStartingPlots,
+};
+
+export interface EnsurePlayerExistsResult {
+  player: PlayerState;
+  created: boolean;
+}
+
+/**
+ * Garantit qu'une ligne `players` (+ ses STARTING_PLOTS parcelles vides)
+ * existe pour `playerId`, en reproduisant EXACTEMENT createPlayer() de
+ * ../store.ts (V1) -- SANS jamais toucher un joueur deja existant (aucune
+ * remise a zero de coins/inventaire/progression/parcelles, aucune
+ * recreation). Atomique : CAS d'insertion + insertion des parcelles dans
+ * UNE SEULE transaction (voir commentaire de section ci-dessus pour la
+ * preuve de surete en concurrence).
+ *
+ * Retourne TOUJOURS un `PlayerState` exploitable (joueur nouvellement cree
+ * OU deja existant), avec `created` indiquant lequel des deux cas s'est
+ * produit -- utile pour un futur appelant qui voudrait, par exemple,
+ * logger uniquement les creations reelles (jamais les IDs eux-memes, voir
+ * postgresRuntimeAllowlist.ts pour la meme discipline).
+ */
+export async function ensurePlayerExists(
+  playerId: string,
+  deps: EnsurePlayerExistsDeps = realEnsurePlayerExistsDeps,
+  runTransaction?: TransactionRunner,
+  now: Date = new Date(),
+): Promise<EnsurePlayerExistsResult> {
+  const run = runTransaction ?? (await getRealTransactionRunner());
+
+  return run(async (tx) => {
+    const created = await deps.tryInsertNewPlayer(tx, playerId, now);
+    if (created) {
+      await deps.insertStartingPlots(tx, playerId);
+    }
+
+    const playerRow = await deps.lockAndGetPlayer(tx, playerId);
+    if (!playerRow) {
+      throw new Error(
+        `ensurePlayerExists : joueur "${playerId}" introuvable juste apres la tentative de creation -- etat incoherent.`,
+      );
+    }
+    const plotRows = await deps.getPlotsForUpdate(tx, playerId);
+    const inventoryRows = await deps.getInventoryItemsForUpdate(tx, playerId);
+    const player = deps.toPlayerState({ player: playerRow, plots: plotRows, inventoryItems: inventoryRows });
+
+    return { player, created };
   });
 }
 
