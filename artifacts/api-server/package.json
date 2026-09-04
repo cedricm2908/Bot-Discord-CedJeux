@@ -12,7 +12,8 @@
     "diagnose:db": "tsx src/discord/db/diagnose.ts",
     "diagnose:farm-repository": "tsx src/discord/db/diagnoseFarmRepository.ts",
     "test:save-player-integration": "tsx src/discord/db/testSavePlayerIntegration.ts",
-    "test:mutate-player-concurrency": "tsx src/discord/db/testMutatePlayerConcurrency.ts"
+    "test:mutate-player-concurrency": "tsx src/discord/db/testMutatePlayerConcurrency.ts",
+    "test:mutate-global-concurrency": "tsx src/discord/db/testMutateGlobalStateConcurrency.ts"
   },
   "dependencies": {
     "@workspace/api-zod": "workspace:*",

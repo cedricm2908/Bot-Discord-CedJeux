@@ -20,14 +20,21 @@
 // declencherait immediatement la verification DATABASE_URL de
 // lib/db/src/index.ts des le chargement de ce fichier (donc aussi pendant
 // les tests), ce que ce fichier evite deliberement.
-import { asc, eq, sql } from "drizzle-orm";
+import { asc, desc, eq, sql } from "drizzle-orm";
 import { toGlobalState } from "./globalStateAdapter.ts";
 import { toPlayerState } from "./playerAdapter.ts";
 import type { GlobalState, PlayerState } from "../types";
 import type { GlobalStateRecord, PlayerRecord } from "@workspace/db/repositories";
 import type {
+  ContractRow,
+  DailyChallengeContributor,
+  DailyChallengeRow,
   db as DbInstance,
+  GlobalStateRow,
   InventoryItem as InventoryItemRow,
+  NewContractRow,
+  NewDailyChallengeRow,
+  NewGlobalStateRow,
   NewInventoryItem,
   NewPlayer,
   NewPlot,
@@ -111,6 +118,19 @@ export async function getGlobalState(): Promise<GlobalState | null> {
 // branches sur des commandes concurrentes qui font lire-modifier-ecrire hors
 // transaction.
 //
+// ORDRE CANONIQUE DES VERROUS (a respecter PARTOUT dans ce fichier, present
+// et futur -- seule protection contre un deadlock des qu'une transaction
+// doit un jour verrouiller plusieurs ressources a la fois) :
+//   1. global_state (singleton id=1)
+//   2. contract     (singleton id=1)
+//   3. daily_challenge (challenge courant, verrouille de facon deterministe)
+//   4. players      (verrouille par mutatePlayer/savePlayerWithTx)
+// mutateGlobalState() (plus bas) verrouille 1->2->3, jamais 4. La future
+// mutatePlayerAndGlobal() (categorie E de l'audit de migration, PAS encore
+// creee) devra verrouiller 1->2->3 PUIS 4, dans cet ordre exact et jamais
+// l'inverse -- un chemin qui verrouillerait players avant global_state
+// creerait un risque de deadlock avec un chemin qui fait l'inverse.
+//
 // Type du parametre `tx` : derive mecaniquement du type reel de
 // `db.transaction` (via `import type { db }`, efface a la compilation --
 // aucun import runtime de @workspace/db ici) plutot que reconstruit a la
@@ -147,6 +167,10 @@ let schemaTablesPromise: Promise<{
   players: typeof import("@workspace/db/schema").players;
   plots: typeof import("@workspace/db/schema").plots;
   inventoryItems: typeof import("@workspace/db/schema").inventoryItems;
+  globalState: typeof import("@workspace/db/schema").globalState;
+  contract: typeof import("@workspace/db/schema").contract;
+  dailyChallenge: typeof import("@workspace/db/schema").dailyChallenge;
+  dailyChallengeContributors: typeof import("@workspace/db/schema").dailyChallengeContributors;
 }> | null = null;
 
 function getSchemaTables() {
@@ -452,5 +476,304 @@ export async function mutatePlayer(
     player.updatedAt = updatedAt.getTime();
 
     return player;
+  });
+}
+
+// ===========================================================================
+// MUTATION ATOMIQUE : mutateGlobalState
+// ===========================================================================
+//
+// Meme principe que mutatePlayer(), applique a l'etat GLOBAL (global_state +
+// contract + daily_challenge courant) plutot qu'a un joueur : verrouille
+// TOUTES les ressources concernees AVANT de les lire, applique une mutation
+// metier EN MEMOIRE (destinee a etre `enrichGlobalState(global, now)` de
+// ../farm.ts, reutilisee telle quelle), puis ecrit -- le tout dans UNE
+// SEULE transaction, verrou tenu du debut a la fin. Ferme la meme fenetre
+// de lost update que mutatePlayer() ferme pour un joueur, mais pour les
+// transitions globales (meteo, marche, renouvellement du contrat,
+// renouvellement du defi quotidien).
+//
+// ORDRE DES VERROUS : global_state (id=1) -> contract (id=1) -> daily_challenge
+// (challenge courant, verrouille par la MEME requete deterministe que
+// lib/db/src/repositories/globalStateRepository.ts : ORDER BY started_at
+// DESC, id DESC LIMIT 1 FOR UPDATE) -- voir le commentaire canonique
+// au-dessus de `type Tx`. Chaque verrou est pose INCONDITIONNELLEMENT
+// (meme discipline que mutatePlayer avec le joueur) : on ne sait pas a
+// l'avance quelles ressources le mutator va effectivement modifier, donc
+// tout ce qui pourrait etre lu-puis-ecrit est verrouille d'emblee.
+//
+// Puisque global_state est un singleton (id=1) verrouille EN PREMIER par
+// TOUTE transaction qui touche l'etat global, son verrou suffit a lui seul
+// a serialiser des appels concurrents -- y compris la decision de
+// renouveler ou non le defi quotidien (voir plus bas) : un second appel ne
+// peut commencer sa propre lecture qu'apres que le premier ait commit/
+// rollback, et relit donc systematiquement l'etat DEJA A JOUR. Verrouiller
+// aussi contract/daily_challenge individuellement est neanmoins fait par
+// prudence (meme discipline "tout ce qui est lu-puis-ecrit est verrouille"
+// que pour players/plots/inventory_items) : ca protege aussi contre un
+// futur code qui verrouillerait directement contract/daily_challenge sans
+// passer par global_state en premier.
+//
+// LE MUTATOR DOIT RESTER UNE OPERATION METIER EN MEMOIRE : memes
+// contraintes que pour mutatePlayer -- rapide, sans appel reseau, sans I/O
+// externe, sans autre requete DB hors de cette transaction. Un mutator qui
+// ferait de l'I/O externe garderait ces TROIS verrous poses pendant toute
+// cette duree, bloquant TOUTE commande qui touche l'etat global (donc,
+// potentiellement, une bonne partie du jeu) le temps de cette I/O.
+export interface GlobalStateWriteCoreDeps {
+  updateGlobalStateRow: (tx: Tx, values: Omit<NewGlobalStateRow, "id">) => Promise<void>;
+  updateContractRow: (tx: Tx, values: Omit<NewContractRow, "id">) => Promise<void>;
+  updateDailyChallengeRow: (
+    tx: Tx,
+    challengeId: number,
+    values: Omit<NewDailyChallengeRow, "id">,
+  ) => Promise<void>;
+  insertDailyChallengeRow: (tx: Tx, values: Omit<NewDailyChallengeRow, "id">) => Promise<void>;
+}
+
+export interface MutateGlobalStateDeps extends GlobalStateWriteCoreDeps {
+  lockAndGetGlobalState: (tx: Tx) => Promise<GlobalStateRow | null>;
+  lockAndGetContract: (tx: Tx) => Promise<ContractRow | null>;
+  lockAndGetCurrentDailyChallenge: (tx: Tx) => Promise<DailyChallengeRow | null>;
+  getDailyChallengeContributors: (tx: Tx, challengeId: number) => Promise<DailyChallengeContributor[]>;
+  toGlobalState: (record: GlobalStateRecord) => GlobalState;
+}
+
+async function realLockAndGetGlobalState(tx: Tx): Promise<GlobalStateRow | null> {
+  const { globalState } = await getSchemaTables();
+  const [row] = await tx.select().from(globalState).where(eq(globalState.id, 1)).for("update");
+  return row ?? null;
+}
+
+async function realLockAndGetContract(tx: Tx): Promise<ContractRow | null> {
+  const { contract } = await getSchemaTables();
+  const [row] = await tx.select().from(contract).where(eq(contract.id, 1)).for("update");
+  return row ?? null;
+}
+
+// Meme requete que globalStateRepository.getGlobalStateRecord() (ORDER BY
+// started_at DESC, id DESC -- started_at seul n'est pas garanti unique),
+// mais avec FOR UPDATE et sur `tx` : verrouille exactement la ligne
+// renvoyee, de facon deterministe.
+async function realLockAndGetCurrentDailyChallenge(tx: Tx): Promise<DailyChallengeRow | null> {
+  const { dailyChallenge } = await getSchemaTables();
+  const [row] = await tx
+    .select()
+    .from(dailyChallenge)
+    .orderBy(desc(dailyChallenge.startedAt), desc(dailyChallenge.id))
+    .limit(1)
+    .for("update");
+  return row ?? null;
+}
+
+async function realGetDailyChallengeContributors(
+  tx: Tx,
+  challengeId: number,
+): Promise<DailyChallengeContributor[]> {
+  const { dailyChallengeContributors } = await getSchemaTables();
+  return tx
+    .select()
+    .from(dailyChallengeContributors)
+    .where(eq(dailyChallengeContributors.challengeId, challengeId));
+}
+
+async function realUpdateGlobalStateRow(tx: Tx, values: Omit<NewGlobalStateRow, "id">): Promise<void> {
+  const { globalState } = await getSchemaTables();
+  await tx.update(globalState).set(values).where(eq(globalState.id, 1));
+}
+
+async function realUpdateContractRow(tx: Tx, values: Omit<NewContractRow, "id">): Promise<void> {
+  const { contract } = await getSchemaTables();
+  await tx.update(contract).set(values).where(eq(contract.id, 1));
+}
+
+async function realUpdateDailyChallengeRow(
+  tx: Tx,
+  challengeId: number,
+  values: Omit<NewDailyChallengeRow, "id">,
+): Promise<void> {
+  const { dailyChallenge } = await getSchemaTables();
+  await tx.update(dailyChallenge).set(values).where(eq(dailyChallenge.id, challengeId));
+}
+
+// INSERT uniquement -- daily_challenge est un historique append-only (voir
+// lib/db/src/schema/dailyChallenge.ts) : jamais d'UPDATE d'une ancienne
+// ligne pour la "transformer" en nouveau defi, jamais de DELETE d'une
+// ancienne ligne. Le nouveau defi devient "courant" simplement parce que
+// son started_at est le plus recent (voir realLockAndGetCurrentDailyChallenge).
+async function realInsertDailyChallengeRow(tx: Tx, values: Omit<NewDailyChallengeRow, "id">): Promise<void> {
+  const { dailyChallenge } = await getSchemaTables();
+  await tx.insert(dailyChallenge).values(values);
+}
+
+const realMutateGlobalStateDeps: MutateGlobalStateDeps = {
+  lockAndGetGlobalState: realLockAndGetGlobalState,
+  lockAndGetContract: realLockAndGetContract,
+  lockAndGetCurrentDailyChallenge: realLockAndGetCurrentDailyChallenge,
+  getDailyChallengeContributors: realGetDailyChallengeContributors,
+  updateGlobalStateRow: realUpdateGlobalStateRow,
+  updateContractRow: realUpdateContractRow,
+  updateDailyChallengeRow: realUpdateDailyChallengeRow,
+  insertDailyChallengeRow: realInsertDailyChallengeRow,
+  toGlobalState,
+};
+
+/**
+ * Ecrit global_state/contract/daily_challenge EN SUPPOSANT QUE LES TROIS
+ * VERROUS SONT DEJA DETENUS par l'appelant (mutateGlobalState) -- ne
+ * verrouille rien, ne relit rien.
+ *
+ * `originalDailyChallengeId`/`originalDailyChallengeStartedAt` proviennent
+ * de la ligne daily_challenge LUE ET VERROUILLEE avant le mutator (le type
+ * metier DailyChallengeState n'a pas d'id, donc cette info doit transiter
+ * separement -- meme raison que writePlayerStateAssumingLock qui a besoin
+ * du player.userId, deja present sur PlayerState, alors qu'ici l'id de
+ * ligne daily_challenge n'a pas d'equivalent metier).
+ *
+ * Decision UPDATE vs INSERT pour daily_challenge : si
+ * `global.dailyChallenge.startedAt` differe de la valeur lue au debut de
+ * la transaction, le mutator a remplace le defi (renouvellement, voir
+ * enrichGlobalState -- `global.dailyChallenge = randomDailyChallenge(now)`)
+ * -> INSERT d'une nouvelle ligne, l'ancienne n'est ni modifiee ni
+ * supprimee. Sinon, c'est le MEME defi dont seules des valeurs ont pu
+ * changer (progress/completed/rewarded) -> UPDATE cible de la ligne deja
+ * verrouillee. `dailyChallengeContributors` n'est JAMAIS ecrit ici : ni
+ * enrichGlobalState() ni aucun mutator attendu dans ce lot n'y touche
+ * (l'ajout de contributeurs est une consequence de harvest(), categorie E
+ * de l'audit de migration -- mutatePlayerAndGlobal(), pas encore cree).
+ */
+async function writeGlobalStateAssumingLock(
+  tx: Tx,
+  global: GlobalState,
+  originalDailyChallengeId: number,
+  originalDailyChallengeStartedAt: number,
+  deps: GlobalStateWriteCoreDeps,
+): Promise<void> {
+  await deps.updateGlobalStateRow(tx, {
+    marketMultiplier: global.marketMultiplier,
+    previousMarketMultiplier: global.previousMarketMultiplier,
+    marketUpdatedAt: new Date(global.marketUpdatedAt),
+    weather: global.weather,
+    weatherMultiplier: global.weatherMultiplier,
+    weatherChangedAt: global.weatherChangedAt !== null ? new Date(global.weatherChangedAt) : null,
+    weatherExpiresAt: global.weatherExpiresAt !== null ? new Date(global.weatherExpiresAt) : null,
+    nextWeatherAt: new Date(global.nextWeatherAt),
+    nextWeatherType: global.nextWeatherType,
+    weeklyStartedAt: new Date(global.weeklyStartedAt),
+  });
+
+  await deps.updateContractRow(tx, {
+    cropId: global.contract.cropId,
+    required: global.contract.required,
+    remaining: global.contract.remaining,
+    bonusMultiplier: global.contract.bonusMultiplier,
+    renewedAt: new Date(global.contract.renewedAt),
+  });
+
+  const dailyChallengeValues = {
+    cropId: global.dailyChallenge.cropId,
+    target: global.dailyChallenge.target,
+    progress: global.dailyChallenge.progress,
+    rewardCoins: global.dailyChallenge.rewardCoins,
+    startedAt: new Date(global.dailyChallenge.startedAt),
+    completed: global.dailyChallenge.completed,
+    rewarded: global.dailyChallenge.rewarded,
+  };
+
+  const isRenewal = global.dailyChallenge.startedAt !== originalDailyChallengeStartedAt;
+  if (isRenewal) {
+    await deps.insertDailyChallengeRow(tx, dailyChallengeValues);
+  } else {
+    await deps.updateDailyChallengeRow(tx, originalDailyChallengeId, dailyChallengeValues);
+  }
+}
+
+/**
+ * Lit, mute et sauvegarde l'etat global (global_state + contract +
+ * daily_challenge courant) dans UNE SEULE transaction, les trois verrous
+ * poses du debut a la fin -- ferme la fenetre de lost update/double
+ * transition que des appels concurrents a `enrichGlobalState` hors
+ * transaction laisseraient ouverte.
+ *
+ * Deroulement : SELECT ... FOR UPDATE sur global_state (absent -> throw,
+ * rien d'autre n'est lu/ecrit) -> SELECT ... FOR UPDATE sur contract
+ * (absent -> throw, etat incoherent) -> SELECT ... FOR UPDATE sur le
+ * daily_challenge courant, ORDER BY started_at DESC, id DESC (absent ->
+ * throw, etat incoherent) -> SELECT des contributeurs du defi courant ->
+ * toGlobalState(...) -> mutator(global) EN MEMOIRE -> ecriture (AUCUN
+ * second verrou) -> COMMIT.
+ *
+ * `mutator` mute `global` EN PLACE (retour `void`/`Promise<void>`, sync ou
+ * async supporte comme mutatePlayer) : cet objet est fraichement construit
+ * a l'interieur de cette transaction, sans aucune autre reference externe.
+ * Destine a recevoir `(global) => enrichGlobalState(global)` de
+ * ../farm.ts, reutilisee telle quelle -- aucune regle metier (formules de
+ * marche/meteo/contrat/defi) n'est dupliquee ici.
+ *
+ * global_state n'a PAS de colonne updated_at technique (contrairement a
+ * players) : aucune valeur de ce type n'est donc calculee ni reportee ici.
+ *
+ * Si `mutator` leve (sync ou async) ou si l'ecriture echoue, l'erreur
+ * remonte telle quelle et la transaction entiere est annulee par Drizzle
+ * (rollback automatique) -- aucune ecriture partielle possible.
+ *
+ * Concurrence : deux mutateGlobalState concurrents sont serialises par le
+ * SELECT ... FOR UPDATE sur global_state (id=1, verrouille en premier) --
+ * le second bloque jusqu'a ce que le premier commit/rollback, puis relit
+ * l'etat DEJA A JOUR (y compris un daily_challenge deja renouvele par le
+ * premier, ce qui evite de creer deux nouvelles lignes pour UNE seule
+ * transition : le second, en relisant l'etat frais, constate via
+ * enrichGlobalState() que le renouvellement n'est plus du et n'insere
+ * rien).
+ */
+export async function mutateGlobalState(
+  mutator: (global: GlobalState) => void | Promise<void>,
+  deps: MutateGlobalStateDeps = realMutateGlobalStateDeps,
+  runTransaction?: TransactionRunner,
+): Promise<GlobalState> {
+  const run = runTransaction ?? (await getRealTransactionRunner());
+
+  return run(async (tx) => {
+    const globalRow = await deps.lockAndGetGlobalState(tx);
+    if (!globalRow) {
+      throw new Error(
+        "mutateGlobalState : global_state introuvable (id=1) -- base non initialisee, aucune mutation effectuee.",
+      );
+    }
+
+    const contractRow = await deps.lockAndGetContract(tx);
+    if (!contractRow) {
+      throw new Error(
+        "mutateGlobalState : contract introuvable (id=1) -- etat incoherent, aucune mutation effectuee.",
+      );
+    }
+
+    const dailyChallengeRow = await deps.lockAndGetCurrentDailyChallenge(tx);
+    if (!dailyChallengeRow) {
+      throw new Error(
+        "mutateGlobalState : aucun daily_challenge trouve -- etat incoherent, aucune mutation effectuee.",
+      );
+    }
+
+    const contributorRows = await deps.getDailyChallengeContributors(tx, dailyChallengeRow.id);
+
+    const global = deps.toGlobalState({
+      globalState: globalRow,
+      contract: contractRow,
+      dailyChallenge: dailyChallengeRow,
+      dailyChallengeContributors: contributorRows,
+    });
+
+    await mutator(global);
+
+    await writeGlobalStateAssumingLock(
+      tx,
+      global,
+      dailyChallengeRow.id,
+      dailyChallengeRow.startedAt.getTime(),
+      deps,
+    );
+
+    return global;
   });
 }
