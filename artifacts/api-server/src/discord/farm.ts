@@ -13,6 +13,7 @@ import {
   RECIPES,
   STARTING_PLOTS,
   WEEKLY_INTERVAL_MS,
+  WEEKLY_LEADERBOARD_REWARDS,
   WEATHER_INFO,
   cropById,
   freshQuests,
@@ -165,9 +166,8 @@ export function resetWeeklyIfNeeded(store: FarmStore, now = Date.now()): boolean
   const top = [...store.getPlayers()]
     .sort((a, b) => b.coins - b.weeklySnapshotCoins - (a.coins - a.weeklySnapshotCoins))
     .slice(0, 3);
-  const rewards = [500, 300, 150];
   top.forEach((player, index) => {
-    player.coins += rewards[index] ?? 0;
+    player.coins += WEEKLY_LEADERBOARD_REWARDS[index] ?? 0;
   });
   for (const player of store.getPlayers()) {
     player.weeklySnapshotCoins = player.coins;

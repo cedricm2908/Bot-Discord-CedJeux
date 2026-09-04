@@ -20,7 +20,7 @@
 // declencherait immediatement la verification DATABASE_URL de
 // lib/db/src/index.ts des le chargement de ce fichier (donc aussi pendant
 // les tests), ce que ce fichier evite deliberement.
-import { asc, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, like, sql } from "drizzle-orm";
 import { toGlobalState } from "./globalStateAdapter.ts";
 import { toPlayerState } from "./playerAdapter.ts";
 import type { GlobalState, PlayerState } from "../types";
@@ -41,7 +41,9 @@ import type {
   NewPlot,
   Player,
   Plot as PlotRow,
+  RewardClaim,
 } from "@workspace/db";
+import { WEEKLY_INTERVAL_MS, WEEKLY_LEADERBOARD_REWARDS } from "../constants.ts";
 
 export interface FarmRepositoryDeps {
   getPlayerRecord: (playerId: string) => Promise<PlayerRecord | null>;
@@ -172,6 +174,7 @@ let schemaTablesPromise: Promise<{
   contract: typeof import("@workspace/db/schema").contract;
   dailyChallenge: typeof import("@workspace/db/schema").dailyChallenge;
   dailyChallengeContributors: typeof import("@workspace/db/schema").dailyChallengeContributors;
+  rewardClaims: typeof import("@workspace/db/schema").rewardClaims;
 }> | null = null;
 
 function getSchemaTables() {
@@ -989,4 +992,1090 @@ export async function mutatePlayerAndGlobal(
 
     return { player, global };
   });
+}
+
+// ===========================================================================
+// LOT 5 : ELECTION ATOMIQUE + FAN-OUT (weekly, defi quotidien, notifications)
+// ===========================================================================
+//
+// Trois systemes automatiques V1 (bot.ts + farm.ts) doivent pouvoir tourner
+// sur PLUSIEURS instances/ticks concurrents sans jamais : distribuer deux
+// fois une recompense, faire deux resets weekly, recompenser deux fois un
+// defi quotidien, perdre une mutation joueur, ou envoyer deux fois la meme
+// notification. Architecture volontairement en DEUX ETAPES SEPAREES,
+// jamais une seule grosse transaction verrouillant tous les joueurs :
+//
+//  1. ELECTION/CLAIM ATOMIQUE : une operation SQL unique (UPDATE ... WHERE
+//     ancienne_valeur = ... ou INSERT ... ON CONFLICT DO NOTHING) decide,
+//     parmi plusieurs appelants concurrents, UN SEUL gagnant. Les perdants
+//     repartent immediatement avec { claimed: false }, sans avoir rien lu
+//     ni ecrit d'autre.
+//  2. FAN-OUT : le gagnant applique les mutations joueur UNE PAR UNE via
+//     mutatePlayer() (weekly, reset de snapshot) ou via
+//     claimAndMutatePlayer() (toute recompense reelle -- voir plus bas),
+//     jamais via une transaction unique qui verrouillerait tous les
+//     joueurs a la fois.
+//
+// REWARD_CLAIMS -- UTILISATION EXACTE : la table existe deja
+// (lib/db/src/schema/rewardClaims.ts, jamais utilisee avant ce lot) avec
+// UNIQUE(player_id, claim_type). Son propre commentaire documente deja la
+// convention retenue : encoder la PERIODE/le CYCLE dans claim_type (ex.
+// "weekly:2026-W36"). Verification faite : claim_type est une colonne TEXT
+// libre, sans CHECK ni enum -- rien n'empeche d'y encoder un identifiant de
+// cycle STABLE, donc AUCUNE MIGRATION DE SCHEMA n'est necessaire pour ce
+// lot (voir le rapport de cette etape, section 13, pour la confirmation
+// explicite demandee).
+//
+// Deux usages DISTINCTS de reward_claims, avec deux familles de
+// claim_type :
+//  a. "ASSIGNMENT" (weekly uniquement) : qui a gagne quel rang pour quel
+//     cycle -- ecrit UNE FOIS par l'election, JAMAIS reecrit. C'est le
+//     "plan" persiste durablement SANS nouvelle table : une ligne
+//     reward_claims par gagnant suffit, et reste lisible apres un
+//     redemarrage complet du processus (voir getWeeklyRewardAssignments).
+//  b. "PAYOUT" (weekly + defi quotidien) : le paiement reel (coins += X)
+//     est-il DEJA effectue pour ce joueur, pour ce cycle/defi precis --
+//     ecrit ATOMIQUEMENT AVEC la mutation du joueur elle-meme, par
+//     claimAndMutatePlayer() (voir plus bas), jamais separement.
+//
+// POURQUOI CETTE SEPARATION EST NECESSAIRE (et pas juste "une ligne
+// reward_claims par joueur suffit") : si l'assignation ET le paiement
+// partageaient le MEME claim_type, la ligne inseree par l'election
+// bloquerait a tort claimAndMutatePlayer() (qui la trouverait deja
+// presente et conclurait a tort "deja paye"), alors que le paiement reel
+// n'a pas encore eu lieu. Deux claim_type distincts par cycle resolvent
+// ce probleme sans ambiguite.
+//
+// claim_type utilises dans ce lot (toujours texte libre, jamais de
+// migration) :
+//   "weekly-member:<cycleId>"                         -- population (voir plus bas)
+//   "weekly-bonus-assignment:<cycleId>:rank<1|2|3>"  -- assignation (a)
+//   "weekly-bonus-payout:<cycleId>"                   -- paiement (b)
+//   "weekly-snapshot:<cycleId>"                        -- paiement (b)
+//   "daily-challenge-reward:<challengeId>"            -- paiement (b)
+// cycleId = epoch ms (en chaine) de l'ancien global_state.weekly_started_at
+// AVANT le renouvellement -- stable, unique par cycle, deja disponible
+// sans calcul de semaine ISO. challengeId = id reel de la ligne
+// daily_challenge (deja stable par construction, table append-only).
+//
+// "weekly-member:<cycleId>" merite une precision : ce n'est PAS une
+// recompense accordee (contrairement aux autres claim_type de ce
+// fichier), mais un FAIT durable ("ce joueur appartenait a ce cycle").
+// C'est une extension deliberee et assumee de l'usage de reward_claims --
+// justifiee par le mecanisme sous-jacent qu'elle fournit deja
+// gratuitement (fait idempotent par (player_id, claim_type), horodate,
+// jamais duplique) etant EXACTEMENT ce qui est necessaire ici, sans
+// ambiguite d'interpretation possible grace au namespace explicite du
+// claim_type. Si ce type d'usage devait un jour se multiplier ou devenir
+// moins trivial a interpreter, une petite table dediee serait
+// preferable -- mais un seul usage, clairement isole et documente, ne le
+// justifie pas.
+export function weeklyMemberClaimType(cycleId: string): string {
+  return `weekly-member:${cycleId}`;
+}
+
+export function weeklyBonusAssignmentClaimType(cycleId: string, rank: number): string {
+  return `weekly-bonus-assignment:${cycleId}:rank${rank}`;
+}
+
+// "weekly-target:<cycleId>:<value>" fige, AU MOMENT DE L'ELECTION, la
+// valeur EXACTE que weeklySnapshotCoins devra prendre pour CE joueur dans
+// CE cycle -- CORRECTION D'UN BUG REEL : resumeWeeklyRewards() derivait
+// auparavant ce snapshot depuis player.coins AU MOMENT DU FAN-OUT (pas de
+// l'election), ce qui incluait a tort tout gain/perte de gameplay survenu
+// ENTRE l'election et la reprise (potentiellement bien plus tard en cas
+// de crash) dans le snapshot de la semaine qui se termine -- au lieu de
+// laisser ces gains compter pour la semaine SUIVANTE, comme le fait V1
+// (snapshot pris de maniere synchrone AU MOMENT du reset, jamais
+// recalcule plus tard).
+//
+// EVALUATION DE L'ENCODAGE : plutot que de fusionner cette valeur DANS
+// "weekly-member:<cycleId>" (ce qui casserait sa recherche par EGALITE
+// STRICTE existante -- la valeur, inconnue tant que target n'est pas
+// calcule, ne peut pas faire partie d'une cle recherchee par egalite --
+// et forcerait tout le code deja teste de
+// getWeeklyCycleMembers()/getPendingWeeklyCycleIds() a etre reecrit),
+// c'est une famille de claim_type SEPAREE, symetrique a
+// "weekly-bonus-assignment:<cycleId>:rank<N>" : le ":" IMMEDIATEMENT
+// apres <cycleId> agit comme delimiteur naturel, ce qui rend la recherche
+// LIKE-prefixe "weekly-target:<cycleId>:" SURE (aucune collision possible
+// avec un cycleId plus long qui commencerait par les memes chiffres,
+// exactement le meme raisonnement que pour l'assignation -- contrairement
+// a "weekly-member:<cycleId>" qui n'a aucun delimiteur et doit rester en
+// EGALITE stricte). <value> est un entier signe (relu via Number(), meme
+// niveau de confiance dans les donnees internes que getWeeklyRewardAssignments
+// pour <rank>) ; un signe "-" eventuel ne cree aucune ambiguite de parsing
+// car <cycleId> ne contient jamais lui-meme de "-" (String(Date.getTime())
+// est purement numerique). "text" (PostgreSQL) n'a pas de limite de
+// taille pratique pour un entier serialise. Une seule ligne par
+// (playerId, cycleId) est garantie par construction : cycleId n'est
+// jamais reutilise pour une nouvelle election (le CAS avance
+// weekly_started_at de maniere strictement monotone), donc ce claim_type
+// n'est jamais insere qu'une seule fois par joueur, DANS LA MEME
+// TRANSACTION que l'election -- meme niveau de confiance structurelle que
+// "weekly-member"/"weekly-bonus-assignment" deja en production dans ce
+// fichier.
+export function weeklySnapshotTargetClaimType(cycleId: string, target: number): string {
+  return `weekly-target:${cycleId}:${target}`;
+}
+
+export function weeklyBonusPayoutClaimType(cycleId: string): string {
+  return `weekly-bonus-payout:${cycleId}`;
+}
+
+export function dailyChallengeRewardClaimType(challengeId: number): string {
+  return `daily-challenge-reward:${challengeId}`;
+}
+
+// ---------------------------------------------------------------------------
+// claimAndMutatePlayer : primitive de PAIEMENT idempotent, reutilisee par le
+// weekly ET le defi quotidien.
+// ---------------------------------------------------------------------------
+//
+// Meme discipline de verrouillage et d'ecriture que mutatePlayer()
+// (reutilise directement writePlayerStateAssumingLock -- aucune logique
+// d'ecriture dupliquee) : verrouille le joueur (SELECT ... FOR UPDATE),
+// PUIS tente d'inserer la ligne reward_claims (INSERT ... ON CONFLICT DO
+// NOTHING) DANS LA MEME TRANSACTION que la mutation elle-meme. C'est cette
+// atomicite (claim + paiement dans UNE seule transaction, jamais deux
+// etapes separees) qui garantit qu'aucun double paiement n'est possible :
+// soit les deux reussissent ensemble (COMMIT), soit aucun des deux n'a
+// lieu (ROLLBACK, ex. si le mutator leve). Un appel ulterieur avec le
+// MEME (playerId, claimType) trouve la ligne deja presente, n'ecrit rien,
+// et retourne { claimed: false, player: null } -- sans jamais rejouer la
+// mutation.
+//
+// C'est la maniere correcte de satisfaire "chaque recompense doit passer
+// par mutatePlayer()" tout en garantissant l'absence de double paiement :
+// mutatePlayer() seul n'a aucune notion de claim et rejouerait la mutation
+// a chaque appel.
+export interface ClaimAndMutatePlayerDeps extends MutatePlayerDeps {
+  tryInsertRewardClaim: (tx: Tx, playerId: string, claimType: string) => Promise<boolean>;
+}
+
+async function realTryInsertRewardClaim(tx: Tx, playerId: string, claimType: string): Promise<boolean> {
+  const { rewardClaims } = await getSchemaTables();
+  const inserted = await tx
+    .insert(rewardClaims)
+    .values({ playerId, claimType })
+    .onConflictDoNothing({ target: [rewardClaims.playerId, rewardClaims.claimType] })
+    .returning({ id: rewardClaims.id });
+  return inserted.length > 0;
+}
+
+const realClaimAndMutatePlayerDeps: ClaimAndMutatePlayerDeps = {
+  ...realMutatePlayerDeps,
+  tryInsertRewardClaim: realTryInsertRewardClaim,
+};
+
+/**
+ * Tente de reclamer `claimType` pour `playerId` et, UNIQUEMENT en cas de
+ * succes, applique `mutator` et l'ecrit -- le tout dans UNE SEULE
+ * transaction (verrou joueur + claim + mutation + ecriture atomiques
+ * ensemble). Si la reclamation echoue (ligne reward_claims deja presente
+ * pour ce couple), retourne immediatement `{ claimed: false, player: null
+ * }` SANS lire plots/inventory, SANS appeler `mutator`, SANS ecrire quoi
+ * que ce soit -- idempotent par construction, sans avoir besoin de savoir
+ * si un appel precedent a reussi.
+ *
+ * `mutator` mute `player` EN PLACE, memes contraintes que mutatePlayer()
+ * (en memoire, rapide, sans I/O externe -- le verrou joueur est detenu
+ * pendant son execution).
+ */
+export async function claimAndMutatePlayer(
+  playerId: string,
+  claimType: string,
+  mutator: (player: PlayerState) => void | Promise<void>,
+  deps: ClaimAndMutatePlayerDeps = realClaimAndMutatePlayerDeps,
+  runTransaction?: TransactionRunner,
+): Promise<{ claimed: boolean; player: PlayerState | null }> {
+  const run = runTransaction ?? (await getRealTransactionRunner());
+
+  return run(async (tx) => {
+    const playerRow = await deps.lockAndGetPlayer(tx, playerId);
+    if (!playerRow) {
+      throw new Error(
+        `claimAndMutatePlayer : joueur "${playerId}" introuvable -- aucune creation automatique, aucune mutation effectuee.`,
+      );
+    }
+
+    const claimed = await deps.tryInsertRewardClaim(tx, playerId, claimType);
+    if (!claimed) {
+      return { claimed: false, player: null };
+    }
+
+    const plotRows = await deps.getPlotsForUpdate(tx, playerId);
+    const inventoryRows = await deps.getInventoryItemsForUpdate(tx, playerId);
+    const player = deps.toPlayerState({ player: playerRow, plots: plotRows, inventoryItems: inventoryRows });
+
+    await mutator(player);
+
+    const updatedAt = new Date();
+    await writePlayerStateAssumingLock(tx, player, updatedAt, deps);
+    player.updatedAt = updatedAt.getTime();
+
+    return { claimed: true, player };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// A. WEEKLY RESET / REWARDS
+// ---------------------------------------------------------------------------
+//
+// Regles V1 EXACTES conservees (voir farm.ts:resetWeeklyIfNeeded, jamais
+// modifie -- seul le litteral [500,300,150] a ete extrait vers
+// WEEKLY_LEADERBOARD_REWARDS dans constants.ts pour eviter toute
+// divergence entre V1/JSON et cette primitive, meme valeurs, zero
+// changement de comportement) :
+//   - du : now - weeklyStartedAt >= WEEKLY_INTERVAL_MS (7 jours).
+//   - classement : TOUS les joueurs, tries par (coins - weeklySnapshotCoins)
+//     decroissant -- le "gain net" de la semaine.
+//   - 3 gagnants exactement (WEEKLY_LEADERBOARD_REWARDS.length), rangs
+//     1/2/3 -> +500/+300/+150 coins.
+//   - ENSUITE (V1 : boucle separee, apres les bonus), TOUS les joueurs
+//     (gagnants inclus) ont leur weeklySnapshotCoins remis a leur coins
+//     COURANT -- pour un gagnant, ce coins courant INCLUT deja son bonus
+//     (V1 applique les bonus avant la boucle de reset, execution
+//     synchrone). Cet ordre est reproduit ici : payer les 3 gagnants
+//     D'ABORD, remettre a niveau weeklySnapshotCoins de TOUS les joueurs
+//     ENSUITE (voir le commentaire d'orchestration plus bas).
+//   - global.weeklyStartedAt = now.
+//
+// ELECTION : CAS optimiste "UPDATE ... WHERE ancienne_valeur" (PAS de
+// SELECT ... FOR UPDATE, pas de lecture-puis-ecriture non atomique) : on
+// lit weekly_started_at (sans verrou), on verifie qu'il est du, PUIS on
+// tente `UPDATE global_state SET weekly_started_at = now() WHERE id = 1
+// AND weekly_started_at = <valeur lue>` -- si un autre appel a gagne
+// entre-temps, cette condition ne correspond plus (0 ligne modifiee) et
+// cet appel perd proprement, sans avoir rien ecrit. Le classement (lecture
+// de TOUS les joueurs, realGetAllPlayersForWeeklyRanking) est UNE SEULE
+// requete SQL (`tx.select(...).from(players)`, aucune boucle de lectures
+// individuelles), jamais verrouillee -- "PAS de grosse transaction
+// verrouillant tous les joueurs". COHERENCE OBTENUE : sous READ COMMITTED
+// (isolation par defaut de PostgreSQL, aucune option d'isolation
+// specifiee sur db.transaction() ici), chaque INSTRUCTION SQL individuelle
+// voit un instantane pris au debut de CETTE instruction -- donc toutes
+// les lignes retournees par CETTE UNIQUE requete sont mutuellement
+// coherentes, comme observees au meme instant, meme si des joueurs jouent
+// simultanement (leurs ecritures concurrentes, si elles commitent apres
+// le debut de cette requete, restent simplement invisibles a cette
+// lecture -- exactement le comportement souhaite : leurs gains comptent
+// pour le cycle SUIVANT). C'est le minimum demande ("au moins une seule
+// lecture SQL coherente"), obtenu gratuitement par construction (une
+// seule requete), sans SERIALIZABLE ni verrou explicite sur `players`.
+//
+// ASSIGNATION + POPULATION + CIBLES DE SNAPSHOT DURABLES : des que
+// l'election est gagnee, TROIS familles de lignes reward_claims sont
+// inserees DANS LA MEME TRANSACTION que le CAS -- c'est le "plan" complet,
+// entierement persiste et redecouvrable meme apres un redemarrage complet
+// du processus :
+//   1. "weekly-member:<cycleId>" -- UNE ligne par joueur de la population
+//      (TOUS les joueurs lus pour le classement, gagnants et non-gagnants
+//      confondus). C'est la liste FIGEE des joueurs qui appartiennent a
+//      CE cycle -- un joueur cree APRES l'election n'aura jamais cette
+//      ligne pour ce cycleId, donc ne sera jamais traite pour lui (voir
+//      getWeeklyCycleMembers()/resumeWeeklyRewards() plus bas).
+//   2. "weekly-bonus-assignment:<cycleId>:rank<N>" -- une ligne par
+//      gagnant (deja presente avant cette correction).
+//   3. "weekly-target:<cycleId>:<value>" -- une ligne par joueur de la
+//      population, encodant la valeur EXACTE (coins observes A
+//      L'ELECTION, + bonus pour un gagnant) que weeklySnapshotCoins devra
+//      prendre -- CORRECTION D'UN BUG REEL detecte apres coup : sans
+//      cette famille, resumeWeeklyRewards() ne pouvait que deriver le
+//      snapshot depuis player.coins AU MOMENT DU FAN-OUT, incluant a tort
+//      du gameplay survenu entre l'election et la reprise (voir
+//      weeklySnapshotTargetClaimType ci-dessus pour le detail complet).
+// Redecouvrables via
+// getWeeklyCycleMembers()/getWeeklyRewardAssignments()/getWeeklySnapshotTargets().
+//
+// CORRECTION IMPORTANTE (incoherence d'identite de cycle detectee et
+// corrigee) : `cycleId` est TOUJOURS l'ANCIENNE valeur de weekly_started_at
+// (celle lue par le peek, AVANT le CAS) -- c'est la semaine qui vient de
+// se terminer et qu'on est en train de recompenser. Immediatement apres
+// le CAS, global_state.weekly_started_at devient la NOUVELLE valeur (le
+// debut de la semaine SUIVANTE, pas encore due) -- getCurrentWeeklyCycleId()
+// reflete donc TOUJOURS le cycle EN COURS (ouvert, pas encore elu),
+// JAMAIS le cycle qui vient d'etre elu et dont le fan-out doit reprendre.
+// Utiliser getCurrentWeeklyCycleId() pour trouver quoi reprendre serait
+// une erreur -- c'est precisement pour cela que getPendingWeeklyCycleIds()
+// (plus bas) existe : il decouvre TOUS les cycles avec du travail en
+// attente directement depuis les lignes reward_claims deja persistees,
+// sans jamais dependre de la valeur courante -- forcement unique -- de
+// global_state.weekly_started_at.
+export interface WeeklyRewardWinner {
+  playerId: string;
+  rank: number;
+  bonus: number;
+}
+
+export type WeeklyRewardClaimResult =
+  | { claimed: false }
+  | { claimed: true; cycleId: string; winners: WeeklyRewardWinner[]; allPlayerIds: string[] };
+
+export interface WeeklyRewardClaimDeps {
+  peekWeeklyStartedAt: (tx: Tx) => Promise<Date | null>;
+  getAllPlayersForWeeklyRanking: (tx: Tx) => Promise<{ id: string; coins: number; weeklySnapshotCoins: number }[]>;
+  tryAdvanceWeeklyStartedAt: (tx: Tx, expectedOldValue: Date, newValue: Date) => Promise<boolean>;
+  tryInsertRewardClaim: (tx: Tx, playerId: string, claimType: string) => Promise<boolean>;
+}
+
+async function realPeekWeeklyStartedAt(tx: Tx): Promise<Date | null> {
+  const { globalState } = await getSchemaTables();
+  const [row] = await tx
+    .select({ weeklyStartedAt: globalState.weeklyStartedAt })
+    .from(globalState)
+    .where(eq(globalState.id, 1))
+    .limit(1);
+  return row ? row.weeklyStartedAt : null;
+}
+
+async function realGetAllPlayersForWeeklyRanking(
+  tx: Tx,
+): Promise<{ id: string; coins: number; weeklySnapshotCoins: number }[]> {
+  const { players } = await getSchemaTables();
+  return tx
+    .select({ id: players.id, coins: players.coins, weeklySnapshotCoins: players.weeklySnapshotCoins })
+    .from(players);
+}
+
+async function realTryAdvanceWeeklyStartedAt(tx: Tx, expectedOldValue: Date, newValue: Date): Promise<boolean> {
+  const { globalState } = await getSchemaTables();
+  const updated = await tx
+    .update(globalState)
+    .set({ weeklyStartedAt: newValue })
+    .where(and(eq(globalState.id, 1), eq(globalState.weeklyStartedAt, expectedOldValue)))
+    .returning({ id: globalState.id });
+  return updated.length > 0;
+}
+
+const realWeeklyRewardClaimDeps: WeeklyRewardClaimDeps = {
+  peekWeeklyStartedAt: realPeekWeeklyStartedAt,
+  getAllPlayersForWeeklyRanking: realGetAllPlayersForWeeklyRanking,
+  tryAdvanceWeeklyStartedAt: realTryAdvanceWeeklyStartedAt,
+  tryInsertRewardClaim: realTryInsertRewardClaim,
+};
+
+/**
+ * Election atomique du weekly reset. Retourne `{ claimed: false }` si le
+ * cycle n'est pas du OU si un autre appel concurrent a deja gagne (les
+ * deux cas sont indiscernables pour l'appelant, et n'ont pas besoin de
+ * l'etre : "rien a faire" dans les deux cas). En cas de succes, retourne
+ * le plan complet (gagnants + montants + liste de tous les joueurs) --
+ * ET, DANS LA MEME TRANSACTION que le CAS, persiste durablement CE PLAN
+ * EN ENTIER (population + assignations + cibles de snapshot figees, voir
+ * le commentaire de section ci-dessus) : une election commitee a donc
+ * TOUJOURS son plan complet
+ * disponible en base, meme si le processus crashe immediatement apres
+ * (rollback total sinon -- pas d'etat intermediaire possible). Le fan-out
+ * lui-meme (paiement des gagnants puis reset de weeklySnapshotCoins) est
+ * effectue separement par resumeWeeklyRewards(cycleId), qui n'a besoin
+ * d'AUCUN objet en memoire issu de cet appel pour fonctionner.
+ *
+ * N'effectue AUCUNE mutation joueur elle-meme -- l'appelant doit ensuite
+ * appeler resumeWeeklyRewards(cycleId) (voir sa documentation pour l'ordre
+ * exact bonus/snapshot, reproduit V1).
+ */
+export async function tryClaimWeeklyReset(
+  deps: WeeklyRewardClaimDeps = realWeeklyRewardClaimDeps,
+  runTransaction?: TransactionRunner,
+  now: Date = new Date(),
+): Promise<WeeklyRewardClaimResult> {
+  const run = runTransaction ?? (await getRealTransactionRunner());
+
+  return run(async (tx) => {
+    const currentWeeklyStartedAt = await deps.peekWeeklyStartedAt(tx);
+    if (!currentWeeklyStartedAt) {
+      throw new Error("tryClaimWeeklyReset : global_state introuvable (id=1) -- base non initialisee.");
+    }
+
+    if (now.getTime() - currentWeeklyStartedAt.getTime() < WEEKLY_INTERVAL_MS) {
+      return { claimed: false };
+    }
+
+    const players = await deps.getAllPlayersForWeeklyRanking(tx);
+    const ranked = [...players]
+      .sort((a, b) => b.coins - b.weeklySnapshotCoins - (a.coins - a.weeklySnapshotCoins))
+      .slice(0, WEEKLY_LEADERBOARD_REWARDS.length);
+    const winners: WeeklyRewardWinner[] = ranked.map((player, index) => ({
+      playerId: player.id,
+      rank: index + 1,
+      bonus: WEEKLY_LEADERBOARD_REWARDS[index] ?? 0,
+    }));
+
+    const advanced = await deps.tryAdvanceWeeklyStartedAt(tx, currentWeeklyStartedAt, now);
+    if (!advanced) {
+      // Course perdue entre le peek et l'UPDATE : un autre appel a gagne
+      // entre-temps. Rien n'a ete ecrit (ni membres, ni assignations).
+      return { claimed: false };
+    }
+
+    // cycleId = l'ANCIENNE valeur (celle du peek, AVANT le CAS) -- c'est
+    // la semaine qui vient de se terminer, voir le commentaire de section
+    // ci-dessus pour l'explication complete de ce choix.
+    const cycleId = String(currentWeeklyStartedAt.getTime());
+    const bonusByPlayerId = new Map(winners.map((winner) => [winner.playerId, winner.bonus]));
+
+    // Population FIGEE du cycle, persistee DANS CETTE MEME TRANSACTION que
+    // le CAS -- garantit qu'une election commitee a TOUJOURS sa population
+    // complete disponible, jamais partiellement (voir resumeWeeklyRewards
+    // et getPendingWeeklyCycleIds plus bas, qui en dependent). Pour CHAQUE
+    // membre, la cible EXACTE de weeklySnapshotCoins est calculee ICI,
+    // depuis les coins OBSERVES A L'ELECTION (`player.coins` issu de la
+    // MEME lecture que le classement, jamais recalcule plus tard) -- regle
+    // V1 : bonus puis snapshot, donc pour un gagnant la cible inclut son
+    // bonus (coinsAtElection + bonus), et pour un non-gagnant c'est
+    // simplement coinsAtElection. Voir weeklySnapshotTargetClaimType
+    // ci-dessus pour le detail complet de cette correction.
+    for (const player of players) {
+      await deps.tryInsertRewardClaim(tx, player.id, weeklyMemberClaimType(cycleId));
+      const snapshotTarget = player.coins + (bonusByPlayerId.get(player.id) ?? 0);
+      await deps.tryInsertRewardClaim(tx, player.id, weeklySnapshotTargetClaimType(cycleId, snapshotTarget));
+    }
+    for (const winner of winners) {
+      await deps.tryInsertRewardClaim(tx, winner.playerId, weeklyBonusAssignmentClaimType(cycleId, winner.rank));
+    }
+
+    return { claimed: true, cycleId, winners, allPlayerIds: players.map((player) => player.id) };
+  });
+}
+
+/**
+ * Redecouvre les gagnants assignes pour un cycle donne, a partir des
+ * lignes reward_claims "weekly-bonus-assignment:<cycleId>:rank<N>" --
+ * survit a un redemarrage complet du processus (contrairement au plan
+ * retourne en memoire par tryClaimWeeklyReset). LECTURE SEULE.
+ */
+export async function getWeeklyRewardAssignments(
+  cycleId: string,
+  deps: { listRewardClaimsByPrefix: (prefix: string) => Promise<RewardClaim[]> } = {
+    listRewardClaimsByPrefix: realListRewardClaimsByPrefix,
+  },
+): Promise<WeeklyRewardWinner[]> {
+  const prefix = `weekly-bonus-assignment:${cycleId}:rank`;
+  const rows = await deps.listRewardClaimsByPrefix(prefix);
+  return rows
+    .map((row) => {
+      const rank = Number(row.claimType.slice(prefix.length));
+      return { playerId: row.playerId, rank, bonus: WEEKLY_LEADERBOARD_REWARDS[rank - 1] ?? 0 };
+    })
+    .sort((a, b) => a.rank - b.rank);
+}
+
+async function realListRewardClaimsByPrefix(prefix: string): Promise<RewardClaim[]> {
+  const { db } = await import("@workspace/db");
+  const { rewardClaims } = await getSchemaTables();
+  return db
+    .select()
+    .from(rewardClaims)
+    .where(like(rewardClaims.claimType, `${prefix}%`));
+}
+
+export interface WeeklySnapshotTarget {
+  playerId: string;
+  target: number;
+}
+
+/**
+ * LECTURE SEULE. Redecouvre, pour un cycle donne, la cible EXACTE de
+ * weeklySnapshotCoins fixee A L'ELECTION pour chaque membre (voir
+ * weeklySnapshotTargetClaimType plus haut) -- survit a un redemarrage
+ * complet, au meme titre que getWeeklyRewardAssignments()/
+ * getWeeklyCycleMembers().
+ */
+export async function getWeeklySnapshotTargets(
+  cycleId: string,
+  deps: { listRewardClaimsByPrefix: (prefix: string) => Promise<RewardClaim[]> } = {
+    listRewardClaimsByPrefix: realListRewardClaimsByPrefix,
+  },
+): Promise<WeeklySnapshotTarget[]> {
+  const prefix = `weekly-target:${cycleId}:`;
+  const rows = await deps.listRewardClaimsByPrefix(prefix);
+  return rows.map((row) => ({ playerId: row.playerId, target: Number(row.claimType.slice(prefix.length)) }));
+}
+
+// claim_type du PAIEMENT (par opposition a l'ASSIGNATION ci-dessus) du
+// reset de weeklySnapshotCoins, par joueur et par cycle -- idempotent,
+// distinct du paiement du bonus pour ne jamais confondre "ce joueur a
+// deja recu son snapshot remis a niveau" avec "ce joueur a deja recu son
+// bonus" (ce sont deux operations independantes, voir
+// resumeWeeklyRewards() ci-dessous).
+export function weeklySnapshotClaimType(cycleId: string): string {
+  return `weekly-snapshot:${cycleId}`;
+}
+
+/**
+ * LECTURE SEULE. Identifiant du cycle hebdomadaire EN COURS (celui associe
+ * a la valeur ACTUELLE de global_state.weekly_started_at) -- c'est-a-dire
+ * le cycle OUVERT, pas encore du, PAS le dernier cycle elu. Utile pour
+ * afficher "ou en est la semaine courante" (ex. un futur /weekly), mais
+ * PAS pour decouvrir quels cycles ont un fan-out en attente : des qu'une
+ * election reussit, cette valeur change immediatement pour designer le
+ * cycle SUIVANT (voir le commentaire au-dessus de tryClaimWeeklyReset) --
+ * utiliser getPendingWeeklyCycleIds() pour la reprise.
+ */
+export async function getCurrentWeeklyCycleId(
+  deps: { getGlobalState: typeof getGlobalState } = { getGlobalState },
+): Promise<string | null> {
+  const global = await deps.getGlobalState();
+  return global ? String(global.weeklyStartedAt) : null;
+}
+
+export interface GetWeeklyCycleMembersDeps {
+  getRewardClaimsByExactType: (claimType: string) => Promise<RewardClaim[]>;
+}
+
+// EGALITE STRICTE (pas de LIKE-prefixe) : contrairement a l'assignation
+// ("...:rank<N>", ou le ":rank" agit comme delimiteur naturel apres le
+// cycleId), "weekly-member:<cycleId>" n'a AUCUN suffixe -- un LIKE-prefixe
+// sur un cycleId partiel matcherait a tort un AUTRE cycleId plus long qui
+// le commence (ex. rechercher "170" matcherait aussi "1700000000000").
+// L'egalite stricte elimine tout risque de collision.
+async function realGetRewardClaimsByExactType(claimType: string): Promise<RewardClaim[]> {
+  const { db } = await import("@workspace/db");
+  const { rewardClaims } = await getSchemaTables();
+  return db.select().from(rewardClaims).where(eq(rewardClaims.claimType, claimType));
+}
+
+const realGetWeeklyCycleMembersDeps: GetWeeklyCycleMembersDeps = {
+  getRewardClaimsByExactType: realGetRewardClaimsByExactType,
+};
+
+/**
+ * LECTURE SEULE. Retrouve la population FIGEE d'un cycle (les joueurs
+ * presents au moment de l'election, persistes durablement par
+ * tryClaimWeeklyReset() via "weekly-member:<cycleId>") -- jamais une
+ * lecture fraiche de getAllPlayers(), justement pour qu'un joueur cree
+ * APRES l'election ne devienne jamais membre d'un cycle passe.
+ */
+export async function getWeeklyCycleMembers(
+  cycleId: string,
+  deps: GetWeeklyCycleMembersDeps = realGetWeeklyCycleMembersDeps,
+): Promise<string[]> {
+  const rows = await deps.getRewardClaimsByExactType(weeklyMemberClaimType(cycleId));
+  return rows.map((row) => row.playerId);
+}
+
+export interface WeeklyResumeDeps {
+  getWeeklyRewardAssignments: (cycleId: string) => Promise<WeeklyRewardWinner[]>;
+  getWeeklyCycleMembers: (cycleId: string) => Promise<string[]>;
+  getWeeklySnapshotTargets: (cycleId: string) => Promise<WeeklySnapshotTarget[]>;
+  claimAndMutatePlayer: typeof claimAndMutatePlayer;
+}
+
+const realWeeklyResumeDeps: WeeklyResumeDeps = {
+  getWeeklyRewardAssignments,
+  getWeeklyCycleMembers,
+  getWeeklySnapshotTargets,
+  claimAndMutatePlayer,
+};
+
+export interface WeeklyResumeResult {
+  cycleId: string;
+  winners: WeeklyRewardWinner[];
+  processedPlayerCount: number;
+}
+
+/**
+ * Reprend (ou effectue pour la premiere fois) le fan-out complet d'un
+ * cycle hebdomadaire DEJA ELU, identifie par `cycleId` (obtenu via
+ * getPendingWeeklyCycleIds() apres un redemarrage, ou directement retourne
+ * par tryClaimWeeklyReset() au moment de l'election). ENTIEREMENT
+ * reconstructible depuis PostgreSQL : les gagnants ET la population sont
+ * TOUS deux relus depuis les lignes deja persistees par
+ * tryClaimWeeklyReset() (getWeeklyRewardAssignments/getWeeklyCycleMembers)
+ * -- AUCUN plan ne doit survivre en memoire entre deux appels, et AUCUN
+ * joueur cree apres l'election n'est jamais inclus (contrairement a une
+ * version anterieure de cette fonction qui utilisait a tort une lecture
+ * fraiche de getAllPlayers()).
+ *
+ * Pour CHAQUE membre FIGE du cycle, DANS CET ORDRE STRICT (garanti par
+ * `await` sequentiel a l'interieur de chaque tache, mais les joueurs
+ * entre eux sont traites EN PARALLELE -- pas de grosse transaction) :
+ *  1. S'il est gagnant (present dans les assignations) :
+ *     claimAndMutatePlayer(playerId, weeklyBonusPayoutClaimType(cycleId),
+ *     (p) => { p.coins += bonus; }) -- idempotent, deja paye = no-op.
+ *  2. ENSUITE SEULEMENT : claimAndMutatePlayer(playerId,
+ *     weeklySnapshotClaimType(cycleId), (p) => { p.weeklySnapshotCoins =
+ *     snapshotTarget; }) -- idempotent, deja fait = no-op.
+ * Cet ordre (bonus PUIS snapshot, jamais l'inverse, jamais en parallele
+ * pour un MEME joueur) reproduit le comportement V1 (boucle synchrone :
+ * bonus d'abord, reset de weeklySnapshotCoins ensuite pour tout le
+ * monde). IMPORTANT (correction) : `snapshotTarget` est relu depuis
+ * getWeeklySnapshotTargets(cycleId) -- la valeur FIGEE A L'ELECTION,
+ * JAMAIS `p.coins` au moment du fan-out. Une version anterieure de cette
+ * fonction faisait `p.weeklySnapshotCoins = p.coins`, ce qui incluait a
+ * tort tout gain/perte de gameplay survenu ENTRE l'election et la reprise
+ * (potentiellement bien plus tard en cas de crash) dans le snapshot de la
+ * semaine qui se termine, au lieu de les laisser compter pour la semaine
+ * SUIVANTE (voir weeklySnapshotTargetClaimType ci-dessus).
+ */
+export async function resumeWeeklyRewards(
+  cycleId: string,
+  deps: WeeklyResumeDeps = realWeeklyResumeDeps,
+): Promise<WeeklyResumeResult> {
+  const winners = await deps.getWeeklyRewardAssignments(cycleId);
+  const winnerByPlayerId = new Map(winners.map((winner) => [winner.playerId, winner]));
+  const memberIds = await deps.getWeeklyCycleMembers(cycleId);
+  const targets = await deps.getWeeklySnapshotTargets(cycleId);
+  const targetByPlayerId = new Map(targets.map((target) => [target.playerId, target.target]));
+
+  await Promise.all(
+    memberIds.map(async (playerId) => {
+      const winner = winnerByPlayerId.get(playerId);
+      if (winner) {
+        await deps.claimAndMutatePlayer(playerId, weeklyBonusPayoutClaimType(cycleId), (p) => {
+          p.coins += winner.bonus;
+        });
+      }
+      const snapshotTarget = targetByPlayerId.get(playerId);
+      if (snapshotTarget === undefined) {
+        throw new Error(
+          `resumeWeeklyRewards : snapshotTarget introuvable pour le joueur "${playerId}" dans le cycle "${cycleId}" -- etat incoherent (weekly-member et weekly-target sont censes etre inseres ensemble, dans la meme transaction, par tryClaimWeeklyReset).`,
+        );
+      }
+      await deps.claimAndMutatePlayer(playerId, weeklySnapshotClaimType(cycleId), (p) => {
+        p.weeklySnapshotCoins = snapshotTarget;
+      });
+    }),
+  );
+
+  return { cycleId, winners, processedPlayerCount: memberIds.length };
+}
+
+// ---------------------------------------------------------------------------
+// DECOUVERTE MULTI-CYCLES : getPendingWeeklyCycleIds
+// ---------------------------------------------------------------------------
+//
+// Repond precisement au probleme souleve : un cycle A elu, partiellement
+// distribue, puis un cycle B qui devient du plus tard NE DOIT PAS rendre A
+// introuvable. global_state.weekly_started_at, en tant que colonne
+// UNIQUE et mutable, ne peut structurellement designer qu'UN SEUL cycle a
+// la fois (le courant) -- il est donc STRUCTURELLEMENT incapable de
+// repondre a "quels cycles ont du travail en attente" des qu'il existe
+// plus d'un cycle concerne. La reponse ne peut venir que d'une source qui
+// accumule TOUS les cycles jamais elus : les lignes reward_claims
+// elles-memes (jamais purgees, jamais ecrasees).
+//
+// Un cycle est considere COMPLET (donc absent du resultat) si et
+// seulement si :
+//   - chaque "weekly-member:<cycleId>" a un "weekly-snapshot:<cycleId>"
+//     correspondant pour le MEME playerId ;
+//   - ET chaque "weekly-bonus-assignment:<cycleId>:rank<N>" a un
+//     "weekly-bonus-payout:<cycleId>" correspondant pour le MEME playerId.
+// Ce n'est PAS "tous les joueurs actuels ont un snapshot" (ce qui
+// inclurait a tort des joueurs crees apres l'election) -- c'est
+// explicitement borne a la population FIGEE du cycle (les membres
+// persistes), conformement a la semantique V1 demandee.
+export interface WeeklyCyclePendingCheck {
+  cycleId: string;
+  memberCount: number;
+  pendingSnapshotCount: number;
+  winners: WeeklyRewardWinner[];
+  pendingPayoutCount: number;
+  isComplete: boolean;
+}
+
+interface ParsedWeeklyClaim {
+  kind: "member" | "snapshot" | "assignment" | "payout";
+  cycleId: string;
+  playerId: string;
+  rank?: number;
+}
+
+function parseWeeklyClaim(claim: RewardClaim): ParsedWeeklyClaim | null {
+  const assignmentPrefix = "weekly-bonus-assignment:";
+  const payoutPrefix = "weekly-bonus-payout:";
+  const snapshotPrefix = "weekly-snapshot:";
+  const memberPrefix = "weekly-member:";
+
+  if (claim.claimType.startsWith(assignmentPrefix)) {
+    const rest = claim.claimType.slice(assignmentPrefix.length);
+    const match = /^(.+):rank(\d+)$/.exec(rest);
+    if (!match) return null;
+    return { kind: "assignment", cycleId: match[1]!, playerId: claim.playerId, rank: Number(match[2]) };
+  }
+  if (claim.claimType.startsWith(payoutPrefix)) {
+    return { kind: "payout", cycleId: claim.claimType.slice(payoutPrefix.length), playerId: claim.playerId };
+  }
+  if (claim.claimType.startsWith(snapshotPrefix)) {
+    return { kind: "snapshot", cycleId: claim.claimType.slice(snapshotPrefix.length), playerId: claim.playerId };
+  }
+  if (claim.claimType.startsWith(memberPrefix)) {
+    return { kind: "member", cycleId: claim.claimType.slice(memberPrefix.length), playerId: claim.playerId };
+  }
+  return null;
+}
+
+async function realListWeeklyClaims(): Promise<RewardClaim[]> {
+  const { db } = await import("@workspace/db");
+  const { rewardClaims } = await getSchemaTables();
+  return db.select().from(rewardClaims).where(like(rewardClaims.claimType, "weekly-%"));
+}
+
+/**
+ * LECTURE SEULE. Retrouve TOUS les cycles hebdomadaires dont le fan-out
+ * est incomplet (au moins un membre sans snapshot, ou au moins un gagnant
+ * non paye) -- jamais seulement le cycle courant. Un cycle plus ancien,
+ * dont le fan-out a ete interrompu, reste TOUJOURS decouvrable ici, meme
+ * apres qu'un ou plusieurs cycles suivants aient ete elus (les lignes
+ * reward_claims ne sont jamais purgees ni ecrasees -- voir le commentaire
+ * de section ci-dessus).
+ */
+export async function getPendingWeeklyCycleIds(
+  deps: { listWeeklyClaims: () => Promise<RewardClaim[]> } = { listWeeklyClaims: realListWeeklyClaims },
+): Promise<string[]> {
+  const claims = await deps.listWeeklyClaims();
+  const cycles = new Map<
+    string,
+    { members: Set<string>; snapshots: Set<string>; winners: Map<string, number>; payouts: Set<string> }
+  >();
+
+  const getCycle = (cycleId: string) => {
+    let cycle = cycles.get(cycleId);
+    if (!cycle) {
+      cycle = { members: new Set(), snapshots: new Set(), winners: new Map(), payouts: new Set() };
+      cycles.set(cycleId, cycle);
+    }
+    return cycle;
+  };
+
+  for (const claim of claims) {
+    const parsed = parseWeeklyClaim(claim);
+    if (!parsed) continue;
+    const cycle = getCycle(parsed.cycleId);
+    if (parsed.kind === "member") cycle.members.add(parsed.playerId);
+    else if (parsed.kind === "snapshot") cycle.snapshots.add(parsed.playerId);
+    else if (parsed.kind === "payout") cycle.payouts.add(parsed.playerId);
+    else cycle.winners.set(parsed.playerId, parsed.rank ?? 0);
+  }
+
+  const pending: string[] = [];
+  for (const [cycleId, cycle] of cycles) {
+    const allMembersSnapshotted = [...cycle.members].every((playerId) => cycle.snapshots.has(playerId));
+    const allWinnersPaid = [...cycle.winners.keys()].every((playerId) => cycle.payouts.has(playerId));
+    if (!allMembersSnapshotted || !allWinnersPaid) {
+      pending.push(cycleId);
+    }
+  }
+  return pending;
+}
+
+// ---------------------------------------------------------------------------
+// B. DAILY CHALLENGE REWARD -- PAIEMENT D'ABORD, FINALISATION ENSUITE
+// ---------------------------------------------------------------------------
+//
+// Regles V1 EXACTES conservees (voir farm.ts:distributeDailyChallengeReward,
+// jamais modifie) : le defi doit etre `completed && !rewarded` ; CHAQUE
+// contributeur recoit exactement `rewardCoins` (montant fixe, pas de
+// calcul de rang) ; aucune autre condition de participation.
+//
+// CORRECTION IMPORTANTE PAR RAPPORT A UNE PREMIERE VERSION DE CE LOT :
+// l'architecture initiale faisait `rewarded: false -> true` COMME
+// election, AVANT le fan-out des paiements -- dangereux, car un crash
+// entre la finalisation et la fin du fan-out aurait laisse
+// `rewarded=true` alors que certains contributeurs n'auraient jamais ete
+// payes, avec plus aucun signal pour reprendre (un futur redemarrage
+// verrait "deja recompense" et ne retenterait plus rien). CORRIGE : le
+// paiement par contributeur passe maintenant TOUJOURS en premier
+// (idempotent, voir claimAndMutatePlayer), et `rewarded` ne passe a
+// `true` qu'EN DERNIER, une fois TOUS les paiements confirmes -- il
+// retrouve ainsi sa signification V1 exacte : "la distribution est
+// TERMINEE", jamais "une election a eu lieu".
+//
+// AVANTAGE STRUCTUREL PAR RAPPORT AU WEEKLY : le "plan" (challengeId,
+// rewardCoins, liste des contributeurs) est ENTIEREMENT derivable de
+// donnees DEJA PERSISTEES et STABLES (daily_challenge + ses
+// daily_challenge_contributors, une table append-only qui n'evolue plus
+// une fois `completed = true` -- voir farm.ts:harvest, l'ajout de
+// contributeurs est conditionne a `!global.dailyChallenge.completed`).
+// AUCUNE information ephemere (aucun "plan" en memoire) n'est necessaire
+// pour decouvrir OU reprendre ce fan-out apres un redemarrage complet.
+//
+// DECOUVERTE (reprise apres redemarrage complet, sans etat memoire) :
+// getUnrewardedCompletedDailyChallenges() retrouve TOUS les defis
+// `completed=true AND rewarded=false` -- pas seulement le defi COURANT
+// (contrairement a realLockAndGetCurrentDailyChallenge, ORDER BY
+// started_at DESC LIMIT 1, utilise par mutateGlobalState/
+// mutatePlayerAndGlobal) : un ANCIEN defi dont la distribution a ete
+// interrompue reste ainsi TOUJOURS retrouvable, meme apres la creation
+// d'un ou plusieurs defis suivants (table append-only, aucune ligne
+// n'est jamais perdue ni ecrasee).
+//
+// PAIEMENT : pour CHAQUE contributeur, claimAndMutatePlayer(contributorId,
+// dailyChallengeRewardClaimType(challengeId), ...) -- idempotent par
+// construction : plusieurs schedulers concurrents peuvent tenter le meme
+// fan-out sans jamais payer deux fois un contributeur deja traite.
+//
+// FINALISATION : UNIQUEMENT apres que le fan-out de paiement a termine
+// SANS EXCEPTION pour tous les contributeurs (garanti par Promise.all --
+// s'il rejette, aucune finalisation n'est tentee), CAS optimiste
+// `UPDATE daily_challenge SET rewarded = true WHERE id = <challengeId>
+// AND completed = true AND rewarded = false`. Si deux schedulers
+// terminent leur fan-out en meme temps, un seul gagne cette derniere
+// ecriture -- sans consequence, puisque les paiements individuels sont
+// deja tous idempotents.
+export interface GetUnrewardedCompletedDailyChallengesDeps {
+  listUnrewardedCompletedDailyChallenges: () => Promise<DailyChallengeRow[]>;
+}
+
+async function realListUnrewardedCompletedDailyChallenges(): Promise<DailyChallengeRow[]> {
+  const { db } = await import("@workspace/db");
+  const { dailyChallenge } = await getSchemaTables();
+  return db
+    .select()
+    .from(dailyChallenge)
+    .where(and(eq(dailyChallenge.completed, true), eq(dailyChallenge.rewarded, false)))
+    .orderBy(asc(dailyChallenge.startedAt));
+}
+
+const realGetUnrewardedCompletedDailyChallengesDeps: GetUnrewardedCompletedDailyChallengesDeps = {
+  listUnrewardedCompletedDailyChallenges: realListUnrewardedCompletedDailyChallenges,
+};
+
+/**
+ * LECTURE SEULE. Retrouve TOUS les daily_challenge dont la distribution de
+ * recompense est incomplete (completed=true, rewarded=false) -- jamais
+ * seulement "le" defi courant. C'est le point d'entree de la reprise
+ * apres un redemarrage complet du processus : aucun etat memoire requis,
+ * chaque challengeId retourne peut etre passe directement a
+ * resumeDailyChallengeReward().
+ */
+export async function getUnrewardedCompletedDailyChallenges(
+  deps: GetUnrewardedCompletedDailyChallengesDeps = realGetUnrewardedCompletedDailyChallengesDeps,
+): Promise<DailyChallengeRow[]> {
+  return deps.listUnrewardedCompletedDailyChallenges();
+}
+
+export interface DailyChallengeResumeDeps {
+  getDailyChallengeById: (challengeId: number) => Promise<DailyChallengeRow | null>;
+  getDailyChallengeContributors: (challengeId: number) => Promise<DailyChallengeContributor[]>;
+  claimAndMutatePlayer: typeof claimAndMutatePlayer;
+  tryFinalizeDailyChallengeRewarded: (challengeId: number) => Promise<boolean>;
+}
+
+async function realGetDailyChallengeById(challengeId: number): Promise<DailyChallengeRow | null> {
+  const { db } = await import("@workspace/db");
+  const { dailyChallenge } = await getSchemaTables();
+  const [row] = await db.select().from(dailyChallenge).where(eq(dailyChallenge.id, challengeId)).limit(1);
+  return row ?? null;
+}
+
+async function realGetDailyChallengeContributorsStandalone(
+  challengeId: number,
+): Promise<DailyChallengeContributor[]> {
+  const { db } = await import("@workspace/db");
+  const { dailyChallengeContributors } = await getSchemaTables();
+  return db
+    .select()
+    .from(dailyChallengeContributors)
+    .where(eq(dailyChallengeContributors.challengeId, challengeId));
+}
+
+// Meme requete que realTryMarkDailyChallengeRewarded (nom conserve pour
+// designer le CAS lui-meme), mais appelee ICI en tout dernier, comme
+// FINALISATION -- jamais comme election prealable (voir le commentaire de
+// section ci-dessus). Autonome (utilise `db` directement, pas `tx`) :
+// une seule instruction UPDATE, deja atomique par elle-meme, exactement
+// comme claimReadyPlotNotification.
+async function realTryMarkDailyChallengeRewarded(challengeId: number): Promise<boolean> {
+  const { db } = await import("@workspace/db");
+  const { dailyChallenge } = await getSchemaTables();
+  const updated = await db
+    .update(dailyChallenge)
+    .set({ rewarded: true })
+    .where(
+      and(
+        eq(dailyChallenge.id, challengeId),
+        eq(dailyChallenge.completed, true),
+        eq(dailyChallenge.rewarded, false),
+      ),
+    )
+    .returning({ id: dailyChallenge.id });
+  return updated.length > 0;
+}
+
+const realDailyChallengeResumeDeps: DailyChallengeResumeDeps = {
+  getDailyChallengeById: realGetDailyChallengeById,
+  getDailyChallengeContributors: realGetDailyChallengeContributorsStandalone,
+  claimAndMutatePlayer,
+  tryFinalizeDailyChallengeRewarded: realTryMarkDailyChallengeRewarded,
+};
+
+export interface DailyChallengeResumeResult {
+  challengeId: number;
+  rewardCoins: number;
+  contributorIds: string[];
+  finalized: boolean;
+}
+
+/**
+ * Reprend (ou effectue pour la premiere fois) la distribution de
+ * recompense d'un defi quotidien PRECIS, identifie par son `challengeId`
+ * (obtenu via getUnrewardedCompletedDailyChallenges(), ou directement
+ * connu de l'appelant). Fonctionne A L'IDENTIQUE que ce soit le tout
+ * premier appel pour ce defi ou une reprise apres crash partiel :
+ *
+ *  1. Lit le defi par id (erreur explicite si absent ou si `!completed`
+ *     -- rien a distribuer).
+ *  2. Lit ses contributeurs (table stable, jamais modifiee une fois le
+ *     defi complete).
+ *  3. Pour CHAQUE contributeur, EN PARALLELE : claimAndMutatePlayer(...)
+ *     -- idempotent, un contributeur deja paye lors d'un appel precedent
+ *     n'est PAS repaye (son claim existe deja, `claimed: false`, aucune
+ *     mutation rejouee).
+ *  4. UNIQUEMENT si l'etape 3 se termine SANS EXCEPTION pour tous les
+ *     contributeurs (Promise.all) : tente la finalisation `rewarded =
+ *     true`. Si elle echoue au niveau applicatif (une des promesses
+ *     rejette), AUCUNE finalisation n'est tentee -- l'appel suivant
+ *     (reprise) retentera les contributeurs manquants avant de refinaliser.
+ *
+ * Plusieurs appels concurrents sur le MEME challengeId (plusieurs
+ * schedulers) sont surs : chaque paiement individuel est idempotent, et
+ * la finalisation elle-meme est un CAS (un seul gagne, les autres no-op).
+ */
+export async function resumeDailyChallengeReward(
+  challengeId: number,
+  deps: DailyChallengeResumeDeps = realDailyChallengeResumeDeps,
+): Promise<DailyChallengeResumeResult> {
+  const challenge = await deps.getDailyChallengeById(challengeId);
+  if (!challenge) {
+    throw new Error(`resumeDailyChallengeReward : daily_challenge id=${challengeId} introuvable.`);
+  }
+  if (!challenge.completed) {
+    throw new Error(
+      `resumeDailyChallengeReward : daily_challenge id=${challengeId} n'est pas "completed" -- rien a distribuer.`,
+    );
+  }
+
+  const contributorRows = await deps.getDailyChallengeContributors(challengeId);
+  const contributorIds = contributorRows.map((row) => row.playerId);
+
+  await Promise.all(
+    contributorIds.map((contributorId) =>
+      deps.claimAndMutatePlayer(contributorId, dailyChallengeRewardClaimType(challengeId), (player) => {
+        player.coins += challenge.rewardCoins;
+      }),
+    ),
+  );
+
+  const finalized = challenge.rewarded ? false : await deps.tryFinalizeDailyChallengeRewarded(challengeId);
+
+  return { challengeId, rewardCoins: challenge.rewardCoins, contributorIds, finalized };
+}
+
+// ---------------------------------------------------------------------------
+// C. NOTIFICATION DE PARCELLE PRETE -- claim atomique, PAS d'envoi Discord
+// ---------------------------------------------------------------------------
+//
+// Comportement V1 exact (bot.ts:notifyReadyCrops) : pour chaque parcelle
+// avec `cropId` non nul, `!notifiedReady` et `isReady(...)`, un DM Discord
+// est envoye PUIS `plot.notifiedReady = true` est positionne. En V1, ceci
+// est sur, car synchrone et mono-process (aucune course possible). En
+// Postgres, le risque explicite a eviter est : lire notifiedReady=false,
+// envoyer Discord, ecrire true -- deux ticks concurrents liraient tous
+// deux `false` et enverraient chacun un message.
+//
+// Cette primitive ne fait QUE la transition atomique `notified_ready:
+// false -> true`, en une SEULE instruction SQL (UPDATE ... WHERE ...
+// RETURNING), sans transaction explicite -- Postgres garantit deja
+// l'atomicite d'une instruction unique. Elle ne connait ni Discord, ni le
+// contenu du message : c'est au futur appelant (runtime, hors de ce lot)
+// de faire "claim DB, PUIS envoyer Discord SEULEMENT si claimed=true".
+//
+// EXCEPTION DOCUMENTEE a l'invariant "plots n'est ecrit que via
+// writePlayerStateAssumingLock, apres verrou joueur" (etabli au LOT 2) :
+// cette primitive ecrit `plots.notified_ready` DIRECTEMENT, sans passer
+// par un verrou de ligne players. C'est sur car il ne s'agit PAS d'un
+// pattern lire-muter-ecrire d'un PlayerState complet (ce que l'invariant
+// protege) mais d'un CAS auto-contenu en une seule instruction, exactement
+// comme les CAS de global_state/daily_challenge ci-dessus.
+//
+// GARDE SUPPLEMENTAIRE (au-dela du minimum demande) : `expectedPlantedAt`
+// est verifie dans le WHERE -- si la parcelle a ete recoltee puis
+// replantee entre l'observation "c'est pret" et l'appel a cette primitive,
+// `planted_at` a change et le claim echoue proprement (0 ligne modifiee),
+// evitant de notifier a tort pour une toute nouvelle plantation.
+//
+// CLAIM DB REUSSI PUIS CRASH AVANT ENVOI DISCORD -- ANALYSE ET CHOIX
+// RECOMMANDE : deux ordres possibles.
+//   (1) claim PUIS envoi (retenu) : un crash entre les deux perd
+//       DEFINITIVEMENT cette notification precise (notified_ready reste a
+//       true, plus jamais retentee) -- mais AUCUNE consequence de jeu :
+//       le joueur decouvrira sa recolte prete au prochain /farm, aucune
+//       perte economique, aucun etat incoherent.
+//   (2) envoi PUIS claim : un crash entre les deux fait RENVOYER le
+//       message au prochain tick (le joueur recoit un DM en double) --
+//       gene mineure, mais AUCUNE fenetre ne garantit "jamais deux fois"
+//       explicitement demandee plus haut pour ce point precis.
+// Choix retenu : (1), car aucune consequence durable en cas de perte,
+// contre une consequence (certes mineure) en cas de doublon avec (2). Une
+// garantie exactly-once stricte des deux cotes necessiterait une file
+// d'attente (outbox) persistante -- DELIBEREMENT NON CONSTRUITE ici (pas
+// justifiee pour un DM informatif a faible enjeu) ; a reconsiderer
+// seulement si un besoin reel de fiabilite plus stricte apparait.
+export interface ClaimReadyPlotNotificationDeps {
+  tryClaimNotifiedReady: (playerId: string, plotIndex: number, expectedPlantedAt: number) => Promise<boolean>;
+}
+
+async function realTryClaimNotifiedReady(
+  playerId: string,
+  plotIndex: number,
+  expectedPlantedAt: number,
+): Promise<boolean> {
+  const { db } = await import("@workspace/db");
+  const { plots } = await getSchemaTables();
+  const updated = await db
+    .update(plots)
+    .set({ notifiedReady: true })
+    .where(
+      and(
+        eq(plots.playerId, playerId),
+        eq(plots.plotIndex, plotIndex),
+        eq(plots.notifiedReady, false),
+        isNotNull(plots.cropId),
+        eq(plots.plantedAt, new Date(expectedPlantedAt)),
+      ),
+    )
+    .returning({ id: plots.id });
+  return updated.length > 0;
+}
+
+const realClaimReadyPlotNotificationDeps: ClaimReadyPlotNotificationDeps = {
+  tryClaimNotifiedReady: realTryClaimNotifiedReady,
+};
+
+/**
+ * Tente de reclamer atomiquement le droit d'envoyer la notification
+ * "parcelle prete" pour `plotIndex` du joueur `playerId`, dont la
+ * plantation en cours est cense avoir demarre a `expectedPlantedAt`
+ * (epoch ms, observe par l'appelant).
+ *
+ * `readyAt` (epoch ms) est calcule par l'APPELANT a partir des regles
+ * metier existantes (isReady()/growMinutes() de ../farm.ts, qui dependent
+ * de player.irrigationLevel -- volontairement PAS dupliquees ici, cette
+ * couche reste DB-only). Si `now < readyAt`, la parcelle n'est pas
+ * (encore) prete : retourne `{ claimed: false }` IMMEDIATEMENT, sans
+ * tenter la moindre ecriture -- c'est la verification "elle est
+ * reellement prete" demandee, faite sur des donnees explicites plutot que
+ * suppose vrai par confiance envers l'appelant.
+ *
+ * Si `now >= readyAt`, tente la transition atomique `notified_ready:
+ * false -> true` en base. Retourne `{ claimed: true }` UNIQUEMENT si
+ * cette transition a effectivement eu lieu -- deux appels concurrents
+ * pour la MEME parcelle ne peuvent jamais tous les deux obtenir
+ * `claimed: true`. N'envoie JAMAIS de message Discord elle-meme.
+ */
+export async function claimReadyPlotNotification(
+  playerId: string,
+  plotIndex: number,
+  expectedPlantedAt: number,
+  readyAt: number,
+  now: number = Date.now(),
+  deps: ClaimReadyPlotNotificationDeps = realClaimReadyPlotNotificationDeps,
+): Promise<{ claimed: boolean }> {
+  if (now < readyAt) {
+    return { claimed: false };
+  }
+  const claimed = await deps.tryClaimNotifiedReady(playerId, plotIndex, expectedPlantedAt);
+  return { claimed };
 }

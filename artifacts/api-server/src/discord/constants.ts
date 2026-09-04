@@ -66,6 +66,12 @@ export const WEEKLY_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 export const QUEST_RESET_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const DAILY_CHALLENGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const FORECAST_COST = 15;
+// Recompenses du podium hebdomadaire (rang 1/2/3), dans cet ordre. Exportee
+// ici (plutot que gardee comme litteral local dans resetWeeklyIfNeeded)
+// pour servir de SEULE source de verite, partagee par farm.ts (V1/JSON) et
+// la future primitive Postgres equivalente -- evite tout risque de
+// divergence entre les deux implementations de la meme regle.
+export const WEEKLY_LEADERBOARD_REWARDS = [500, 300, 150] as const;
 
 export const PLOT_SKINS: Record<
   PlotSkinId,
