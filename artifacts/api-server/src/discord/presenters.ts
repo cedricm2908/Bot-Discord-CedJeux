@@ -39,8 +39,8 @@ import {
   xpToNextLevel,
 } from "./farm.ts";
 import { FarmStore } from "./store.ts";
-import { buyPlayerUpgrade, claimPlayerDaily } from "./db/farmPlayerActions.ts";
-import { ensurePlayerExists } from "./db/farmRepository.ts";
+import { buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop } from "./db/farmPlayerActions.ts";
+import { ensurePlayerExists, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import type {
   CropId,
@@ -133,15 +133,15 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 
 // LOT 6 : commandes ENTIEREMENT routees vers Postgres pour un joueur
 // allowliste -- aucune ne depend de global_state JSON (buyUpgrade()/
-// claimDaily() sont des fonctions PLAYER-ONLY, verifie a l'audit de chaque
-// branchement). Utilise UNIQUEMENT pour eviter le
+// claimDaily()/plant() sont des fonctions PLAYER-ONLY, verifie a l'audit
+// de chaque branchement). Utilise UNIQUEMENT pour eviter le
 // enrichGlobalState(store.global)+store.save() ci-dessous (qui ecrirait le
 // fichier JSON, meme sans toucher aux donnees du joueur) quand ce joueur
 // precis n'aura de toute facon aucune autre ecriture JSON pour CETTE
 // commande precise. Ne s'applique JAMAIS a /farm, /profile, etc. -- ces
 // commandes restent V1 pour absolument tout le monde, allowliste ou non,
 // et continuent donc de declencher ce preambule exactement comme avant.
-const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily"]);
+const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily", "plant"]);
 
 export function commandSkipsJsonPreamble(
   commandName: string,
@@ -225,16 +225,83 @@ export async function handleSlashCommand(
   }
 }
 
+// LOT 6, bascule TEST-only pour /plant UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveBuyUpgrade/resolveDailyClaim ci-dessus. Contrairement a ces deux
+// autres commandes, la reponse Discord de /plant a besoin d'une DEUXIEME
+// donnee en plus du resultat de la mutation elle-meme : le temps de pousse
+// affiche (growMinutes(), farm.ts) depend de player.irrigationLevel, pas
+// du tout retourne par la plantation cote Postgres (qui ne retourne que le
+// numero de parcelle, comme plant() lui-meme en V1). Cote V1, ce besoin existait
+// deja et etait couvert par un second store.getPlayer() (lecture en
+// memoire, gratuite). Cote Postgres, la MEME solution est reprise a
+// l'identique avec le REPOSITORY existant (getPlayer() de
+// farmRepository.ts, deja utilise ailleurs, LECTURE SEULE) plutot que
+// FarmStore -- aucune nouvelle primitive, aucune regle metier dupliquee :
+// growMinutes() est appele UNE SEULE fois, sur l'etat complet du joueur
+// (V1 ou Postgres), exactement comme avant.
+export interface PlantResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  plantPlayerCrop: typeof plantPlayerCrop;
+  getPlayer: typeof getPlayer;
+}
+
+const realPlantResolutionDeps: PlantResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  plantPlayerCrop,
+  getPlayer,
+};
+
+export interface PlantResult {
+  plantedPlot: number;
+  player: PlayerState;
+}
+
+/**
+ * Decide quel backend utiliser pour /plant et retourne le numero de
+ * parcelle PLUS l'etat complet du joueur apres plantation (necessaire pour
+ * growMinutes() dans commandPlant), SANS jamais toucher a la reponse
+ * Discord. Un joueur allowliste passe EXCLUSIVEMENT par le bootstrap PUIS
+ * la plantation cote Postgres, puis une relecture read-only via le
+ * repository -- aucune ecriture JSON dans cette branche. Un joueur non
+ * allowliste (cas par defaut) suit EXACTEMENT le chemin V1 : store.mutatePlayer
+ * + plant(), puis store.getPlayer() pour la meme raison qu'avant.
+ */
+export async function resolvePlantCrop(
+  playerId: string,
+  cropId: CropId,
+  requestedPlot: number | null,
+  store: FarmStore,
+  deps: PlantResolutionDeps = realPlantResolutionDeps,
+): Promise<PlantResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    const plantedPlot = await deps.plantPlayerCrop(playerId, cropId, requestedPlot);
+    const player = await deps.getPlayer(playerId);
+    if (!player) {
+      throw new Error(
+        `resolvePlantCrop : joueur "${playerId}" introuvable juste apres la plantation -- etat incoherent.`,
+      );
+    }
+    return { plantedPlot, player };
+  }
+  let plantedPlot = 0;
+  await store.mutatePlayer(playerId, (player) => {
+    plantedPlot = plant(player, cropId, requestedPlot);
+  });
+  const player = store.getPlayer(playerId);
+  return { plantedPlot, player };
+}
+
 async function commandPlant(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
   const cropId = cropIdFrom(interaction.options.getString("culture", true));
   const requestedPlot = interaction.options.getInteger("parcelle") ?? null;
-  let plantedPlot = 0;
-  await store.mutatePlayer(interaction.user.id, (player) => {
-    plantedPlot = plant(player, cropId, requestedPlot);
-  });
+  const { plantedPlot, player } = await resolvePlantCrop(interaction.user.id, cropId, requestedPlot, store);
   const crop = cropById(cropId);
   await interaction.reply({
     embeds: [
@@ -243,7 +310,7 @@ async function commandPlant(
         .setTitle("Culture plantée")
         .setDescription(
           `${crop.emoji} **${crop.name}** pousse sur la parcelle **${plantedPlot}**.\n` +
-            `Récolte dans environ **${formatDuration(growMinutes(store.getPlayer(interaction.user.id), cropId))}**.`,
+            `Récolte dans environ **${formatDuration(growMinutes(player, cropId))}**.`,
         ),
     ],
   });
