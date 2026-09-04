@@ -35,6 +35,13 @@
 //
 // N'affiche jamais DATABASE_URL.
 
+// Force le mode module (aucun import/export statique sinon, a cause des
+// imports dynamiques ci-dessous) : sans ça, ce fichier serait traite comme
+// un script en portee globale et entrerait en collision avec les autres
+// scripts de seed du meme dossier (ex. seedSecondTestPlayer.ts, meme noms
+// de constantes TEST_PLAYER_ID/TEST_PLOT_INDEXES/databaseUrl).
+export {};
+
 const TEST_PLAYER_ID = "v2-test-player-001";
 const TEST_PLOT_INDEXES = [0, 1, 2, 3] as const;
 const TEST_INVENTORY = [

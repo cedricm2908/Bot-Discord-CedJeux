@@ -13,7 +13,8 @@
     "push-force": "drizzle-kit push --force --config ./drizzle.config.ts",
     "generate": "drizzle-kit generate --config ./drizzle.config.ts",
     "migrate": "tsx src/migrate.ts",
-    "seed:test": "tsx src/seedTest.ts"
+    "seed:test": "tsx src/seedTest.ts",
+    "seed:second-test-player": "tsx src/seedSecondTestPlayer.ts"
   },
   "dependencies": {
     "drizzle-orm": "catalog:",
