@@ -20,7 +20,7 @@ import {
   WEATHER_INFO,
   cropById,
   recipeById,
-} from "./constants";
+} from "./constants.ts";
 import {
   FarmError,
   buyUpgrade,
@@ -37,8 +37,11 @@ import {
   sell,
   totalInventoryValue,
   xpToNextLevel,
-} from "./farm";
-import { FarmStore } from "./store";
+} from "./farm.ts";
+import { FarmStore } from "./store.ts";
+import { buyPlayerUpgrade } from "./db/farmPlayerActions.ts";
+import { ensurePlayerExists } from "./db/farmRepository.ts";
+import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import type {
   CropId,
   InventoryId,
@@ -366,17 +369,61 @@ async function commandMarket(
   });
 }
 
+// LOT 6, bascule TEST-only pour /buy UNIQUEMENT (voir postgresRuntimeAllowlist.ts) --
+// extrait de commandBuy en fonction PURE-DEPS injectable pour rester
+// testable sans construire de fausse interaction discord.js : seule la
+// DECISION (quel backend, quel resultat) vit ici, le parsing des options et
+// la reponse Discord restent dans commandBuy, inchanges pour les deux
+// branches.
+export interface BuyResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  buyPlayerUpgrade: typeof buyPlayerUpgrade;
+}
+
+const realBuyResolutionDeps: BuyResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  buyPlayerUpgrade,
+};
+
+/**
+ * Decide quel backend utiliser pour /buy et retourne le resultat, SANS
+ * jamais toucher a la reponse Discord (voir commandBuy). Un joueur
+ * allowliste (deps.shouldUsePostgresRuntime === true) passe EXCLUSIVEMENT
+ * par le bootstrap PUIS l'achat cote Postgres -- aucune ecriture JSON
+ * (store.mutatePlayer/store.save) n'est jamais tentee dans cette branche.
+ * Un joueur non allowliste (le cas par defaut, y compris quand
+ * FARM2WIN_POSTGRES_TEST_PLAYER_IDS est absente) suit EXACTEMENT le chemin
+ * V1 deja existant : store.mutatePlayer + buyUpgrade(), meme erreur
+ * ("Achat impossible.") propagee telle quelle si buyUpgrade() ne mute rien.
+ */
+export async function resolveBuyUpgrade(
+  playerId: string,
+  kind: "plots" | "irrigation" | "fertilizer",
+  quantity: number,
+  store: FarmStore,
+  deps: BuyResolutionDeps = realBuyResolutionDeps,
+): Promise<{ bought: number; spent: number }> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    return deps.buyPlayerUpgrade(playerId, kind, quantity);
+  }
+  let result: ReturnType<typeof buyUpgrade> | undefined;
+  await store.mutatePlayer(playerId, (player) => {
+    result = buyUpgrade(player, kind, quantity);
+  });
+  if (!result) throw new FarmError("Achat impossible.");
+  return result;
+}
+
 async function commandBuy(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
   const kind = interaction.options.getString("amelioration", true) as "plots" | "irrigation" | "fertilizer";
   const quantity = interaction.options.getInteger("quantite") ?? 1;
-  let result: ReturnType<typeof buyUpgrade> | undefined;
-  await store.mutatePlayer(interaction.user.id, (player) => {
-    result = buyUpgrade(player, kind, quantity);
-  });
-  if (!result) throw new FarmError("Achat impossible.");
+  const result = await resolveBuyUpgrade(interaction.user.id, kind, quantity, store);
   const labels = { plots: "parcelle(s)", irrigation: "niveau(x) d'irrigation", fertilizer: "niveau(x) d'engrais" };
   await interaction.reply({
     embeds: [

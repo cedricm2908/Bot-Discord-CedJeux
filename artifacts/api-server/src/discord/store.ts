@@ -9,7 +9,7 @@ import {
   freshQuests,
   randomDailyChallenge,
   randomWeatherType,
-} from "./constants";
+} from "./constants.ts";
 import type { FarmDatabase, PlayerState } from "./types";
 
 const dataFile = path.resolve(
