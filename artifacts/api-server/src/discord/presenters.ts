@@ -39,7 +39,7 @@ import {
   xpToNextLevel,
 } from "./farm.ts";
 import { FarmStore } from "./store.ts";
-import { buyPlayerUpgrade } from "./db/farmPlayerActions.ts";
+import { buyPlayerUpgrade, claimPlayerDaily } from "./db/farmPlayerActions.ts";
 import { ensurePlayerExists } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import type {
@@ -131,12 +131,37 @@ function playerName(interaction: ChatInputCommandInteraction): string {
     : interaction.user.globalName ?? interaction.user.username;
 }
 
+// LOT 6 : commandes ENTIEREMENT routees vers Postgres pour un joueur
+// allowliste -- aucune ne depend de global_state JSON (buyUpgrade()/
+// claimDaily() sont des fonctions PLAYER-ONLY, verifie a l'audit de chaque
+// branchement). Utilise UNIQUEMENT pour eviter le
+// enrichGlobalState(store.global)+store.save() ci-dessous (qui ecrirait le
+// fichier JSON, meme sans toucher aux donnees du joueur) quand ce joueur
+// precis n'aura de toute facon aucune autre ecriture JSON pour CETTE
+// commande precise. Ne s'applique JAMAIS a /farm, /profile, etc. -- ces
+// commandes restent V1 pour absolument tout le monde, allowliste ou non,
+// et continuent donc de declencher ce preambule exactement comme avant.
+const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily"]);
+
+export function commandSkipsJsonPreamble(
+  commandName: string,
+  playerId: string,
+  deps: { shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime } = { shouldUsePostgresRuntime },
+): boolean {
+  return POSTGRES_ROUTED_COMMAND_NAMES.has(commandName) && deps.shouldUsePostgresRuntime(playerId);
+}
+
 export async function handleSlashCommand(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
   try {
-    if (enrichGlobalState(store.global)) await store.save();
+    if (
+      !commandSkipsJsonPreamble(interaction.commandName, interaction.user.id) &&
+      enrichGlobalState(store.global)
+    ) {
+      await store.save();
+    }
     switch (interaction.commandName) {
       case "list":
         await interaction.reply({
@@ -549,14 +574,52 @@ async function commandWeekly(
   });
 }
 
+// LOT 6, bascule TEST-only pour /daily UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveBuyUpgrade ci-dessus, pour rester testable sans fausse
+// interaction discord.js.
+export interface DailyResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  claimPlayerDaily: typeof claimPlayerDaily;
+}
+
+const realDailyResolutionDeps: DailyResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  claimPlayerDaily,
+};
+
+/**
+ * Decide quel backend utiliser pour /daily et retourne la recompense, SANS
+ * jamais toucher a la reponse Discord (voir commandDaily). Un joueur
+ * allowliste passe EXCLUSIVEMENT par le bootstrap PUIS la reclamation cote
+ * Postgres -- aucune ecriture JSON (store.mutatePlayer/store.save) dans cette
+ * branche. Un joueur non allowliste (cas par defaut) suit EXACTEMENT le
+ * chemin V1 : store.mutatePlayer + claimDaily(), meme cooldown/erreur
+ * propagee telle quelle.
+ */
+export async function resolveDailyClaim(
+  playerId: string,
+  store: FarmStore,
+  deps: DailyResolutionDeps = realDailyResolutionDeps,
+): Promise<number> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    return deps.claimPlayerDaily(playerId);
+  }
+  let reward = 0;
+  await store.mutatePlayer(playerId, (player) => {
+    reward = claimDaily(player);
+  });
+  return reward;
+}
+
 async function commandDaily(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  let reward = 0;
-  await store.mutatePlayer(interaction.user.id, (player) => {
-    reward = claimDaily(player);
-  });
+  const reward = await resolveDailyClaim(interaction.user.id, store);
   await interaction.reply({
     embeds: [
       new EmbedBuilder()
