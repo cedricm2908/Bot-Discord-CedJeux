@@ -22,10 +22,12 @@ import {
   createFarmRepository,
   mutateGlobalState,
   mutatePlayer,
+  mutatePlayerAndGlobal,
   savePlayer,
   savePlayerWithTx,
   type FarmRepositoryDeps,
   type MutateGlobalStateDeps,
+  type MutatePlayerAndGlobalDeps,
   type MutatePlayerDeps,
   type PlayerWriteDeps,
 } from "./farmRepository.ts";
@@ -1039,4 +1041,436 @@ test("mutateGlobalState 14. farmRepository.ts n'utilise ni FarmStore/getFarmStor
   assert.ok(!/discord\.js/.test(importLines), "aucune dependance discord.js attendue");
   assert.ok(!/["']express["']/.test(importLines), "aucune dependance express attendue");
   assert.ok(!/\.delete\(/.test(source), "aucun .delete( attendu dans farmRepository.ts");
+});
+
+// ===========================================================================
+// mutatePlayerAndGlobal -- verrou (global_state -> contract -> daily_challenge
+// -> player) + lecture + mutation en memoire (player ET global) + ecriture,
+// dans UNE seule transaction. Mocks/fakes uniquement, jamais de vraie base
+// (meme approche que mutatePlayer/mutateGlobalState ci-dessus).
+// ===========================================================================
+
+function buildMutatePlayerAndGlobalDeps(
+  overrides: Partial<MutatePlayerAndGlobalDeps> = {},
+): MutatePlayerAndGlobalDeps {
+  const globalRecord = buildGlobalStateRecord();
+  return {
+    lockAndGetGlobalState: async () => globalRecord.globalState,
+    lockAndGetContract: async () => globalRecord.contract,
+    lockAndGetCurrentDailyChallenge: async () => globalRecord.dailyChallenge,
+    getDailyChallengeContributors: async () => globalRecord.dailyChallengeContributors,
+    updateGlobalStateRow: async () => {},
+    updateContractRow: async () => {},
+    updateDailyChallengeRow: async () => {},
+    insertDailyChallengeRow: async () => {},
+    upsertDailyChallengeContributors: async () => {},
+    toGlobalState,
+    lockAndGetPlayer: async (_tx, id) => buildFullPlayerRow(id),
+    updatePlayerRow: async () => {},
+    upsertPlots: async () => {},
+    upsertInventoryItems: async () => {},
+    getPlotsForUpdate: async () => [],
+    getInventoryItemsForUpdate: async () => [],
+    toPlayerState,
+    ...overrides,
+  };
+}
+
+async function runMutatePlayerAndGlobal(
+  mutator: (player: PlayerState, global: GlobalState) => void | Promise<void>,
+  deps: MutatePlayerAndGlobalDeps,
+): Promise<{ player: PlayerState; global: GlobalState }> {
+  return mutatePlayerAndGlobal(TEST_PLAYER_ID, mutator, deps, async (fn) => fn(FAKE_TX));
+}
+
+test("mutatePlayerAndGlobal 1. ordre strict : global_state -> contract -> daily_challenge -> contributeurs -> player -> plots -> inventory -> adapters -> mutator -> ecriture (global, contract, daily_challenge, player), transaction unique", async () => {
+  const callOrder: string[] = [];
+  const globalRecord = buildGlobalStateRecord();
+
+  const lockAndGetGlobalState = mock.fn(async () => {
+    callOrder.push("lock-global_state");
+    return globalRecord.globalState;
+  });
+  const lockAndGetContract = mock.fn(async () => {
+    callOrder.push("lock-contract");
+    return globalRecord.contract;
+  });
+  const lockAndGetCurrentDailyChallenge = mock.fn(async () => {
+    callOrder.push("lock-daily_challenge");
+    return globalRecord.dailyChallenge;
+  });
+  const getDailyChallengeContributors = mock.fn(async () => {
+    callOrder.push("get-contributors");
+    return globalRecord.dailyChallengeContributors;
+  });
+  const lockAndGetPlayer = mock.fn(async (_tx: never, id: string) => {
+    callOrder.push("lock-player");
+    return buildFullPlayerRow(id);
+  });
+  const getPlotsForUpdate = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["getPlotsForUpdate"]>) => {
+    callOrder.push("get-plots");
+    return [];
+  });
+  const getInventoryItemsForUpdate = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["getInventoryItemsForUpdate"]>) => {
+      callOrder.push("get-inventory");
+      return [];
+    },
+  );
+  const toGlobalStateSpy = mock.fn((r: GlobalStateRecord) => {
+    callOrder.push("adapter-global");
+    return toGlobalState(r);
+  });
+  const toPlayerStateSpy = mock.fn((r: PlayerRecord) => {
+    callOrder.push("adapter-player");
+    return toPlayerState(r);
+  });
+  const updateGlobalStateRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateGlobalStateRow"]>) => {
+      callOrder.push("write-global_state");
+    },
+  );
+  const updateContractRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateContractRow"]>) => {
+      callOrder.push("write-contract");
+    },
+  );
+  const updateDailyChallengeRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateDailyChallengeRow"]>) => {
+      callOrder.push("write-daily_challenge");
+    },
+  );
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["updatePlayerRow"]>) => {
+    callOrder.push("write-player");
+  });
+
+  const deps = buildMutatePlayerAndGlobalDeps({
+    lockAndGetGlobalState,
+    lockAndGetContract,
+    lockAndGetCurrentDailyChallenge,
+    getDailyChallengeContributors,
+    lockAndGetPlayer,
+    getPlotsForUpdate,
+    getInventoryItemsForUpdate,
+    toGlobalState: toGlobalStateSpy,
+    toPlayerState: toPlayerStateSpy,
+    updateGlobalStateRow,
+    updateContractRow,
+    updateDailyChallengeRow,
+    updatePlayerRow,
+  });
+
+  let transactionCalls = 0;
+  const fakeRunTransaction = async (fn: (tx: never) => Promise<{ player: PlayerState; global: GlobalState }>) => {
+    transactionCalls += 1;
+    return fn(FAKE_TX);
+  };
+
+  await mutatePlayerAndGlobal(
+    TEST_PLAYER_ID,
+    (player, global) => {
+      callOrder.push("mutator");
+      player.coins += 1;
+      global.marketMultiplier = 1.1;
+    },
+    deps,
+    fakeRunTransaction as never,
+  );
+
+  assert.equal(transactionCalls, 1);
+  assert.equal(lockAndGetGlobalState.mock.calls.length, 1);
+  assert.equal(lockAndGetContract.mock.calls.length, 1);
+  assert.equal(lockAndGetCurrentDailyChallenge.mock.calls.length, 1);
+  assert.equal(lockAndGetPlayer.mock.calls.length, 1);
+  assert.deepEqual(callOrder, [
+    "lock-global_state",
+    "lock-contract",
+    "lock-daily_challenge",
+    "get-contributors",
+    "lock-player",
+    "get-plots",
+    "get-inventory",
+    "adapter-global",
+    "adapter-player",
+    "mutator",
+    "write-global_state",
+    "write-contract",
+    "write-daily_challenge",
+    "write-player",
+  ]);
+});
+
+test("mutatePlayerAndGlobal 2. global_state absent : rejette, aucune autre lecture ni ecriture", async () => {
+  const lockAndGetContract = mock.fn(async () => buildGlobalStateRecord().contract);
+  const lockAndGetPlayer = mock.fn(async (_tx: never, id: string) => buildFullPlayerRow(id));
+  const updateGlobalStateRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateGlobalStateRow"]>) => {},
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({
+    lockAndGetGlobalState: async () => null,
+    lockAndGetContract,
+    lockAndGetPlayer,
+    updateGlobalStateRow,
+  });
+
+  await assert.rejects(() => runMutatePlayerAndGlobal(() => {}, deps), /introuvable/);
+  assert.equal(lockAndGetContract.mock.calls.length, 0);
+  assert.equal(lockAndGetPlayer.mock.calls.length, 0);
+  assert.equal(updateGlobalStateRow.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 3. contract absent : rejette (apres verrou global_state), aucune ecriture", async () => {
+  const lockAndGetCurrentDailyChallenge = mock.fn(async () => buildGlobalStateRecord().dailyChallenge);
+  const lockAndGetPlayer = mock.fn(async (_tx: never, id: string) => buildFullPlayerRow(id));
+  const deps = buildMutatePlayerAndGlobalDeps({
+    lockAndGetContract: async () => null,
+    lockAndGetCurrentDailyChallenge,
+    lockAndGetPlayer,
+  });
+
+  await assert.rejects(() => runMutatePlayerAndGlobal(() => {}, deps), /contract introuvable/);
+  assert.equal(lockAndGetCurrentDailyChallenge.mock.calls.length, 0);
+  assert.equal(lockAndGetPlayer.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 4. daily_challenge absent : rejette (apres verrou contract), aucune ecriture", async () => {
+  const lockAndGetPlayer = mock.fn(async (_tx: never, id: string) => buildFullPlayerRow(id));
+  const deps = buildMutatePlayerAndGlobalDeps({
+    lockAndGetCurrentDailyChallenge: async () => null,
+    lockAndGetPlayer,
+  });
+
+  await assert.rejects(() => runMutatePlayerAndGlobal(() => {}, deps), /aucun daily_challenge trouve/);
+  assert.equal(lockAndGetPlayer.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 5. joueur absent (apres verrous global_state/contract/daily_challenge) : rejette, aucune lecture plots/inventory, aucune ecriture", async () => {
+  const getPlotsForUpdate = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["getPlotsForUpdate"]>) => []);
+  const updateGlobalStateRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateGlobalStateRow"]>) => {},
+  );
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutatePlayerAndGlobalDeps({
+    lockAndGetPlayer: async () => null,
+    getPlotsForUpdate,
+    updateGlobalStateRow,
+    updatePlayerRow,
+  });
+
+  await assert.rejects(() => runMutatePlayerAndGlobal(() => {}, deps), /introuvable/);
+  assert.equal(getPlotsForUpdate.mock.calls.length, 0);
+  assert.equal(updateGlobalStateRow.mock.calls.length, 0);
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 6. mutator synchrone qui leve : l'erreur remonte telle quelle, aucune ecriture", async () => {
+  const updateGlobalStateRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateGlobalStateRow"]>) => {},
+  );
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutatePlayerAndGlobalDeps({ updateGlobalStateRow, updatePlayerRow });
+
+  await assert.rejects(
+    () =>
+      runMutatePlayerAndGlobal(() => {
+        throw new Error("echec metier simule (sync)");
+      }, deps),
+    /echec metier simule \(sync\)/,
+  );
+  assert.equal(updateGlobalStateRow.mock.calls.length, 0);
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 7. mutator asynchrone qui rejette : l'erreur remonte telle quelle, aucune ecriture", async () => {
+  const updateGlobalStateRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateGlobalStateRow"]>) => {},
+  );
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutatePlayerAndGlobalDeps({ updateGlobalStateRow, updatePlayerRow });
+
+  await assert.rejects(
+    () =>
+      runMutatePlayerAndGlobal(async () => {
+        throw new Error("echec metier simule (async)");
+      }, deps),
+    /echec metier simule \(async\)/,
+  );
+  assert.equal(updateGlobalStateRow.mock.calls.length, 0);
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 8. mutator asynchrone qui resout : supporte, mutations player+global appliquees", async () => {
+  const result = await runMutatePlayerAndGlobal(async (player, global) => {
+    await Promise.resolve();
+    player.coins += 5;
+    global.marketMultiplier = 1.15;
+  }, buildMutatePlayerAndGlobalDeps());
+
+  assert.equal(result.player.coins, 55); // fixture par defaut : coins=50
+  assert.equal(result.global.marketMultiplier, 1.15);
+});
+
+test("mutatePlayerAndGlobal 9. erreur pendant l'ecriture globale : rejette, mutator deja execute, ecriture joueur jamais tentee", async () => {
+  const mutator = mock.fn((player: PlayerState, global: GlobalState) => {
+    player.coins += 1;
+    global.marketMultiplier = 1.2;
+  });
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutatePlayerAndGlobalDeps({
+    updateGlobalStateRow: async () => {
+      throw new Error("echec simule de l'UPDATE global_state");
+    },
+    updatePlayerRow,
+  });
+
+  await assert.rejects(() => runMutatePlayerAndGlobal(mutator, deps), /echec simule de l'UPDATE global_state/);
+  assert.equal(mutator.mock.calls.length, 1);
+  assert.equal(updatePlayerRow.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 10. retour player/global apres mutation, createdAt inchange, updatedAt coherent", async () => {
+  const updatePlayerRow = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["updatePlayerRow"]>) => {});
+  const deps = buildMutatePlayerAndGlobalDeps({ updatePlayerRow });
+
+  const result = await runMutatePlayerAndGlobal((player, global) => {
+    player.coins = 999;
+    global.marketMultiplier = 1.05;
+  }, deps);
+
+  assert.equal(result.player.coins, 999);
+  assert.equal(result.global.marketMultiplier, 1.05);
+
+  const [, , values] = updatePlayerRow.mock.calls[0]!.arguments;
+  assert.ok(!("createdAt" in values), "createdAt ne doit jamais faire partie des valeurs ecrites");
+  assert.ok(values.updatedAt instanceof Date);
+  assert.equal(result.player.updatedAt, values.updatedAt.getTime());
+  assert.equal(result.player.createdAt, NOW.getTime());
+});
+
+test("mutatePlayerAndGlobal 11. contract correctement persiste", async () => {
+  const updateContractRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateContractRow"]>) => {},
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({ updateContractRow });
+
+  await runMutatePlayerAndGlobal((_player, global) => {
+    global.contract.remaining -= 3;
+  }, deps);
+
+  assert.equal(updateContractRow.mock.calls.length, 1);
+  const [, values] = updateContractRow.mock.calls[0]!.arguments;
+  assert.equal(values.remaining, 17); // fixture par defaut : remaining=20
+  assert.equal(values.cropId, "wheat");
+  assert.equal(values.required, 20);
+});
+
+test("mutatePlayerAndGlobal 12. meme defi (startedAt inchange) : UPDATE de la ligne existante, jamais d'INSERT", async () => {
+  const updateDailyChallengeRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateDailyChallengeRow"]>) => {},
+  );
+  const insertDailyChallengeRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["insertDailyChallengeRow"]>) => {},
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({ updateDailyChallengeRow, insertDailyChallengeRow });
+
+  await runMutatePlayerAndGlobal((_player, global) => {
+    global.dailyChallenge.progress += 50;
+  }, deps);
+
+  assert.equal(updateDailyChallengeRow.mock.calls.length, 1);
+  assert.equal(insertDailyChallengeRow.mock.calls.length, 0);
+  const [, challengeId, values] = updateDailyChallengeRow.mock.calls[0]!.arguments;
+  assert.equal(challengeId, 1); // id de la ligne verrouillee (fixture)
+  assert.equal(values.progress, 50);
+});
+
+test("mutatePlayerAndGlobal 13. renouvellement (startedAt different) : INSERT d'une nouvelle ligne, jamais d'UPDATE, aucun upsert de contributeurs", async () => {
+  const updateDailyChallengeRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["updateDailyChallengeRow"]>) => {},
+  );
+  const insertDailyChallengeRow = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["insertDailyChallengeRow"]>) => {},
+  );
+  const upsertDailyChallengeContributors = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["upsertDailyChallengeContributors"]>) => {},
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({
+    updateDailyChallengeRow,
+    insertDailyChallengeRow,
+    upsertDailyChallengeContributors,
+  });
+
+  const NEW_STARTED_AT = 1_700_600_000_000;
+  await runMutatePlayerAndGlobal((_player, global) => {
+    global.dailyChallenge = {
+      cropId: "potato",
+      target: 100,
+      progress: 0,
+      contributors: [],
+      rewardCoins: 110,
+      startedAt: NEW_STARTED_AT,
+      completed: false,
+      rewarded: false,
+    };
+  }, deps);
+
+  assert.equal(insertDailyChallengeRow.mock.calls.length, 1);
+  assert.equal(updateDailyChallengeRow.mock.calls.length, 0);
+  assert.equal(upsertDailyChallengeContributors.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 14. nouveau contributeur ajoute au defi courant : upsert avec le bon challengeId, sans doublon (liste complete, ON CONFLICT DO NOTHING cote reel)", async () => {
+  const upsertDailyChallengeContributors = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["upsertDailyChallengeContributors"]>) => {},
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({ upsertDailyChallengeContributors });
+
+  await runMutatePlayerAndGlobal((player, global) => {
+    if (!global.dailyChallenge.contributors.includes(player.userId)) {
+      global.dailyChallenge.contributors.push(player.userId);
+    }
+    global.dailyChallenge.progress += 10;
+  }, deps);
+
+  assert.equal(upsertDailyChallengeContributors.mock.calls.length, 1);
+  const [, rows] = upsertDailyChallengeContributors.mock.calls[0]!.arguments;
+  assert.deepEqual(rows, [{ challengeId: 1, playerId: TEST_PLAYER_ID }]);
+});
+
+test("mutatePlayerAndGlobal 15. aucun nouveau contributeur (contributors vide) : upsert non tente", async () => {
+  const upsertDailyChallengeContributors = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["upsertDailyChallengeContributors"]>) => {},
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({ upsertDailyChallengeContributors });
+
+  await runMutatePlayerAndGlobal((_player, global) => {
+    global.dailyChallenge.progress += 1;
+  }, deps);
+
+  assert.equal(upsertDailyChallengeContributors.mock.calls.length, 0);
+});
+
+test("mutatePlayerAndGlobal 16. plots/inventory lus APRES le verrou du joueur, mutator execute seulement apres toutes les lectures (rejeu explicite hors du test d'ordre global)", async () => {
+  const callOrder: string[] = [];
+  const lockAndGetPlayer = mock.fn(async (_tx: never, id: string) => {
+    callOrder.push("lock-player");
+    return buildFullPlayerRow(id);
+  });
+  const getPlotsForUpdate = mock.fn(async (..._args: Parameters<MutatePlayerAndGlobalDeps["getPlotsForUpdate"]>) => {
+    callOrder.push("get-plots");
+    return [buildPlotRow({ id: 1, plotIndex: 0 })];
+  });
+  const getInventoryItemsForUpdate = mock.fn(
+    async (..._args: Parameters<MutatePlayerAndGlobalDeps["getInventoryItemsForUpdate"]>) => {
+      callOrder.push("get-inventory");
+      return [buildInventoryItemRow({ id: 1, itemId: "wheat", quantity: 3 })];
+    },
+  );
+  const deps = buildMutatePlayerAndGlobalDeps({ lockAndGetPlayer, getPlotsForUpdate, getInventoryItemsForUpdate });
+
+  await runMutatePlayerAndGlobal(() => {
+    callOrder.push("mutator");
+  }, deps);
+
+  assert.deepEqual(callOrder, ["lock-player", "get-plots", "get-inventory", "mutator"]);
 });

@@ -33,6 +33,7 @@ import type {
   GlobalStateRow,
   InventoryItem as InventoryItemRow,
   NewContractRow,
+  NewDailyChallengeContributor,
   NewDailyChallengeRow,
   NewGlobalStateRow,
   NewInventoryItem,
@@ -125,11 +126,11 @@ export async function getGlobalState(): Promise<GlobalState | null> {
 //   2. contract     (singleton id=1)
 //   3. daily_challenge (challenge courant, verrouille de facon deterministe)
 //   4. players      (verrouille par mutatePlayer/savePlayerWithTx)
-// mutateGlobalState() (plus bas) verrouille 1->2->3, jamais 4. La future
-// mutatePlayerAndGlobal() (categorie E de l'audit de migration, PAS encore
-// creee) devra verrouiller 1->2->3 PUIS 4, dans cet ordre exact et jamais
-// l'inverse -- un chemin qui verrouillerait players avant global_state
-// creerait un risque de deadlock avec un chemin qui fait l'inverse.
+// mutateGlobalState() verrouille 1->2->3, jamais 4. mutatePlayerAndGlobal()
+// (categorie E de l'audit de migration, plus bas dans ce fichier) verrouille
+// 1->2->3 PUIS 4, dans cet ordre exact et jamais l'inverse -- un chemin qui
+// verrouillerait players avant global_state creerait un risque de deadlock
+// avec un chemin qui fait l'inverse.
 //
 // Type du parametre `tx` : derive mecaniquement du type reel de
 // `db.transaction` (via `import type { db }`, efface a la compilation --
@@ -606,6 +607,31 @@ async function realInsertDailyChallengeRow(tx: Tx, values: Omit<NewDailyChalleng
   await tx.insert(dailyChallenge).values(values);
 }
 
+// Upsert (INSERT ... ON CONFLICT DO NOTHING) sur la cle composite
+// (challenge_id, player_id) -- pas de mise a jour possible pour une ligne
+// deja presente (contributed_at n'a de sens qu'a la PREMIERE contribution),
+// pas de DELETE. Reinserer un contributeur deja present est un no-op sans
+// erreur : appeler cette fonction avec la liste COMPLETE des contributeurs
+// courants (pas seulement les nouveaux) est donc sans danger, c'est le
+// choix fait par writeGlobalStateAndContributorsAssumingLock plus bas.
+// Specifique a mutatePlayerAndGlobal -- mutateGlobalState() n'ecrit jamais
+// cette table (voir son commentaire, LOT 3 : l'ajout de contributeurs est
+// une consequence de harvest(), categorie E, pas du renouvellement/des
+// transitions temporelles couvertes par mutateGlobalState()).
+async function realUpsertDailyChallengeContributors(
+  tx: Tx,
+  rows: NewDailyChallengeContributor[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  const { dailyChallengeContributors } = await getSchemaTables();
+  await tx
+    .insert(dailyChallengeContributors)
+    .values(rows)
+    .onConflictDoNothing({
+      target: [dailyChallengeContributors.challengeId, dailyChallengeContributors.playerId],
+    });
+}
+
 const realMutateGlobalStateDeps: MutateGlobalStateDeps = {
   lockAndGetGlobalState: realLockAndGetGlobalState,
   lockAndGetContract: realLockAndGetContract,
@@ -775,5 +801,192 @@ export async function mutateGlobalState(
     );
 
     return global;
+  });
+}
+
+// ===========================================================================
+// MUTATION ATOMIQUE JOUEUR + GLOBAL : mutatePlayerAndGlobal
+// ===========================================================================
+//
+// Categorie E de l'audit de migration : pour les actions qui doivent muter
+// LE JOUEUR ET L'ETAT GLOBAL dans UNE SEULE transaction (harvest -> daily_
+// challenge, sell -> contract) -- mutatePlayer() seul et mutateGlobalState()
+// seul ne suffisent pas ici : les appeler l'un apres l'autre rouvrirait une
+// fenetre de lost update ENTRE les deux (un autre appel pourrait modifier
+// le joueur ou le global entre les deux transactions separees).
+// mutatePlayerAndGlobal() verrouille les DEUX ressources dans UNE seule
+// transaction, sans jamais la relacher entre la lecture et l'ecriture.
+//
+// ORDRE DES VERROUS : global_state -> contract -> daily_challenge -> player
+// (voir le commentaire canonique au-dessus de `type Tx`) -- JAMAIS l'inverse.
+// C'est l'unique protection contre un deadlock entre deux transactions qui
+// verrouillent les memes ressources : tant que TOUT chemin de code respecte
+// cet ordre, deux transactions concurrentes qui se disputent plusieurs
+// verrous finissent toujours par se serialiser plutot que de s'attendre
+// mutuellement en cycle.
+//
+// Chaque verrou est pose INCONDITIONNELLEMENT, meme discipline que
+// mutatePlayer()/mutateGlobalState() : on ne sait pas a l'avance ce que le
+// mutator va effectivement modifier.
+//
+// REUTILISATION (aucune logique d'ecriture dupliquee) : l'ecriture du
+// joueur delegue integralement a writePlayerStateAssumingLock (la meme
+// fonction que savePlayerWithTx/mutatePlayer utilisent), l'ecriture de
+// l'etat global (global_state/contract/daily_challenge) delegue
+// integralement a writeGlobalStateAssumingLock (la meme fonction que
+// mutateGlobalState utilise) -- seul l'upsert des contributeurs du defi
+// (realUpsertDailyChallengeContributors, ci-dessus) est propre a cette
+// fonction, puisque mutateGlobalState() ne touche jamais cette table.
+//
+// LE MUTATOR DOIT RESTER UNE OPERATION METIER EN MEMOIRE : memes
+// contraintes que mutatePlayer()/mutateGlobalState() -- rapide, sans appel
+// reseau, sans I/O externe, sans autre requete DB hors de cette
+// transaction. Ici, un mutator non conforme garderait QUATRE verrous poses
+// simultanement (global_state + contract + daily_challenge + le joueur)
+// pendant toute la duree de cette I/O -- le pire cas de contention possible
+// dans ce fichier.
+export interface MutatePlayerAndGlobalDeps extends MutateGlobalStateDeps, PlayerWriteDeps {
+  getPlotsForUpdate: (tx: Tx, playerId: string) => Promise<PlotRow[]>;
+  getInventoryItemsForUpdate: (tx: Tx, playerId: string) => Promise<InventoryItemRow[]>;
+  toPlayerState: (record: PlayerRecord) => PlayerState;
+  upsertDailyChallengeContributors: (tx: Tx, rows: NewDailyChallengeContributor[]) => Promise<void>;
+}
+
+const realMutatePlayerAndGlobalDeps: MutatePlayerAndGlobalDeps = {
+  ...realMutateGlobalStateDeps,
+  ...realPlayerWriteDeps,
+  getPlotsForUpdate: realGetPlotsForUpdate,
+  getInventoryItemsForUpdate: realGetInventoryItemsForUpdate,
+  toPlayerState,
+  upsertDailyChallengeContributors: realUpsertDailyChallengeContributors,
+};
+
+/**
+ * Lit, mute et sauvegarde l'etat d'UN joueur ET l'etat global (global_state
+ * + contract + daily_challenge courant) dans UNE SEULE transaction, les
+ * QUATRE verrous poses du debut a la fin -- ferme la fenetre de lost update
+ * qu'un enchainement mutatePlayer() PUIS mutateGlobalState() (deux
+ * transactions separees) laisserait ouverte entre les deux.
+ *
+ * Deroulement : SELECT ... FOR UPDATE sur global_state (absent -> throw) ->
+ * SELECT ... FOR UPDATE sur contract (absent -> throw) -> SELECT ... FOR
+ * UPDATE sur le daily_challenge courant, ORDER BY started_at DESC, id DESC
+ * (absent -> throw) -> SELECT des contributeurs du defi courant -> SELECT
+ * ... FOR UPDATE sur le joueur (absent -> throw) -> SELECT plots (meme tx)
+ * -> SELECT inventory_items (meme tx) -> toGlobalState(...) ->
+ * toPlayerState(...) -> mutator(player, global) EN MEMOIRE -> ecriture
+ * (AUCUN second verrou : writeGlobalStateAssumingLock, upsert des
+ * contributeurs si le defi n'a pas ete renouvele, writePlayerStateAssumingLock)
+ * -> COMMIT.
+ *
+ * `mutator` mute `player` ET `global` EN PLACE (retour `void`/`Promise<void>`,
+ * sync ou async supporte) : les deux objets sont fraichement construits a
+ * l'interieur de cette transaction, sans aucune autre reference externe.
+ * Destine a recevoir des fonctions comme harvest(player, global, ...) ou
+ * sell(player, global, ...) de ../farm.ts, enveloppees dans une closure
+ * (ex. `(player, global) => { result = harvest(player, global); }`, meme
+ * pattern que farmPlayerActions.ts) -- aucune regle metier n'est dupliquee
+ * ici, harvest()/sell() sont compatibles SANS adaptation (voir le rapport
+ * de cette etape).
+ *
+ * Contributeurs du defi quotidien : apres l'ecriture globale, si le defi
+ * n'a PAS ete renouvele (meme comparaison de startedAt que
+ * writeGlobalStateAssumingLock utilise en interne pour choisir UPDATE vs
+ * INSERT), la liste COURANTE de `global.dailyChallenge.contributors` est
+ * upsertee (ON CONFLICT DO NOTHING sur la cle (challenge_id, player_id)) --
+ * reinserer un contributeur deja present est un no-op, donc aucun doublon
+ * possible et aucun besoin de calculer un diff. Si le defi a ete renouvele,
+ * aucun upsert n'est tente (le nouveau defi demarre par construction avec 0
+ * contributeur, voir randomDailyChallenge() dans ../constants.ts).
+ *
+ * `createdAt` (joueur) n'est jamais modifie (writePlayerStateAssumingLock
+ * ne l'ecrit jamais). `updatedAt` (joueur) est calcule UNE SEULE FOIS,
+ * transmis a l'ecriture puis reporte dans le PlayerState retourne -- meme
+ * garantie que mutatePlayer(). global_state n'a pas de colonne updated_at
+ * technique (meme remarque que mutateGlobalState()).
+ *
+ * Si `mutator` leve (sync ou async) ou si l'ecriture echoue, l'erreur
+ * remonte telle quelle et la transaction entiere est annulee par Drizzle
+ * (rollback automatique) -- aucune ecriture partielle possible.
+ */
+export async function mutatePlayerAndGlobal(
+  playerId: string,
+  mutator: (player: PlayerState, global: GlobalState) => void | Promise<void>,
+  deps: MutatePlayerAndGlobalDeps = realMutatePlayerAndGlobalDeps,
+  runTransaction?: TransactionRunner,
+): Promise<{ player: PlayerState; global: GlobalState }> {
+  const run = runTransaction ?? (await getRealTransactionRunner());
+
+  return run(async (tx) => {
+    const globalRow = await deps.lockAndGetGlobalState(tx);
+    if (!globalRow) {
+      throw new Error(
+        "mutatePlayerAndGlobal : global_state introuvable (id=1) -- base non initialisee, aucune mutation effectuee.",
+      );
+    }
+
+    const contractRow = await deps.lockAndGetContract(tx);
+    if (!contractRow) {
+      throw new Error(
+        "mutatePlayerAndGlobal : contract introuvable (id=1) -- etat incoherent, aucune mutation effectuee.",
+      );
+    }
+
+    const dailyChallengeRow = await deps.lockAndGetCurrentDailyChallenge(tx);
+    if (!dailyChallengeRow) {
+      throw new Error(
+        "mutatePlayerAndGlobal : aucun daily_challenge trouve -- etat incoherent, aucune mutation effectuee.",
+      );
+    }
+
+    const contributorRows = await deps.getDailyChallengeContributors(tx, dailyChallengeRow.id);
+
+    const playerRow = await deps.lockAndGetPlayer(tx, playerId);
+    if (!playerRow) {
+      throw new Error(
+        `mutatePlayerAndGlobal : joueur "${playerId}" introuvable -- aucune creation automatique, aucune mutation effectuee.`,
+      );
+    }
+
+    const plotRows = await deps.getPlotsForUpdate(tx, playerId);
+    const inventoryRows = await deps.getInventoryItemsForUpdate(tx, playerId);
+
+    const global = deps.toGlobalState({
+      globalState: globalRow,
+      contract: contractRow,
+      dailyChallenge: dailyChallengeRow,
+      dailyChallengeContributors: contributorRows,
+    });
+    const player = deps.toPlayerState({ player: playerRow, plots: plotRows, inventoryItems: inventoryRows });
+
+    await mutator(player, global);
+
+    // Ecriture dans le meme ordre que les verrous (global -> player), meme
+    // si l'ordre d'ecriture lui-meme n'a pas d'incidence sur le risque de
+    // deadlock une fois les quatre verrous deja detenus -- garde le code
+    // lisible/previsible.
+    const dailyChallengeWasRenewed = global.dailyChallenge.startedAt !== dailyChallengeRow.startedAt.getTime();
+    await writeGlobalStateAssumingLock(
+      tx,
+      global,
+      dailyChallengeRow.id,
+      dailyChallengeRow.startedAt.getTime(),
+      deps,
+    );
+    if (!dailyChallengeWasRenewed && global.dailyChallenge.contributors.length > 0) {
+      await deps.upsertDailyChallengeContributors(
+        tx,
+        global.dailyChallenge.contributors.map((contributorId) => ({
+          challengeId: dailyChallengeRow.id,
+          playerId: contributorId,
+        })),
+      );
+    }
+
+    const updatedAt = new Date();
+    await writePlayerStateAssumingLock(tx, player, updatedAt, deps);
+    player.updatedAt = updatedAt.getTime();
+
+    return { player, global };
   });
 }
