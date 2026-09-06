@@ -39,11 +39,18 @@ import {
   xpToNextLevel,
 } from "./farm.ts";
 import { FarmStore } from "./store.ts";
-import { buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop } from "./db/farmPlayerActions.ts";
+import {
+  buyPlayerUpgrade,
+  claimPlayerDaily,
+  craftPlayerItem,
+  harvestPlayerCrops,
+  plantPlayerCrop,
+} from "./db/farmPlayerActions.ts";
 import { ensurePlayerExists, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import type {
   CropId,
+  GlobalState,
   InventoryId,
   PlayerState,
   ProductId,
@@ -98,9 +105,23 @@ function stageFor(cropLevel: number) {
   return selected;
 }
 
-function weatherLine(store: FarmStore): string {
-  const weather = WEATHER_INFO[store.global.weather];
+// Extrait de weatherLine() ci-dessous pour accepter directement un
+// GlobalState (LOT 6, /harvest) : le chemin Postgres de resolveHarvestCrops
+// retourne le GlobalState REELLEMENT utilise pour calculer le rendement de
+// la recolte (via mutatePlayerAndGlobal) -- afficher la meteo depuis
+// store.global (JSON) serait incorrect pour un joueur allowliste, puisque
+// ce n'est pas necessairement le meme etat global que celui utilise pour
+// le calcul. weatherLine(store) reste inchangee pour tous ses autres
+// appelants (commandFarm, codexPayload), qui continuent de lire store.global
+// exactement comme avant -- aucune duplication de logique, un seul
+// formattage partage.
+function weatherLineForGlobal(global: GlobalState): string {
+  const weather = WEATHER_INFO[global.weather];
   return `${weather.emoji} ${weather.label} · rendement ×${weather.multiplier}`;
+}
+
+function weatherLine(store: FarmStore): string {
+  return weatherLineForGlobal(store.global);
 }
 
 function embedError(error: unknown): EmbedBuilder {
@@ -132,16 +153,22 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 }
 
 // LOT 6 : commandes ENTIEREMENT routees vers Postgres pour un joueur
-// allowliste -- aucune ne depend de global_state JSON (buyUpgrade()/
-// claimDaily()/plant() sont des fonctions PLAYER-ONLY, verifie a l'audit
-// de chaque branchement). Utilise UNIQUEMENT pour eviter le
+// allowliste -- utilise UNIQUEMENT pour eviter le
 // enrichGlobalState(store.global)+store.save() ci-dessous (qui ecrirait le
-// fichier JSON, meme sans toucher aux donnees du joueur) quand ce joueur
-// precis n'aura de toute facon aucune autre ecriture JSON pour CETTE
-// commande precise. Ne s'applique JAMAIS a /farm, /profile, etc. -- ces
-// commandes restent V1 pour absolument tout le monde, allowliste ou non,
-// et continuent donc de declencher ce preambule exactement comme avant.
-const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily", "plant"]);
+// fichier JSON) quand cette commande precise, pour CE joueur precis,
+// n'aura de toute facon AUCUNE ecriture JSON (ni joueur, ni globale).
+// buyUpgrade()/claimDaily()/plant()/craft() sont des fonctions PLAYER-ONLY
+// (jamais de global_state implique, verifie a l'audit de chaque
+// branchement). harvest() est DIFFERENTE -- elle mute aussi l'etat global
+// (daily_challenge.progress/contributors/completed), mais UNIQUEMENT celui
+// de PostgreSQL (via mutatePlayerAndGlobal(), voir resolveHarvestCrops
+// plus bas) -- jamais store.global/JSON, qui n'est simplement jamais
+// touche du tout dans la branche Postgres. Sauter ce preambule JSON reste
+// donc tout aussi sans consequence pour /harvest. Ne s'applique JAMAIS a
+// /farm, /profile, etc. -- ces commandes restent V1 pour absolument tout
+// le monde, allowliste ou non, et continuent donc de declencher ce
+// preambule exactement comme avant.
+const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily", "plant", "craft", "harvest"]);
 
 export function commandSkipsJsonPreamble(
   commandName: string,
@@ -347,15 +374,72 @@ async function commandFarm(
   });
 }
 
+// LOT 6, bascule TEST-only pour /harvest UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveBuyUpgrade/resolveDailyClaim/resolvePlantCrop/resolveCraftItem
+// ci-dessus. Contrairement aux quatre autres, /harvest a besoin d'une
+// PRIMITIVE DIFFERENTE (mutatePlayerAndGlobal(), via la fonction dediee
+// harvestPlayerCrops de farmPlayerActions.ts) car harvest() (../farm.ts)
+// mute a la fois le joueur ET l'etat global (daily_challenge) -- verifie a
+// l'audit : cette fonction reutilise harvest() telle quelle, aucune regle
+// dupliquee. La reponse Discord a besoin, comme pour /plant, d'une DONNEE
+// SUPPLEMENTAIRE au-dela du HarvestResult : la meteo affichee
+// (weatherLineForGlobal, format partage) doit provenir du MEME GlobalState que celui
+// reellement utilise pour calculer le rendement (global.weatherMultiplier,
+// lu par harvest() lui-meme) -- jamais de store.global (JSON) pour un
+// joueur allowliste, qui pourrait diverger de l'etat Postgres reellement
+// utilise pour le calcul. C'est pourquoi resolveHarvestCrops() retourne le
+// GlobalState complet en plus du HarvestResult, dans les DEUX branches.
+export interface HarvestResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  harvestPlayerCrops: typeof harvestPlayerCrops;
+}
+
+const realHarvestResolutionDeps: HarvestResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  harvestPlayerCrops,
+};
+
+export interface HarvestResolutionResult {
+  result: ReturnType<typeof harvest>;
+  global: GlobalState;
+}
+
+/**
+ * Decide quel backend utiliser pour /harvest et retourne le HarvestResult
+ * PLUS le GlobalState reellement utilise pour le calcul (necessaire pour
+ * la meteo affichee dans commandHarvest), SANS jamais toucher a la reponse
+ * Discord. Un joueur allowliste passe EXCLUSIVEMENT par le bootstrap PUIS
+ * la recolte cote Postgres (mutatePlayerAndGlobal, jamais store.mutatePlayer
+ * ni store.save) -- le controle "aucune parcelle prete" reste dans
+ * commandHarvest (comme en V1), pas ici. Un joueur non allowliste (cas par
+ * defaut) suit EXACTEMENT le chemin V1 : store.mutatePlayer + harvest(player,
+ * store.global), meme mutation du global JSON qu'avant.
+ */
+export async function resolveHarvestCrops(
+  playerId: string,
+  store: FarmStore,
+  deps: HarvestResolutionDeps = realHarvestResolutionDeps,
+): Promise<HarvestResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    return deps.harvestPlayerCrops(playerId);
+  }
+  let result: ReturnType<typeof harvest> | undefined;
+  await store.mutatePlayer(playerId, (player) => {
+    result = harvest(player, store.global);
+  });
+  return { result: result!, global: store.global };
+}
+
 async function commandHarvest(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  let result: ReturnType<typeof harvest> | undefined;
-  await store.mutatePlayer(interaction.user.id, (player) => {
-    result = harvest(player, store.global);
-  });
-  if (!result?.harvested.length) {
+  const { result, global } = await resolveHarvestCrops(interaction.user.id, store);
+  if (!result.harvested.length) {
     throw new FarmError("Aucune parcelle n'est prête pour le moment.");
   }
   const lines = result.harvested.map((entry) => {
@@ -371,7 +455,7 @@ async function commandHarvest(
         .addFields(
           { name: "XP gagnée", value: `+${result.totalXp}`, inline: true },
           { name: "Niveau", value: `${result.leveledUpTo}`, inline: true },
-          { name: "Météo", value: weatherLine(store), inline: true },
+          { name: "Météo", value: weatherLineForGlobal(global), inline: true },
         ),
     ],
   });
@@ -528,15 +612,59 @@ async function commandBuy(
   });
 }
 
+// LOT 6, bascule TEST-only pour /craft UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveBuyUpgrade/resolveDailyClaim/resolvePlantCrop ci-dessus. La plus
+// simple des quatre : contrairement a /plant, la reponse Discord n'a besoin
+// d'AUCUNE seconde lecture -- `quantity` (l'entree elle-meme) suffit deja
+// a l'affichage, exactement comme le fait deja commandCraft en V1 (le
+// retour de craft() n'est meme pas capture aujourd'hui : craft() est
+// all-or-nothing, donc un succes garantit crafted === quantity).
+export interface CraftResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  craftPlayerItem: typeof craftPlayerItem;
+}
+
+const realCraftResolutionDeps: CraftResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  craftPlayerItem,
+};
+
+/**
+ * Decide quel backend utiliser pour /craft et retourne la quantite
+ * fabriquee, SANS jamais toucher a la reponse Discord (voir commandCraft).
+ * Un joueur allowliste passe EXCLUSIVEMENT par le bootstrap PUIS la
+ * fabrication cote Postgres -- aucune ecriture JSON dans cette branche. Un
+ * joueur non allowliste (cas par defaut) suit EXACTEMENT le chemin V1 :
+ * store.mutatePlayer + craft(), meme erreur (ingredients insuffisants,
+ * quantite hors bornes) propagee telle quelle.
+ */
+export async function resolveCraftItem(
+  playerId: string,
+  recipeId: ProductId,
+  quantity: number,
+  store: FarmStore,
+  deps: CraftResolutionDeps = realCraftResolutionDeps,
+): Promise<number> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    return deps.craftPlayerItem(playerId, recipeId, quantity);
+  }
+  await store.mutatePlayer(playerId, (player) => {
+    craft(player, recipeId, quantity);
+  });
+  return quantity;
+}
+
 async function commandCraft(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
   const recipeId = productIdFrom(interaction.options.getString("recette", true));
   const quantity = interaction.options.getInteger("quantite") ?? 1;
-  await store.mutatePlayer(interaction.user.id, (player) => {
-    craft(player, recipeId, quantity);
-  });
+  await resolveCraftItem(interaction.user.id, recipeId, quantity, store);
   const recipe = recipeById(recipeId);
   await interaction.reply({
     embeds: [

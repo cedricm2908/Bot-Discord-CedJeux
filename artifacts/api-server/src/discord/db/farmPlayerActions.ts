@@ -8,19 +8,24 @@
 // reecrite ici : chaque action appelle exactement la meme fonction que
 // presenters.ts/routes/activity.ts appellent aujourd'hui contre FarmStore.
 //
-// EXCLUS de ce lot (LOT 2), volontairement : harvest et sell. Elles mutent
-// a la fois le joueur ET l'etat global (contract.remaining pour sell,
-// daily_challenge.progress/contributors pour harvest) -- elles ont besoin
-// d'une primitive qui verrouille les DEUX ressources dans UNE seule
-// transaction (mutatePlayerAndGlobal(), categorie E de l'audit de
-// migration), qui n'existe pas encore et n'est pas creee ici.
+// EXCLU de ce lot (LOT 2), volontairement : sell. Elle mute a la fois le
+// joueur ET l'etat global (contract.remaining) -- elle a besoin de la
+// meme primitive que harvest ci-dessous (mutatePlayerAndGlobal()), pas
+// encore branchee pour sell a ce stade (LOT 6, wiring /harvest).
 //
-// GLOBAL STATE : une seule action de ce fichier lit global_state
-// (buyPlayerWeatherForecast, via getGlobalState()) -- buyWeatherForecast()
-// ne fait que LIRE global.nextWeatherType, jamais l'ecrire. Aucune autre
-// action de ce fichier ne touche global_state, et aucune ecriture globale
-// n'a lieu nulle part dans ce fichier (ni mutateGlobalState(), qui
-// n'existe pas encore, ni un UPDATE direct quelconque).
+// LOT 6 (wiring /harvest) : harvestPlayerCrops() ci-dessous est la
+// PREMIERE action de ce fichier a utiliser mutatePlayerAndGlobal() plutot
+// que mutatePlayer() -- necessaire car harvest() (../farm.ts) mute a la
+// fois le joueur (inventaire/xp/niveau/parcelles) ET l'etat global
+// (daily_challenge.progress/contributors), verrouilles ensemble dans UNE
+// seule transaction (voir le commentaire de mutatePlayerAndGlobal() dans
+// farmRepository.ts, qui documente explicitement harvest()/sell() comme
+// compatibles SANS adaptation).
+//
+// GLOBAL STATE : buyPlayerWeatherForecast() lit global_state en LECTURE
+// SEULE (via getGlobalState(), jamais ecrit) ; harvestPlayerCrops() le
+// verrouille et l'ecrit (via mutatePlayerAndGlobal()) -- ce sont les deux
+// SEULES actions de ce fichier qui touchent global_state.
 import {
   buyUpgrade,
   buyWeatherForecast,
@@ -29,11 +34,13 @@ import {
   claimQuest,
   craft,
   FarmError,
+  harvest,
   plant,
   toggleAutoReplant,
+  type HarvestResult,
 } from "../farm.ts";
-import { getGlobalState, mutatePlayer } from "./farmRepository.ts";
-import type { CropId, PlayerState, PlotSkinId, ProductId, WeatherKey } from "../types";
+import { getGlobalState, mutatePlayer, mutatePlayerAndGlobal } from "./farmRepository.ts";
+import type { CropId, GlobalState, PlayerState, PlotSkinId, ProductId, WeatherKey } from "../types";
 
 // Dependances injectables -- meme convention que FarmRepositoryDeps/
 // PlayerWriteDeps/MutatePlayerDeps dans farmRepository.ts : les tests
@@ -203,4 +210,42 @@ export async function buyPlayerWeatherForecast(
     forecast = buyWeatherForecast(player, global);
   });
   return forecast!;
+}
+
+// Dependances injectables dediees a harvestPlayerCrops() -- separees de
+// FarmPlayerActionsDeps (qui n'expose que mutatePlayer/getGlobalState) car
+// harvest() a besoin de mutatePlayerAndGlobal(), jamais de mutatePlayer()
+// seul (voir le commentaire d'en-tete de ce fichier).
+export interface HarvestPlayerActionsDeps {
+  mutatePlayerAndGlobal: typeof mutatePlayerAndGlobal;
+}
+
+const realHarvestPlayerActionsDeps: HarvestPlayerActionsDeps = { mutatePlayerAndGlobal };
+
+/**
+ * Recolte toutes les parcelles pretes. Reutilise harvest() de ../farm.ts
+ * telle quelle -- y compris son increment d'inventaire/xp/niveau/
+ * totalHarvested, sa progression du defi quotidien (daily_challenge.progress/
+ * contributors/completed) et sa replantation automatique, deja tous
+ * integres a harvest() lui-meme (aucun second systeme n'est introduit
+ * ici). `mutatePlayerAndGlobal()` verrouille le joueur ET l'etat global
+ * (global_state + contract + daily_challenge) dans UNE SEULE transaction --
+ * necessaire car harvest() mute les deux a la fois. Retourne a la fois le
+ * `HarvestResult` (pour la reponse Discord) ET le `GlobalState` complet
+ * relu/mute (pour que l'appelant puisse afficher la meteo EXACTEMENT comme
+ * celle utilisee pour calculer le rendement -- jamais une lecture separee
+ * d'un autre etat global qui pourrait diverger). Erreurs metier propagees
+ * telles quelles (aucune parcelle prete => harvested vide, verifie par
+ * l'appelant, pas ici -- meme repartition des responsabilites qu'en V1 ou
+ * ce controle vit dans presenters.ts, pas dans harvest()).
+ */
+export async function harvestPlayerCrops(
+  playerId: string,
+  deps: HarvestPlayerActionsDeps = realHarvestPlayerActionsDeps,
+): Promise<{ result: HarvestResult; global: GlobalState }> {
+  let result: HarvestResult | undefined;
+  const { global } = await deps.mutatePlayerAndGlobal(playerId, (player, global) => {
+    result = harvest(player, global);
+  });
+  return { result: result!, global };
 }

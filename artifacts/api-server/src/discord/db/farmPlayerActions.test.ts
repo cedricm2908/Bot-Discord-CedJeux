@@ -18,9 +18,11 @@ import {
   claimPlayerDaily,
   claimPlayerQuest,
   craftPlayerItem,
+  harvestPlayerCrops,
   plantPlayerCrop,
   togglePlayerAutoReplant,
   type FarmPlayerActionsDeps,
+  type HarvestPlayerActionsDeps,
 } from "./farmPlayerActions.ts";
 import type { GlobalState, PlayerState } from "../types";
 
@@ -371,7 +373,84 @@ test("deux actions independantes (plant, craft) passent bien exclusivement par m
   assert.equal(getGlobalStateMock.mock.calls.length, 0);
 });
 
-test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/sharedStore.ts, ni mutateGlobalState/mutatePlayerAndGlobal", async () => {
+// ===========================================================================
+// harvestPlayerCrops (LOT 6) -- mutatePlayerAndGlobal(), pas mutatePlayer().
+// Mock qui applique REELLEMENT le mutator (player, global) recu, meme
+// contrat que buildMutatePlayerMock ci-dessus mais pour les DEUX
+// ressources -- exerce la VRAIE fonction harvest() de farm.ts.
+// ===========================================================================
+
+function buildMutatePlayerAndGlobalMock(player: PlayerState, global: GlobalState) {
+  return mock.fn(async (_playerId: string, mutator: (p: PlayerState, g: GlobalState) => void | Promise<void>) => {
+    await mutator(player, global);
+    return { player, global };
+  });
+}
+
+function buildHarvestDeps(
+  player: PlayerState,
+  global: GlobalState,
+): { deps: HarvestPlayerActionsDeps; mutatePlayerAndGlobal: ReturnType<typeof buildMutatePlayerAndGlobalMock> } {
+  const mutatePlayerAndGlobalMock = buildMutatePlayerAndGlobalMock(player, global);
+  const deps: HarvestPlayerActionsDeps = {
+    mutatePlayerAndGlobal: mutatePlayerAndGlobalMock as unknown as HarvestPlayerActionsDeps["mutatePlayerAndGlobal"],
+  };
+  return { deps, mutatePlayerAndGlobal: mutatePlayerAndGlobalMock };
+}
+
+test("harvestPlayerCrops : mutatePlayerAndGlobal appele avec le bon playerId, harvest() appliquee, HarvestResult + GlobalState retournes", async () => {
+  const player = buildPlayerState({
+    plots: [{ cropId: "wheat", plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false }],
+    inventory: {},
+  });
+  const global = buildGlobalState();
+  const { deps, mutatePlayerAndGlobal } = buildHarvestDeps(player, global);
+
+  const { result, global: returnedGlobal } = await harvestPlayerCrops(TEST_PLAYER_ID, deps);
+
+  assert.equal(mutatePlayerAndGlobal.mock.calls.length, 1);
+  assert.equal(mutatePlayerAndGlobal.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(result.harvested.length, 1);
+  assert.equal(result.harvested[0]!.cropId, "wheat");
+  assert.equal(returnedGlobal, global, "le GlobalState retourne doit etre celui reellement mute par harvest()");
+  assert.ok((player.inventory.wheat ?? 0) > 0, "l'inventaire doit avoir ete incremente par le vrai harvest()");
+});
+
+test("harvestPlayerCrops : aucune parcelle prete => harvested vide, AUCUNE erreur levee ici (le controle vit dans presenters.ts, comme en V1)", async () => {
+  const player = buildPlayerState({ plots: [{ cropId: null, plantedAt: null, notifiedReady: false }] });
+  const global = buildGlobalState();
+  const { deps } = buildHarvestDeps(player, global);
+
+  const { result } = await harvestPlayerCrops(TEST_PLAYER_ID, deps);
+
+  assert.deepEqual(result.harvested, []);
+});
+
+test("harvestPlayerCrops : la progression du defi quotidien (daily_challenge) est mise a jour par le MEME harvest(), aucune regle dupliquee", async () => {
+  const player = buildPlayerState({
+    plots: [{ cropId: "wheat", plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false }],
+  });
+  const global = buildGlobalState({
+    dailyChallenge: {
+      cropId: "wheat",
+      target: 200,
+      progress: 0,
+      contributors: [],
+      rewardCoins: 80,
+      startedAt: NOW,
+      completed: false,
+      rewarded: false,
+    },
+  });
+  const { deps } = buildHarvestDeps(player, global);
+
+  await harvestPlayerCrops(TEST_PLAYER_ID, deps);
+
+  assert.ok(global.dailyChallenge.progress > 0, "la progression du defi doit avoir avance (meme regle que harvest() V1)");
+  assert.ok(global.dailyChallenge.contributors.includes(TEST_PLAYER_ID));
+});
+
+test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/sharedStore.ts, ni mutateGlobalState (mutatePlayerAndGlobal est desormais attendue, pour harvestPlayerCrops -- LOT 6)", async () => {
   const filePath = new URL("./farmPlayerActions.ts", import.meta.url);
   const source = await readFile(filePath, "utf8");
   // Seules les lignes d'import (et non les commentaires explicatifs, qui
@@ -386,6 +465,6 @@ test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/shar
   assert.ok(!/getFarmStore/.test(importLines), "aucun import de getFarmStore attendu");
   assert.ok(!/from ["']\.\/store/.test(importLines), "aucun import de ./store attendu");
   assert.ok(!/from ["']\.\/sharedStore/.test(importLines), "aucun import de ./sharedStore attendu");
-  assert.ok(!/mutateGlobalState/.test(importLines), "mutateGlobalState n'existe pas encore et ne doit pas etre importe");
-  assert.ok(!/mutatePlayerAndGlobal/.test(importLines), "mutatePlayerAndGlobal n'existe pas encore et ne doit pas etre importe");
+  assert.ok(!/mutateGlobalState/.test(importLines), "mutateGlobalState (sans lien avec un joueur) n'est pas necessaire ici et ne doit pas etre importe");
+  assert.ok(/mutatePlayerAndGlobal/.test(importLines), "mutatePlayerAndGlobal DOIT desormais etre importe (harvestPlayerCrops, LOT 6)");
 });
