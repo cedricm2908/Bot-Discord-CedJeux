@@ -45,6 +45,7 @@ import {
   craftPlayerItem,
   harvestPlayerCrops,
   plantPlayerCrop,
+  sellPlayerItems,
 } from "./db/farmPlayerActions.ts";
 import { ensurePlayerExists, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
@@ -159,16 +160,17 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // n'aura de toute facon AUCUNE ecriture JSON (ni joueur, ni globale).
 // buyUpgrade()/claimDaily()/plant()/craft() sont des fonctions PLAYER-ONLY
 // (jamais de global_state implique, verifie a l'audit de chaque
-// branchement). harvest() est DIFFERENTE -- elle mute aussi l'etat global
-// (daily_challenge.progress/contributors/completed), mais UNIQUEMENT celui
-// de PostgreSQL (via mutatePlayerAndGlobal(), voir resolveHarvestCrops
-// plus bas) -- jamais store.global/JSON, qui n'est simplement jamais
-// touche du tout dans la branche Postgres. Sauter ce preambule JSON reste
-// donc tout aussi sans consequence pour /harvest. Ne s'applique JAMAIS a
-// /farm, /profile, etc. -- ces commandes restent V1 pour absolument tout
-// le monde, allowliste ou non, et continuent donc de declencher ce
-// preambule exactement comme avant.
-const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily", "plant", "craft", "harvest"]);
+// branchement). harvest()/sell() sont DIFFERENTES -- elles mutent aussi
+// l'etat global (daily_challenge pour harvest, contract.remaining pour
+// sell), mais UNIQUEMENT celui de PostgreSQL (via mutatePlayerAndGlobal(),
+// voir resolveHarvestCrops/resolveSellItems plus bas) -- jamais
+// store.global/JSON, qui n'est simplement jamais touche du tout dans la
+// branche Postgres. Sauter ce preambule JSON reste donc tout aussi sans
+// consequence pour /harvest et /sell. Ne s'applique JAMAIS a /farm,
+// /profile, etc. -- ces commandes restent V1 pour absolument tout le
+// monde, allowliste ou non, et continuent donc de declencher ce preambule
+// exactement comme avant.
+const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily", "plant", "craft", "harvest", "sell"]);
 
 export function commandSkipsJsonPreamble(
   commandName: string,
@@ -489,16 +491,69 @@ async function commandInventory(
   });
 }
 
+// LOT 6, bascule TEST-only pour /sell UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveHarvestCrops ci-dessus (meme primitive mutatePlayerAndGlobal(),
+// via la fonction dediee sellPlayerItems de farmPlayerActions.ts, car sell() mute a la fois
+// le joueur ET l'etat global (contract.remaining)). MEME PRECAUTION que
+// pour /harvest (weatherLineForGlobal()) : la reponse Discord affiche
+// "Contrat restant" -- cette valeur DOIT provenir du GlobalState
+// REELLEMENT utilise par la vente, jamais de store.global (JSON), qui
+// pourrait diverger de l'etat Postgres pour un joueur allowliste. C'est
+// pourquoi resolveSellItems() retourne le GlobalState complet en plus du
+// SellResult, dans les DEUX branches -- exactement comme resolveHarvestCrops.
+export interface SellResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  sellPlayerItems: typeof sellPlayerItems;
+}
+
+const realSellResolutionDeps: SellResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  sellPlayerItems,
+};
+
+export interface SellResolutionResult {
+  result: ReturnType<typeof sell>;
+  global: GlobalState;
+}
+
+/**
+ * Decide quel backend utiliser pour /sell et retourne le SellResult PLUS
+ * le GlobalState reellement utilise (necessaire pour "Contrat restant"
+ * dans commandSell), SANS jamais toucher a la reponse Discord. Un joueur
+ * allowliste passe EXCLUSIVEMENT par le bootstrap PUIS la vente cote
+ * Postgres (mutatePlayerAndGlobal, jamais store.mutatePlayer ni
+ * store.save). Un joueur non allowliste (cas par defaut) suit EXACTEMENT
+ * le chemin V1 : store.mutatePlayer + sell(player, store.global, ...),
+ * meme mutation du contract JSON qu'avant.
+ */
+export async function resolveSellItems(
+  playerId: string,
+  itemId: InventoryId | "all",
+  requestedAmount: number | null,
+  store: FarmStore,
+  deps: SellResolutionDeps = realSellResolutionDeps,
+): Promise<SellResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    return deps.sellPlayerItems(playerId, itemId, requestedAmount);
+  }
+  let result: ReturnType<typeof sell> | undefined;
+  await store.mutatePlayer(playerId, (player) => {
+    result = sell(player, store.global, itemId, requestedAmount);
+  });
+  return { result: result!, global: store.global };
+}
+
 async function commandSell(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
   const itemId = inventoryIdFrom(interaction.options.getString("culture", true));
   const requestedAmount = interaction.options.getInteger("quantite") ?? null;
-  let result: ReturnType<typeof sell> | undefined;
-  await store.mutatePlayer(interaction.user.id, (player) => {
-    result = sell(player, store.global, itemId, requestedAmount);
-  });
+  const { result, global } = await resolveSellItems(interaction.user.id, itemId, requestedAmount, store);
   if (!result) throw new FarmError("Vente impossible.");
   const lines = result.sold.map((entry) => {
     const item = [...CROPS, ...RECIPES].find((candidate) => candidate.id === entry.itemId);
@@ -512,7 +567,7 @@ async function commandSell(
         .setDescription(lines.join("\n"))
         .addFields(
           { name: "Gains", value: formatCoins(result.earned), inline: true },
-          { name: "Contrat restant", value: `${store.global.contract.remaining} unités`, inline: true },
+          { name: "Contrat restant", value: `${global.contract.remaining} unités`, inline: true },
         ),
     ],
   });

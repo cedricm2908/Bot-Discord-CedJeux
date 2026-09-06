@@ -20,9 +20,11 @@ import {
   craftPlayerItem,
   harvestPlayerCrops,
   plantPlayerCrop,
+  sellPlayerItems,
   togglePlayerAutoReplant,
   type FarmPlayerActionsDeps,
   type HarvestPlayerActionsDeps,
+  type SellPlayerItemsDeps,
 } from "./farmPlayerActions.ts";
 import type { GlobalState, PlayerState } from "../types";
 
@@ -448,6 +450,62 @@ test("harvestPlayerCrops : la progression du defi quotidien (daily_challenge) es
 
   assert.ok(global.dailyChallenge.progress > 0, "la progression du defi doit avoir avance (meme regle que harvest() V1)");
   assert.ok(global.dailyChallenge.contributors.includes(TEST_PLAYER_ID));
+});
+
+// ===========================================================================
+// sellPlayerItems (LOT 6) -- meme primitive mutatePlayerAndGlobal() que
+// harvestPlayerCrops ci-dessus, meme mock reutilise.
+// ===========================================================================
+
+function buildSellDeps(
+  player: PlayerState,
+  global: GlobalState,
+): { deps: SellPlayerItemsDeps; mutatePlayerAndGlobal: ReturnType<typeof buildMutatePlayerAndGlobalMock> } {
+  const mutatePlayerAndGlobalMock = buildMutatePlayerAndGlobalMock(player, global);
+  const deps: SellPlayerItemsDeps = {
+    mutatePlayerAndGlobal: mutatePlayerAndGlobalMock as unknown as SellPlayerItemsDeps["mutatePlayerAndGlobal"],
+  };
+  return { deps, mutatePlayerAndGlobal: mutatePlayerAndGlobalMock };
+}
+
+test("sellPlayerItems : mutatePlayerAndGlobal appele avec le bon playerId, sell() appliquee (inventaire diminue, coins augmentes), SellResult + GlobalState retournes", async () => {
+  const player = buildPlayerState({ inventory: { wheat: 10 }, coins: 0 });
+  const global = buildGlobalState({ marketMultiplier: 1, contract: { cropId: "carrot", required: 20, remaining: 20, bonusMultiplier: 1.6, renewedAt: NOW } });
+  const { deps, mutatePlayerAndGlobal } = buildSellDeps(player, global);
+
+  const { result, global: returnedGlobal } = await sellPlayerItems(TEST_PLAYER_ID, "wheat", 5, deps);
+
+  assert.equal(mutatePlayerAndGlobal.mock.calls.length, 1);
+  assert.equal(mutatePlayerAndGlobal.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(result.sold.length, 1);
+  assert.equal(player.inventory.wheat, 5);
+  assert.ok(player.coins > 0, "les coins doivent avoir augmente (vrai sell())");
+  assert.equal(returnedGlobal, global, "le GlobalState retourne doit etre celui reellement mute par sell()");
+});
+
+test("sellPlayerItems : le bonus de contrat exact V1 est applique et contract.remaining mis a jour par le MEME sell(), aucune regle dupliquee", async () => {
+  const player = buildPlayerState({ inventory: { wheat: 10 }, coins: 0 });
+  const global = buildGlobalState({
+    marketMultiplier: 1,
+    contract: { cropId: "wheat", required: 20, remaining: 6, bonusMultiplier: 1.6, renewedAt: NOW },
+  });
+  const { deps } = buildSellDeps(player, global);
+
+  const { result } = await sellPlayerItems(TEST_PLAYER_ID, "wheat", 10, deps);
+
+  // basePrice(wheat)=4, marketMultiplier=1 => normalPrice=4 ; bonus/unite =
+  // round(4*1.6)=6 ; 6 unites contractees*6 + 4 unites*4 = 36+16 = 52 --
+  // meme regle V1 exacte que sell() dans farm.ts.
+  assert.equal(result.earned, 52);
+  assert.equal(global.contract.remaining, 0);
+});
+
+test("sellPlayerItems : aucune ressource a vendre => FarmError propagee telle quelle", async () => {
+  const player = buildPlayerState({ inventory: {} });
+  const global = buildGlobalState();
+  const { deps } = buildSellDeps(player, global);
+
+  await assert.rejects(() => sellPlayerItems(TEST_PLAYER_ID, "wheat", null, deps), FarmError);
 });
 
 test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/sharedStore.ts, ni mutateGlobalState (mutatePlayerAndGlobal est desormais attendue, pour harvestPlayerCrops -- LOT 6)", async () => {

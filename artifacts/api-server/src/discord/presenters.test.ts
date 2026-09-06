@@ -1,19 +1,19 @@
 // Tests de presenters.ts -- LOT 6, UNIQUEMENT le branchement PostgreSQL de
 // /buy (resolveBuyUpgrade), /daily (resolveDailyClaim), /plant
-// (resolvePlantCrop), /craft (resolveCraftItem) et /harvest
-// (resolveHarvestCrops), plus le garde-fou de preambule
-// (commandSkipsJsonPreamble). N'importe jamais discord.js comme valeur
-// d'execution pour les tests resolveBuyUpgrade/resolveDailyClaim/
-// resolvePlantCrop/resolveCraftItem/resolveHarvestCrops (ni fausse
-// ChatInputCommandInteraction) : ces fonctions ont ete extraites de
-// commandBuy()/commandDaily()/commandPlant()/commandCraft()/commandHarvest()
-// precisement pour rester testables ainsi -- seule la DECISION (V1 vs
-// Postgres, quel resultat) est exercee ici. Le parsing des options et la
-// construction de l'embed Discord restent dans ces command*(), inchanges,
-// non couverts par ce fichier (aucune regle metier n'y est ajoutee ni
-// testee a nouveau). Une fausse interaction minimale N'EST construite QUE
-// pour le test "list" de handleSlashCommand (commande sans donnee joueur,
-// jamais de connexion DB).
+// (resolvePlantCrop), /craft (resolveCraftItem), /harvest
+// (resolveHarvestCrops) et /sell (resolveSellItems), plus le garde-fou de
+// preambule (commandSkipsJsonPreamble). N'importe jamais discord.js comme
+// valeur d'execution pour les tests resolveBuyUpgrade/resolveDailyClaim/
+// resolvePlantCrop/resolveCraftItem/resolveHarvestCrops/resolveSellItems
+// (ni fausse ChatInputCommandInteraction) : ces fonctions ont ete
+// extraites de commandBuy()/commandDaily()/commandPlant()/commandCraft()/
+// commandHarvest()/commandSell() precisement pour rester testables ainsi --
+// seule la DECISION (V1 vs Postgres, quel resultat) est exercee ici. Le
+// parsing des options et la construction de l'embed Discord restent dans
+// ces command*(), inchanges, non couverts par ce fichier (aucune regle
+// metier n'y est ajoutee ni testee a nouveau). Une fausse interaction
+// minimale N'EST construite QUE pour le test "list" de handleSlashCommand
+// (commande sans donnee joueur, jamais de connexion DB).
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { mock, test } from "node:test";
@@ -27,11 +27,13 @@ import {
   resolveDailyClaim,
   resolveHarvestCrops,
   resolvePlantCrop,
+  resolveSellItems,
   type BuyResolutionDeps,
   type CraftResolutionDeps,
   type DailyResolutionDeps,
   type HarvestResolutionDeps,
   type PlantResolutionDeps,
+  type SellResolutionDeps,
 } from "./presenters.ts";
 import { POSTGRES_TEST_PLAYER_IDS_ENV_VAR, shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import { FarmStore } from "./store.ts";
@@ -914,36 +916,277 @@ test("resolveHarvestCrops F. reponse : la meteo affichee (weatherLineForGlobal) 
 });
 
 // ===========================================================================
+// resolveSellItems -- meme structure que resolveHarvestCrops (meme
+// primitive mutatePlayerAndGlobal(), meme nuance : la reponse Discord a
+// besoin du GlobalState reellement utilise pour "Contrat restant").
+// ===========================================================================
+
+function buildSellDeps(overrides: Partial<SellResolutionDeps> = {}): SellResolutionDeps {
+  return {
+    shouldUsePostgresRuntime: () => false,
+    ensurePlayerExists: async (playerId: string) => ({ player: buildPlayerState({ userId: playerId }), created: false }),
+    sellPlayerItems: async () => ({
+      result: { sold: [], earned: 0 },
+      global: buildGlobalState(),
+    }),
+    ...overrides,
+  };
+}
+
+test("resolveSellItems A. joueur non allowliste : utilise store.mutatePlayer, jamais ensurePlayerExists/sellPlayerItems, meme regle V1 (sell reel de farm.ts, inventaire diminue, coins augmentes)", async () => {
+  const player = buildPlayerState({ inventory: { wheat: 10 }, coins: 0 });
+  const global = buildGlobalState();
+  const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    mutator(player);
+    return player;
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], global);
+  const ensurePlayerExists = mock.fn(async () => ({ player, created: false }));
+  const sellPlayerItems = mock.fn(async () => {
+    throw new Error("sellPlayerItems ne doit jamais etre appele sur le chemin V1");
+  });
+  const deps = buildSellDeps({ shouldUsePostgresRuntime: () => false, ensurePlayerExists, sellPlayerItems });
+
+  const { result, global: returnedGlobal } = await resolveSellItems(TEST_PLAYER_ID, "wheat", 5, store, deps);
+
+  assert.equal(mutatePlayer.mock.calls.length, 1);
+  assert.equal(ensurePlayerExists.mock.calls.length, 0);
+  assert.equal(sellPlayerItems.mock.calls.length, 0);
+  // sell("wheat", 5) reel de farm.ts : marketMultiplier=1 => currentCropPrice(wheat)=4
+  // (basePrice), aucun bonus de contrat (contract.cropId="wheat" mais
+  // remaining=20 -- ICI le contrat EST rempli, voir test E dedie pour le
+  // bonus). Ce test-ci verifie surtout inventaire/coins, pas le contrat.
+  assert.equal(player.inventory.wheat, 5);
+  assert.ok(player.coins > 0, "les coins doivent avoir augmente");
+  assert.equal(returnedGlobal, global, "le GlobalState retourne doit etre store.global, celui reellement mute par sell()");
+});
+
+test("resolveSellItems B. joueur allowliste existant : ensurePlayerExists + sellPlayerItems avec le bon playerId/itemId/quantite, jamais store.mutatePlayer", async () => {
+  const mutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer ne doit jamais etre appele sur le chemin Postgres");
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], buildGlobalState());
+  const ensurePlayerExists = mock.fn(async (playerId: string) => ({
+    player: buildPlayerState({ userId: playerId }),
+    created: false,
+  }));
+  const pgGlobal = buildGlobalState({ contract: { cropId: "wheat", required: 20, remaining: 15, bonusMultiplier: 1.6, renewedAt: NOW } });
+  const sellPlayerItems = mock.fn(async () => ({
+    result: { sold: [{ itemId: "wheat" as const, amount: 5, earned: 20 }], earned: 20 },
+    global: pgGlobal,
+  }));
+  const deps = buildSellDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, sellPlayerItems });
+
+  const { result, global } = await resolveSellItems(TEST_PLAYER_ID, "wheat", 5, store, deps);
+
+  assert.equal(ensurePlayerExists.mock.calls.length, 1);
+  assert.equal(ensurePlayerExists.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(sellPlayerItems.mock.calls.length, 1);
+  assert.deepEqual(sellPlayerItems.mock.calls[0]!.arguments, [TEST_PLAYER_ID, "wheat", 5]);
+  assert.equal(mutatePlayer.mock.calls.length, 0);
+  assert.equal(result.earned, 20);
+  assert.equal(global, pgGlobal, "le GlobalState retourne doit etre celui de Postgres, jamais store.global (JSON)");
+});
+
+test("resolveSellItems C. contrat : le bonus exact V1 est applique et contract.remaining mis a jour exactement comme V1 (sell reel de farm.ts)", async () => {
+  const player = buildPlayerState({ inventory: { wheat: 10 }, coins: 0 });
+  // contract.cropId="wheat", remaining=6 : vente de 10 -> 6 contractees (bonus),
+  // 4 au prix normal -- regle V1 exacte de sell().
+  const global = buildGlobalState({
+    marketMultiplier: 1,
+    contract: { cropId: "wheat", required: 20, remaining: 6, bonusMultiplier: 1.6, renewedAt: NOW },
+  });
+  const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    mutator(player);
+    return player;
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], global);
+
+  const { result, global: returnedGlobal } = await resolveSellItems(
+    TEST_PLAYER_ID,
+    "wheat",
+    10,
+    store,
+    buildSellDeps({ shouldUsePostgresRuntime: () => false }),
+  );
+
+  // basePrice(wheat)=4, marketMultiplier=1 => normalPrice=4.
+  // bonus par unite = round(4*1.6) = 6. 6 unites contractees * 6 + 4 unites * 4 = 36+16 = 52.
+  assert.equal(result.earned, 52);
+  assert.equal(returnedGlobal.contract.remaining, 0, "contract.remaining doit etre exactement 0 (6-6), jamais negatif");
+  assert.equal(player.inventory.wheat, 0);
+});
+
+test("resolveSellItems D. marche : le prix reflete exactement currentCropPrice()/productPrice() de farm.ts, aucune formule reimplementee dans presenters.ts", async () => {
+  const player = buildPlayerState({ inventory: { wheat: 5 }, coins: 0 });
+  // marketMultiplier=2 : normalPrice = round(4*2) = 8. Aucun contrat pour
+  // ce test (cropId different) -- prix 100% marche.
+  const global = buildGlobalState({
+    marketMultiplier: 2,
+    contract: { cropId: "carrot", required: 20, remaining: 20, bonusMultiplier: 1.6, renewedAt: NOW },
+  });
+  const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    mutator(player);
+    return player;
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], global);
+
+  const { result } = await resolveSellItems(
+    TEST_PLAYER_ID,
+    "wheat",
+    5,
+    store,
+    buildSellDeps({ shouldUsePostgresRuntime: () => false }),
+  );
+
+  assert.equal(result.earned, 40); // 5 * round(4*2) = 40
+});
+
+test("resolveSellItems E. joueur allowliste absent : bootstrap (created=true) PUIS sellPlayerItems, aucun chemin JSON", async () => {
+  const mutatePlayer = mock.fn(async () => {
+    throw new Error("aucun chemin JSON attendu pour un joueur allowliste");
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], buildGlobalState());
+  const callOrder: string[] = [];
+  const ensurePlayerExists = mock.fn(async (playerId: string) => {
+    callOrder.push("ensure");
+    return { player: buildPlayerState({ userId: playerId }), created: true };
+  });
+  const sellPlayerItems = mock.fn(async () => {
+    callOrder.push("sell");
+    return { result: { sold: [], earned: 0 }, global: buildGlobalState() };
+  });
+  const deps = buildSellDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, sellPlayerItems });
+
+  await resolveSellItems(TEST_PLAYER_ID, "all", null, store, deps);
+
+  assert.deepEqual(callOrder, ["ensure", "sell"]);
+  assert.equal(mutatePlayer.mock.calls.length, 0);
+});
+
+test("resolveSellItems F. erreur metier (aucune ressource a vendre) : FarmError propagee telle quelle, aucun fallback silencieux vers JSON", async () => {
+  const mutatePlayer = mock.fn(async () => {
+    throw new Error("aucun fallback JSON attendu apres une erreur Postgres");
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], buildGlobalState());
+  const ensurePlayerExists = mock.fn(async (playerId: string) => ({
+    player: buildPlayerState({ userId: playerId }),
+    created: false,
+  }));
+  const sellPlayerItems = mock.fn(async () => {
+    throw new FarmError("Tu n'as aucune ressource de ce type à vendre.");
+  });
+  const deps = buildSellDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, sellPlayerItems });
+
+  await assert.rejects(
+    () => resolveSellItems(TEST_PLAYER_ID, "wheat", null, store, deps),
+    (error: unknown) => error instanceof FarmError,
+  );
+  assert.equal(mutatePlayer.mock.calls.length, 0, "aucun fallback silencieux vers JSON apres une erreur Postgres");
+});
+
+test("resolveSellItems G. env FARM2WIN_POSTGRES_TEST_PLAYER_IDS absente, avec la VRAIE shouldUsePostgresRuntime (non mockee) : comportement V1 par defaut", async () => {
+  const originalEnv = process.env[POSTGRES_TEST_PLAYER_IDS_ENV_VAR];
+  try {
+    delete process.env[POSTGRES_TEST_PLAYER_IDS_ENV_VAR];
+    const player = buildPlayerState({ inventory: { wheat: 10 }, coins: 0 });
+    const global = buildGlobalState();
+    const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+      mutator(player);
+      return player;
+    });
+    const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], global);
+    const ensurePlayerExists = mock.fn(async () => ({ player, created: false }));
+    const sellPlayerItems = mock.fn(async () => {
+      throw new Error("sellPlayerItems ne doit jamais etre appele en V1");
+    });
+
+    const { result } = await resolveSellItems(TEST_PLAYER_ID, "wheat", 3, store, {
+      shouldUsePostgresRuntime, // la VRAIE fonction importee, pas un mock
+      ensurePlayerExists,
+      sellPlayerItems,
+    });
+
+    assert.equal(mutatePlayer.mock.calls.length, 1);
+    assert.equal(ensurePlayerExists.mock.calls.length, 0);
+    assert.equal(sellPlayerItems.mock.calls.length, 0);
+    assert.equal(result.sold.length, 1);
+  } finally {
+    if (originalEnv === undefined) delete process.env[POSTGRES_TEST_PLAYER_IDS_ENV_VAR];
+    else process.env[POSTGRES_TEST_PLAYER_IDS_ENV_VAR] = originalEnv;
+  }
+});
+
+test("resolveSellItems H. reponse : le GlobalState retourne (donc 'Contrat restant' affiche) provient TOUJOURS de celui reellement utilise par la vente, jamais de store.global", async () => {
+  const player = buildPlayerState({ inventory: { wheat: 10 }, coins: 0 });
+  // store.global (JSON) et le global Postgres ont des contract.remaining
+  // DIFFERENTS deliberement, pour prouver qu'on ne peut jamais confondre
+  // les deux (meme principe que resolveHarvestCrops F. pour la meteo).
+  const jsonGlobal = buildGlobalState({ contract: { cropId: "wheat", required: 20, remaining: 20, bonusMultiplier: 1.6, renewedAt: NOW } });
+  const pgGlobal = buildGlobalState({ contract: { cropId: "wheat", required: 20, remaining: 3, bonusMultiplier: 1.6, renewedAt: NOW } });
+  const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    mutator(player);
+    return player;
+  });
+  const store = buildFakeStoreForHarvest(mutatePlayer as unknown as FarmStore["mutatePlayer"], jsonGlobal);
+
+  const v1 = await resolveSellItems(TEST_PLAYER_ID, "wheat", 5, store, buildSellDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveSellItems(
+    TEST_PLAYER_ID,
+    "wheat",
+    5,
+    store,
+    buildSellDeps({
+      shouldUsePostgresRuntime: () => true,
+      sellPlayerItems: async () => ({
+        result: { sold: [{ itemId: "wheat", amount: 5, earned: 20 }], earned: 20 },
+        global: pgGlobal,
+      }),
+    }),
+  );
+
+  assert.equal(v1.global, jsonGlobal);
+  assert.equal(pg.global, pgGlobal);
+  assert.notEqual(
+    v1.global.contract.remaining,
+    pg.global.contract.remaining,
+    "les deux contract.remaining sont volontairement differents dans ce test",
+  );
+});
+
+// ===========================================================================
 // H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
-// EXACTEMENT 6 fois (le garde-fou de preambule + resolveBuyUpgrade +
+// EXACTEMENT 7 fois (le garde-fou de preambule + resolveBuyUpgrade +
 // resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
-// resolveHarvestCrops) ; ensurePlayerExists EXACTEMENT 5 fois
-// (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem
-// + resolveHarvestCrops) ; buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop,
-// craftPlayerItem et harvestPlayerCrops EXACTEMENT 1 fois chacun (leur seule
-// fonction de resolution respective). getPlayer( (le repository, pas
+// resolveHarvestCrops + resolveSellItems) ; ensurePlayerExists EXACTEMENT 6
+// fois (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop +
+// resolveCraftItem + resolveHarvestCrops + resolveSellItems) ;
+// buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop, craftPlayerItem,
+// harvestPlayerCrops et sellPlayerItems EXACTEMENT 1 fois chacun (leur
+// seule fonction de resolution respective). getPlayer( (le repository, pas
 // store.getPlayer) EXACTEMENT 1 fois (resolvePlantCrop). Preuve automatisee
 // (lecture du fichier source, meme technique que les tests transversaux
 // existants de farmRepository.test.ts/farmPlayerActions.test.ts) qu'aucune
-// autre commande (/sell, /market, etc.) n'a ete branchee sur Postgres par
-// erreur, et que /buy, /daily, /plant, /craft et /harvest sont desormais
-// les CINQ SEULS chemins Postgres.
+// autre commande (/market, /contract, etc.) n'a ete branchee sur Postgres
+// par erreur, et que /buy, /daily, /plant, /craft, /harvest et /sell sont
+// desormais les SIX SEULS chemins Postgres.
 // ===========================================================================
 
-test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/getPlayer n'ont que les sites d'appel attendus, aucune autre commande", async () => {
+test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/sellPlayerItems/getPlayer n'ont que les sites d'appel attendus, aucune autre commande", async () => {
   const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
   const countCalls = (name: string) => (source.match(new RegExp(`${name}\\(`, "g")) ?? []).length;
 
   assert.equal(
     countCalls("shouldUsePostgresRuntime"),
-    6,
-    "6 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops",
+    7,
+    "7 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems",
   );
   assert.equal(countCalls("harvestPlayerCrops"), 1, "un seul site d'appel attendu (resolveHarvestCrops)");
+  assert.equal(countCalls("sellPlayerItems"), 1, "un seul site d'appel attendu (resolveSellItems)");
   assert.equal(
     countCalls("ensurePlayerExists"),
-    5,
-    "5 sites d'appel attendus : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops",
+    6,
+    "6 sites d'appel attendus : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems",
   );
   assert.equal(countCalls("buyPlayerUpgrade"), 1, "un seul site d'appel attendu (resolveBuyUpgrade)");
   assert.equal(countCalls("claimPlayerDaily"), 1, "un seul site d'appel attendu (resolveDailyClaim)");
@@ -957,7 +1200,7 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
 
 // ===========================================================================
 // I. Preambule enrichGlobalState/store.save() -- ne doit JAMAIS s'executer
-// pour /buy, /daily, /plant, /craft ou /harvest d'un joueur allowliste
+// pour /buy, /daily, /plant, /craft, /harvest ou /sell d'un joueur allowliste
 // (aucune ecriture JSON), mais DOIT continuer a s'executer exactement
 // comme avant pour toute autre commande (V1 inchange). commandSkipsJsonPreamble()
 // est la decision PURE qui gouverne ce garde-fou -- testee ici directement
@@ -966,7 +1209,7 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
 // reellement le preambule.
 // ===========================================================================
 
-test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft ou /harvest d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
+test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest ou /sell d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
   const allowlisted = { shouldUsePostgresRuntime: () => true };
   const notAllowlisted = { shouldUsePostgresRuntime: () => false };
 
@@ -975,16 +1218,18 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("plant", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("craft", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("harvest", TEST_PLAYER_ID, allowlisted), true);
+  assert.equal(commandSkipsJsonPreamble("sell", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("buy", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("daily", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("plant", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("craft", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("harvest", TEST_PLAYER_ID, notAllowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("sell", TEST_PLAYER_ID, notAllowlisted), false);
   // Meme allowliste, une commande jamais branchee sur Postgres reste V1 --
   // le preambule doit continuer a s'executer pour elle, sans exception.
   assert.equal(commandSkipsJsonPreamble("farm", TEST_PLAYER_ID, allowlisted), false);
   assert.equal(commandSkipsJsonPreamble("profile", TEST_PLAYER_ID, allowlisted), false);
-  assert.equal(commandSkipsJsonPreamble("sell", TEST_PLAYER_ID, allowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, allowlisted), false);
 });
 
 // Interaction discord.js minimale -- uniquement les champs lus par

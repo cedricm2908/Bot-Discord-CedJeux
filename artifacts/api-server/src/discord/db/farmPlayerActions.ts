@@ -8,24 +8,20 @@
 // reecrite ici : chaque action appelle exactement la meme fonction que
 // presenters.ts/routes/activity.ts appellent aujourd'hui contre FarmStore.
 //
-// EXCLU de ce lot (LOT 2), volontairement : sell. Elle mute a la fois le
-// joueur ET l'etat global (contract.remaining) -- elle a besoin de la
-// meme primitive que harvest ci-dessous (mutatePlayerAndGlobal()), pas
-// encore branchee pour sell a ce stade (LOT 6, wiring /harvest).
-//
-// LOT 6 (wiring /harvest) : harvestPlayerCrops() ci-dessous est la
-// PREMIERE action de ce fichier a utiliser mutatePlayerAndGlobal() plutot
-// que mutatePlayer() -- necessaire car harvest() (../farm.ts) mute a la
-// fois le joueur (inventaire/xp/niveau/parcelles) ET l'etat global
-// (daily_challenge.progress/contributors), verrouilles ensemble dans UNE
-// seule transaction (voir le commentaire de mutatePlayerAndGlobal() dans
-// farmRepository.ts, qui documente explicitement harvest()/sell() comme
-// compatibles SANS adaptation).
+// LOT 6 (wiring /harvest puis /sell) : harvestPlayerCrops()/sellPlayerItems()
+// ci-dessous utilisent mutatePlayerAndGlobal() plutot que mutatePlayer()
+// seul -- necessaire car harvest()/sell() (../farm.ts) mutent a la fois le
+// joueur (inventaire/xp/niveau/parcelles/coins) ET l'etat global
+// (daily_challenge pour harvest, contract.remaining pour sell),
+// verrouilles ensemble dans UNE seule transaction (voir le commentaire de
+// mutatePlayerAndGlobal() dans farmRepository.ts, qui documente
+// explicitement harvest()/sell() comme compatibles SANS adaptation).
 //
 // GLOBAL STATE : buyPlayerWeatherForecast() lit global_state en LECTURE
-// SEULE (via getGlobalState(), jamais ecrit) ; harvestPlayerCrops() le
-// verrouille et l'ecrit (via mutatePlayerAndGlobal()) -- ce sont les deux
-// SEULES actions de ce fichier qui touchent global_state.
+// SEULE (via getGlobalState(), jamais ecrit) ; harvestPlayerCrops() et
+// sellPlayerItems() le verrouillent et l'ecrivent (via
+// mutatePlayerAndGlobal()) -- ce sont les trois SEULES actions de ce
+// fichier qui touchent global_state.
 import {
   buyUpgrade,
   buyWeatherForecast,
@@ -36,11 +32,13 @@ import {
   FarmError,
   harvest,
   plant,
+  sell,
   toggleAutoReplant,
   type HarvestResult,
+  type SellResult,
 } from "../farm.ts";
 import { getGlobalState, mutatePlayer, mutatePlayerAndGlobal } from "./farmRepository.ts";
-import type { CropId, GlobalState, PlayerState, PlotSkinId, ProductId, WeatherKey } from "../types";
+import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId, WeatherKey } from "../types";
 
 // Dependances injectables -- meme convention que FarmRepositoryDeps/
 // PlayerWriteDeps/MutatePlayerDeps dans farmRepository.ts : les tests
@@ -246,6 +244,48 @@ export async function harvestPlayerCrops(
   let result: HarvestResult | undefined;
   const { global } = await deps.mutatePlayerAndGlobal(playerId, (player, global) => {
     result = harvest(player, global);
+  });
+  return { result: result!, global };
+}
+
+// Dependances injectables dediees a sellPlayerItems() -- meme forme que
+// HarvestPlayerActionsDeps (seul mutatePlayerAndGlobal est necessaire),
+// declaree separement pour garder chaque action clairement nommee plutot
+// que de reutiliser un type nomme d'apres une autre fonction.
+export interface SellPlayerItemsDeps {
+  mutatePlayerAndGlobal: typeof mutatePlayerAndGlobal;
+}
+
+const realSellPlayerItemsDeps: SellPlayerItemsDeps = { mutatePlayerAndGlobal };
+
+/**
+ * Vend des ressources au prix du marche. Reutilise sell() de ../farm.ts
+ * telle quelle -- y compris son calcul de prix (currentCropPrice()/
+ * productPrice(), tous deux inchanges), son bonus de contrat
+ * (contract.bonusMultiplier, uniquement sur la portion contractee,
+ * plafonnee a contract.remaining) et sa progression de quete
+ * ("sell_value"), deja tous integres a sell() lui-meme (aucune formule
+ * dupliquee ici). `mutatePlayerAndGlobal()` verrouille le joueur ET l'etat
+ * global (global_state + contract + daily_challenge) dans UNE SEULE
+ * transaction -- necessaire car sell() mute les deux a la fois
+ * (player.inventory/coins ET global.contract.remaining). Retourne a la
+ * fois le `SellResult` (pour la reponse Discord) ET le `GlobalState`
+ * complet relu/mute (pour que l'appelant affiche `contract.remaining`
+ * EXACTEMENT comme celui reellement mis a jour par cette vente -- jamais
+ * une lecture separee d'un autre etat global qui pourrait diverger, meme
+ * principe que harvestPlayerCrops()/weatherLineForGlobal() cote
+ * presenters.ts). Erreur metier propagee telle quelle (aucune ressource de
+ * ce type a vendre).
+ */
+export async function sellPlayerItems(
+  playerId: string,
+  itemId: InventoryId | "all",
+  requestedAmount: number | null,
+  deps: SellPlayerItemsDeps = realSellPlayerItemsDeps,
+): Promise<{ result: SellResult; global: GlobalState }> {
+  let result: SellResult | undefined;
+  const { global } = await deps.mutatePlayerAndGlobal(playerId, (player, global) => {
+    result = sell(player, global, itemId, requestedAmount);
   });
   return { result: result!, global };
 }
