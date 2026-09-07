@@ -179,10 +179,18 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // growthPercent() (temps restant, statut pret) ne dependent QUE du
 // PlayerState (plots, irrigationLevel), jamais du GlobalState.
 // resolveFarmView() lit le GlobalState via getGlobalState() (Postgres) cote
-// allowliste, jamais store.global. Ne s'applique JAMAIS a /profile, etc. --
-// ces commandes restent V1 pour absolument tout le monde, allowliste ou
-// non, et continuent donc de declencher ce preambule exactement comme
-// avant.
+// allowliste, jamais store.global. /profile est la MEME categorie que
+// /inventory et /farm (LECTURE SEULE) -- verifie a l'audit : commandProfile
+// n'affiche NI achievements, NI skins/unlockedSkins, NI quests, NI
+// totalHarvested, NI weeklySnapshotCoins (V1 reel, malgre ce que ces champs
+// du PlayerState pourraient suggerer) -- seulement level/xp/coins/
+// plots.length/irrigationLevel/fertilizerLevel/autoReplant (PLAYER-ONLY) et
+// totalInventoryValue(player, global), qui depend du GlobalState
+// (marketMultiplier) exactement comme /inventory. resolveProfile() lit ce
+// GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
+// store.global. Ne s'applique JAMAIS a /market, /contract, etc. -- ces
+// commandes restent V1 pour absolument tout le monde, allowliste ou non, et
+// continuent donc de declencher ce preambule exactement comme avant.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
   "daily",
@@ -192,6 +200,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "sell",
   "inventory",
   "farm",
+  "profile",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -896,11 +905,71 @@ async function commandContract(
   });
 }
 
+// LOT 6, bascule TEST-only pour /profile UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveInventory/resolveFarmView ci-dessus, et meme categorie qu'elles :
+// /profile est PUREMENT LECTURE SEULE (aucune fonction mutante de farm.ts
+// impliquee), donc ni mutatePlayer() ni mutatePlayerAndGlobal() ne sont
+// utilises ici -- seulement les lectures deja existantes getPlayer()/
+// getGlobalState() de farmRepository.ts. commandProfile depend du
+// GlobalState via totalInventoryValue(player, global) (marketMultiplier,
+// verifie a l'audit) : resolveProfile() lit ce GlobalState via
+// getGlobalState() (Postgres) cote allowliste, jamais store.global (JSON),
+// qui pourrait diverger de l'etat Postgres reellement affiche a un joueur
+// allowliste -- exactement la meme precaution que pour /inventory et /farm.
+export interface ProfileResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realProfileResolutionDeps: ProfileResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  getPlayer,
+  getGlobalState,
+};
+
+export interface ProfileResolutionResult {
+  player: PlayerState;
+  global: GlobalState;
+}
+
+/**
+ * Decide quel backend utiliser pour /profile et retourne le PlayerState
+ * PLUS le GlobalState a utiliser pour l'affichage (valeur d'inventaire),
+ * SANS jamais toucher a la reponse Discord. Un joueur allowliste passe
+ * EXCLUSIVEMENT par le bootstrap PUIS une lecture Postgres (getPlayer()/
+ * getGlobalState()) -- aucune ecriture, ni joueur ni globale. Un joueur non
+ * allowliste (cas par defaut) suit EXACTEMENT le chemin V1 :
+ * store.getPlayer()/store.global.
+ */
+export async function resolveProfile(
+  playerId: string,
+  store: FarmStore,
+  deps: ProfileResolutionDeps = realProfileResolutionDeps,
+): Promise<ProfileResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    const player = await deps.getPlayer(playerId);
+    if (!player) {
+      throw new Error(`resolveProfile : joueur ${playerId} introuvable apres ensurePlayerExists.`);
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveProfile : global_state introuvable.");
+    }
+    return { player, global };
+  }
+  return { player: store.getPlayer(playerId), global: store.global };
+}
+
 async function commandProfile(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const player = store.getPlayer(interaction.user.id);
+  const { player, global } = await resolveProfile(interaction.user.id, store);
   await interaction.reply({
     embeds: [
       new EmbedBuilder()
@@ -912,7 +981,7 @@ async function commandProfile(
           { name: "Parcelles", value: `${player.plots.length}/40`, inline: true },
           { name: "Irrigation", value: `${player.irrigationLevel}/15`, inline: true },
           { name: "Engrais", value: `${player.fertilizerLevel}/20`, inline: true },
-          { name: "Inventaire", value: formatCoins(totalInventoryValue(player, store.global)), inline: true },
+          { name: "Inventaire", value: formatCoins(totalInventoryValue(player, global)), inline: true },
           { name: "Replantation auto", value: player.autoReplant ? "ON" : "OFF", inline: true },
         ),
     ],
