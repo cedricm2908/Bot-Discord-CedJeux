@@ -47,7 +47,7 @@ import {
   plantPlayerCrop,
   sellPlayerItems,
 } from "./db/farmPlayerActions.ts";
-import { ensurePlayerExists, getGlobalState, getPlayer } from "./db/farmRepository.ts";
+import { ensurePlayerExists, getAllPlayers, getGlobalState, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import type {
   CropId,
@@ -203,9 +203,19 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // n'est PAS affiche (le texte "Toutes les 4 heures" est statique, meme
 // convention que le texte statique de /market). resolveContract() n'appelle
 // donc jamais le bootstrap ensurePlayerExists non plus, exactement comme
-// resolveMarket(). Ne s'applique JAMAIS a /leaderboard, etc. -- ces
-// commandes restent V1 pour absolument tout le monde, allowliste ou non, et
-// continuent donc de declencher ce preambule exactement comme avant.
+// resolveMarket(). /leaderboard est une CINQUIEME categorie -- MULTI-PLAYER
+// GLOBAL : commandLeaderboard lit TOUS les joueurs (store.getPlayers(), pas
+// seulement l'appelant) et le GlobalState (marketMultiplier, via
+// totalInventoryValue()) pour le classement par richesse. Verifie a
+// l'audit : V1 ne bootstrap jamais le joueur appelant lui-meme (aucun
+// store.getPlayer(interaction.user.id) dans commandLeaderboard) -- le
+// bootstrap ne doit donc pas non plus avoir lieu cote Postgres.
+// resolveLeaderboard() lit TOUS les joueurs via getAllPlayers() (Postgres)
+// et le GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
+// store.getPlayers()/store.global. Ne s'applique JAMAIS a /weekly, etc. --
+// ces commandes restent V1 pour absolument tout le monde, allowliste ou
+// non, et continuent donc de declencher ce preambule exactement comme
+// avant.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
   "daily",
@@ -218,6 +228,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "profile",
   "market",
   "contract",
+  "leaderboard",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -1099,17 +1110,75 @@ async function commandProfile(
   });
 }
 
+// LOT 6, bascule TEST-only pour /leaderboard UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- categorie MULTI-PLAYER GLOBAL :
+// commandLeaderboard lit TOUS les joueurs (pas seulement l'appelant) et le
+// GlobalState (marketMultiplier, via totalInventoryValue()) pour le
+// classement par richesse. Verifie a l'audit : V1 ne bootstrap jamais le
+// joueur appelant lui-meme -- resolveLeaderboard() n'accepte donc meme pas
+// ensurePlayerExists/getPlayer dans ses deps, exactement comme
+// resolveMarket/resolveContract. Un joueur allowliste lit EXCLUSIVEMENT
+// tous les joueurs via getAllPlayers() (Postgres) et le GlobalState via
+// getGlobalState() (Postgres), jamais store.getPlayers()/store.global
+// (JSON), qui pourrait diverger de l'etat Postgres reellement affiche. Si
+// le GlobalState Postgres est absent, aucun fallback JSON silencieux :
+// l'erreur remonte telle quelle (meme convention que resolveMarket()/
+// resolveContract()).
+export interface LeaderboardResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  getAllPlayers: typeof getAllPlayers;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realLeaderboardResolutionDeps: LeaderboardResolutionDeps = {
+  shouldUsePostgresRuntime,
+  getAllPlayers,
+  getGlobalState,
+};
+
+export interface LeaderboardResolutionResult {
+  players: PlayerState[];
+  global: GlobalState;
+}
+
+/**
+ * Decide quel backend utiliser pour /leaderboard et retourne TOUS les
+ * joueurs PLUS le GlobalState a utiliser pour le classement, SANS jamais
+ * toucher a la reponse Discord ni a la logique de tri (qui reste dans
+ * commandLeaderboard, inchangee). Un joueur allowliste lit EXCLUSIVEMENT la
+ * source Postgres (getAllPlayers()/getGlobalState()) -- aucune ecriture,
+ * aucun bootstrap joueur (non necessaire, V1 ne le fait pas non plus). Un
+ * joueur non allowliste (cas par defaut) suit EXACTEMENT le chemin V1 :
+ * store.getPlayers()/store.global.
+ */
+export async function resolveLeaderboard(
+  playerId: string,
+  store: FarmStore,
+  deps: LeaderboardResolutionDeps = realLeaderboardResolutionDeps,
+): Promise<LeaderboardResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    const players = await deps.getAllPlayers();
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveLeaderboard : global_state introuvable.");
+    }
+    return { players, global };
+  }
+  return { players: store.getPlayers(), global: store.global };
+}
+
 async function commandLeaderboard(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const top = [...store.getPlayers()]
-    .sort((a, b) => (b.coins + totalInventoryValue(b, store.global)) - (a.coins + totalInventoryValue(a, store.global)))
+  const { players, global } = await resolveLeaderboard(interaction.user.id, store);
+  const top = [...players]
+    .sort((a, b) => (b.coins + totalInventoryValue(b, global)) - (a.coins + totalInventoryValue(a, global)))
     .slice(0, 10);
   const lines = await Promise.all(top.map(async (player, index) => {
     const user = await interaction.client.users.fetch(player.userId).catch(() => null);
     const medal = ["🥇", "🥈", "🥉"][index] ?? `**${index + 1}.**`;
-    const wealth = player.coins + totalInventoryValue(player, store.global);
+    const wealth = player.coins + totalInventoryValue(player, global);
     return `${medal} ${user?.username ?? player.userId} — **${formatCoins(wealth)}**`;
   }));
   await interaction.reply({
