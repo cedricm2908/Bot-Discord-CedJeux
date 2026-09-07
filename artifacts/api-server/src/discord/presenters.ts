@@ -47,7 +47,7 @@ import {
   plantPlayerCrop,
   sellPlayerItems,
 } from "./db/farmPlayerActions.ts";
-import { ensurePlayerExists, getPlayer } from "./db/farmRepository.ts";
+import { ensurePlayerExists, getGlobalState, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import type {
   CropId,
@@ -166,11 +166,25 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // voir resolveHarvestCrops/resolveSellItems plus bas) -- jamais
 // store.global/JSON, qui n'est simplement jamais touche du tout dans la
 // branche Postgres. Sauter ce preambule JSON reste donc tout aussi sans
-// consequence pour /harvest et /sell. Ne s'applique JAMAIS a /farm,
+// consequence pour /harvest et /sell. /inventory est encore une TROISIEME
+// categorie -- purement LECTURE SEULE (aucune fonction farm.ts mutante
+// impliquee), mais elle LIT tout de meme le GlobalState (marketMultiplier,
+// via currentCropPrice()) pour l'affichage de la valeur des cultures ;
+// resolveInventory() lit ce GlobalState via getGlobalState() (Postgres)
+// cote allowliste, jamais store.global -- aucune ecriture, ni joueur ni
+// globale, dans les deux branches. Ne s'applique JAMAIS a /farm,
 // /profile, etc. -- ces commandes restent V1 pour absolument tout le
 // monde, allowliste ou non, et continuent donc de declencher ce preambule
 // exactement comme avant.
-const POSTGRES_ROUTED_COMMAND_NAMES = new Set(["buy", "daily", "plant", "craft", "harvest", "sell"]);
+const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
+  "buy",
+  "daily",
+  "plant",
+  "craft",
+  "harvest",
+  "sell",
+  "inventory",
+]);
 
 export function commandSkipsJsonPreamble(
   commandName: string,
@@ -463,17 +477,75 @@ async function commandHarvest(
   });
 }
 
+// LOT 6, bascule TEST-only pour /inventory UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que les
+// resolveXxx ci-dessus, mais /inventory est PUREMENT LECTURE SEULE : aucune
+// fonction mutante de farm.ts n'est impliquee, donc ni mutatePlayer() ni
+// mutatePlayerAndGlobal() ne sont utilises ici -- seulement les lectures
+// deja existantes getPlayer()/getGlobalState() de farmRepository.ts. /inventory
+// depend neanmoins du GlobalState (marketMultiplier, via currentCropPrice()
+// pour le prix des cultures) : resolveInventory() lit ce GlobalState via
+// getGlobalState() (Postgres) cote allowliste, jamais store.global (JSON),
+// qui pourrait diverger de l'etat Postgres reellement affiche a un joueur
+// allowliste -- exactement la meme precaution que pour /harvest et /sell.
+export interface InventoryResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realInventoryResolutionDeps: InventoryResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  getPlayer,
+  getGlobalState,
+};
+
+export interface InventoryResolutionResult {
+  player: PlayerState;
+  global: GlobalState;
+}
+
+/**
+ * Decide quel backend utiliser pour /inventory et retourne le PlayerState
+ * PLUS le GlobalState a utiliser pour l'affichage, SANS jamais toucher a la
+ * reponse Discord. Un joueur allowliste passe EXCLUSIVEMENT par le
+ * bootstrap PUIS une lecture Postgres (getPlayer()/getGlobalState()) --
+ * aucune ecriture, ni joueur ni globale. Un joueur non allowliste (cas par
+ * defaut) suit EXACTEMENT le chemin V1 : store.getPlayer()/store.global.
+ */
+export async function resolveInventory(
+  playerId: string,
+  store: FarmStore,
+  deps: InventoryResolutionDeps = realInventoryResolutionDeps,
+): Promise<InventoryResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    const player = await deps.getPlayer(playerId);
+    if (!player) {
+      throw new Error(`resolveInventory : joueur ${playerId} introuvable apres ensurePlayerExists.`);
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveInventory : global_state introuvable.");
+    }
+    return { player, global };
+  }
+  return { player: store.getPlayer(playerId), global: store.global };
+}
+
 async function commandInventory(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const player = store.getPlayer(interaction.user.id);
+  const { player, global } = await resolveInventory(interaction.user.id, store);
   const lines = [...CROPS, ...RECIPES]
     .map((item) => {
       const amount = player.inventory[item.id] ?? 0;
       const value = "sellPrice" in item
         ? amount * item.sellPrice
-        : amount * currentCropPrice(store.global, item.id);
+        : amount * currentCropPrice(global, item.id);
       return `${item.emoji} **${item.name}** · ×${amount} · valeur ${formatCoins(value)}`;
     })
     .filter((line, index) => (player.inventory[[...CROPS, ...RECIPES][index].id] ?? 0) > 0 || line.includes("×0"));
@@ -485,7 +557,7 @@ async function commandInventory(
         .setDescription(lines.join("\n"))
         .addFields({
           name: "Valeur totale estimée",
-          value: formatCoins(totalInventoryValue(player, store.global)),
+          value: formatCoins(totalInventoryValue(player, global)),
         }),
     ],
   });
