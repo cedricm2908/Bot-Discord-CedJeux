@@ -28,6 +28,7 @@ import {
   resolveFarmView,
   resolveHarvestCrops,
   resolveInventory,
+  resolveMarket,
   resolvePlantCrop,
   resolveProfile,
   resolveSellItems,
@@ -37,6 +38,7 @@ import {
   type FarmViewResolutionDeps,
   type HarvestResolutionDeps,
   type InventoryResolutionDeps,
+  type MarketResolutionDeps,
   type PlantResolutionDeps,
   type ProfileResolutionDeps,
   type SellResolutionDeps,
@@ -1773,26 +1775,144 @@ test("resolveProfile H. commandProfile n'affiche ni achievements, ni skins/unloc
 });
 
 // ===========================================================================
+// resolveMarket -- PREMIERE categorie GLOBAL-ONLY : commandMarket (V1 reel,
+// verifie a l'audit) ne lit AUCUNE donnee Player (aucun store.getPlayer()
+// dans son corps), uniquement store.global (marketMultiplier,
+// previousMarketMultiplier, currentCropPrice()). resolveMarket() n'accepte
+// donc meme pas ensurePlayerExists/getPlayer dans ses deps (contrairement a
+// resolveInventory/resolveFarmView/resolveProfile) -- aucun bootstrap
+// joueur ne doit jamais avoir lieu pour /market, allowliste ou non.
+// ===========================================================================
+
+function buildFakeStoreForMarket(global: GlobalState): FarmStore {
+  return { global } as unknown as FarmStore;
+}
+
+function buildMarketDeps(overrides: Partial<MarketResolutionDeps> = {}): MarketResolutionDeps {
+  return {
+    shouldUsePostgresRuntime: () => false,
+    getGlobalState: async () => buildGlobalState(),
+    ...overrides,
+  };
+}
+
+test("resolveMarket A. joueur non allowliste : utilise store.global uniquement, jamais deps.getGlobalState, meme chemin V1", async () => {
+  const global = buildGlobalState({ marketMultiplier: 1.1 });
+  const store = buildFakeStoreForMarket(global);
+  const getGlobalState = mock.fn(async () => {
+    throw new Error("getGlobalState ne doit jamais etre appele sur le chemin V1");
+  });
+  const deps = buildMarketDeps({ shouldUsePostgresRuntime: () => false, getGlobalState });
+
+  const result = await resolveMarket(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(getGlobalState.mock.calls.length, 0);
+  assert.equal(result, global, "doit retourner exactement store.global");
+});
+
+test("resolveMarket B. joueur allowliste : utilise deps.getGlobalState (Postgres) uniquement, jamais store.global, aucune mutation JSON", async () => {
+  const jsonGlobal = buildGlobalState({ marketMultiplier: 1 });
+  const store = buildFakeStoreForMarket(jsonGlobal);
+  const pgGlobal = buildGlobalState({ marketMultiplier: 1.7 });
+  const getGlobalState = mock.fn(async () => pgGlobal);
+  const deps = buildMarketDeps({ shouldUsePostgresRuntime: () => true, getGlobalState });
+
+  const result = await resolveMarket(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(getGlobalState.mock.calls.length, 1);
+  assert.equal(result, pgGlobal, "doit retourner exactement le GlobalState Postgres, jamais store.global");
+});
+
+test("resolveMarket C. marketMultiplier : le prix affiche (currentCropPrice de farm.ts) est identique V1/Postgres pour la meme valeur, aucune formule reimplementee", async () => {
+  const pgGlobal = buildGlobalState({ marketMultiplier: 1.5 });
+  const deps = buildMarketDeps({ shouldUsePostgresRuntime: () => true, getGlobalState: async () => pgGlobal });
+
+  const result = await resolveMarket(TEST_PLAYER_ID, buildFakeStoreForMarket(buildGlobalState()), deps);
+
+  assert.equal(currentCropPrice(result, "wheat"), currentCropPrice(pgGlobal, "wheat"));
+  assert.equal(result.marketMultiplier, 1.5);
+});
+
+test("resolveMarket D. plusieurs cultures : les prix (currentCropPrice de farm.ts) different correctement selon le basePrice de chaque culture, meme GlobalState", async () => {
+  const pgGlobal = buildGlobalState({ marketMultiplier: 2 });
+  const deps = buildMarketDeps({ shouldUsePostgresRuntime: () => true, getGlobalState: async () => pgGlobal });
+
+  const result = await resolveMarket(TEST_PLAYER_ID, buildFakeStoreForMarket(buildGlobalState()), deps);
+
+  const wheatPrice = currentCropPrice(result, "wheat");
+  const carrotPrice = currentCropPrice(result, "carrot");
+  const chorusPrice = currentCropPrice(result, "chorus_fruit");
+  assert.equal(wheatPrice, currentCropPrice(pgGlobal, "wheat"));
+  assert.equal(carrotPrice, currentCropPrice(pgGlobal, "carrot"));
+  assert.equal(chorusPrice, currentCropPrice(pgGlobal, "chorus_fruit"));
+  assert.ok(wheatPrice < carrotPrice && carrotPrice < chorusPrice, "des cultures de basePrice croissant doivent produire des prix croissants");
+});
+
+test("resolveMarket E. GlobalState Postgres different du JSON : le resultat correspond au Postgres, preuve qu'aucun melange des deux sources n'est possible", async () => {
+  const jsonGlobal = buildGlobalState({ marketMultiplier: 1, previousMarketMultiplier: 1 });
+  const pgGlobal = buildGlobalState({ marketMultiplier: 3, previousMarketMultiplier: 1 });
+  const store = buildFakeStoreForMarket(jsonGlobal);
+
+  const v1 = await resolveMarket(TEST_PLAYER_ID, store, buildMarketDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveMarket(
+    TEST_PLAYER_ID,
+    store,
+    buildMarketDeps({ shouldUsePostgresRuntime: () => true, getGlobalState: async () => pgGlobal }),
+  );
+
+  assert.equal(v1, jsonGlobal);
+  assert.equal(pg, pgGlobal);
+  assert.notEqual(
+    currentCropPrice(v1, "wheat"),
+    currentCropPrice(pg, "wheat"),
+    "les deux marketMultiplier sont volontairement differents (1 vs 3) : les prix DOIVENT differer, preuve que pg est bien utilise, jamais jsonGlobal cote Postgres",
+  );
+});
+
+test("resolveMarket F. GlobalState Postgres absent : erreur explicite, aucun fallback JSON silencieux", async () => {
+  const store = buildFakeStoreForMarket(buildGlobalState());
+  const deps = buildMarketDeps({ shouldUsePostgresRuntime: () => true, getGlobalState: async () => null });
+
+  await assert.rejects(() => resolveMarket(TEST_PLAYER_ID, store, deps), /global_state introuvable/);
+});
+
+test("resolveMarket G. /market est GLOBAL-ONLY : ensurePlayerExists/getPlayer n'existent meme pas dans MarketResolutionDeps, aucun bootstrap joueur possible", async () => {
+  // Preuve structurelle : MarketResolutionDeps ne declare que
+  // shouldUsePostgresRuntime/getGlobalState -- ce test verifie que l'objet
+  // reellement passe a resolveMarket() (buildMarketDeps(), sans override
+  // ensurePlayerExists/getPlayer) ne contient aucune de ces deux cles.
+  const deps = buildMarketDeps({ shouldUsePostgresRuntime: () => true, getGlobalState: async () => buildGlobalState() });
+
+  assert.ok(!("ensurePlayerExists" in deps), "MarketResolutionDeps ne doit jamais accepter ensurePlayerExists");
+  assert.ok(!("getPlayer" in deps), "MarketResolutionDeps ne doit jamais accepter getPlayer");
+
+  await resolveMarket(TEST_PLAYER_ID, buildFakeStoreForMarket(buildGlobalState()), deps);
+});
+
+// ===========================================================================
 // H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
-// EXACTEMENT 10 fois (le garde-fou de preambule + resolveBuyUpgrade +
+// EXACTEMENT 11 fois (le garde-fou de preambule + resolveBuyUpgrade +
 // resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
 // resolveHarvestCrops + resolveSellItems + resolveInventory +
-// resolveFarmView + resolveProfile) ; ensurePlayerExists EXACTEMENT 9 fois
-// (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop +
-// resolveCraftItem + resolveHarvestCrops + resolveSellItems +
-// resolveInventory + resolveFarmView + resolveProfile) ; buyPlayerUpgrade,
-// claimPlayerDaily, plantPlayerCrop, craftPlayerItem, harvestPlayerCrops et
-// sellPlayerItems EXACTEMENT 1 fois chacun (leur seule fonction de
-// resolution respective). deps.getPlayer( (le repository, pas
-// store.getPlayer) EXACTEMENT 4 fois (resolvePlantCrop + resolveInventory +
-// resolveFarmView + resolveProfile) ; deps.getGlobalState( EXACTEMENT 3
-// fois (resolveInventory + resolveFarmView + resolveProfile). Preuve
-// automatisee (lecture du fichier source, meme technique que les tests
-// transversaux existants de farmRepository.test.ts/farmPlayerActions.test.ts)
-// qu'aucune autre commande (/market, /contract, etc.) n'a ete branchee sur
-// Postgres par erreur, et que /buy, /daily, /plant, /craft, /harvest,
-// /sell, /inventory, /farm et /profile sont desormais les NEUF SEULS
-// chemins Postgres.
+// resolveFarmView + resolveProfile + resolveMarket) ; ensurePlayerExists
+// EXACTEMENT 9 fois -- INCHANGE depuis /profile, ce qui PROUVE que
+// resolveMarket() n'appelle jamais ensurePlayerExists (resolveBuyUpgrade +
+// resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
+// resolveHarvestCrops + resolveSellItems + resolveInventory +
+// resolveFarmView + resolveProfile) ; buyPlayerUpgrade, claimPlayerDaily,
+// plantPlayerCrop, craftPlayerItem, harvestPlayerCrops et sellPlayerItems
+// EXACTEMENT 1 fois chacun (leur seule fonction de resolution respective).
+// deps.getPlayer( (le repository, pas store.getPlayer) EXACTEMENT 4 fois --
+// INCHANGE depuis /profile, ce qui PROUVE que resolveMarket() n'appelle
+// jamais deps.getPlayer non plus (resolvePlantCrop + resolveInventory +
+// resolveFarmView + resolveProfile) ; deps.getGlobalState( EXACTEMENT 4
+// fois (resolveInventory + resolveFarmView + resolveProfile +
+// resolveMarket). Preuve automatisee (lecture du fichier source, meme
+// technique que les tests transversaux existants de
+// farmRepository.test.ts/farmPlayerActions.test.ts) qu'aucune autre
+// commande (/contract, etc.) n'a ete branchee sur Postgres par erreur, et
+// que /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm,
+// /profile et /market sont desormais les DIX SEULS chemins Postgres.
 // ===========================================================================
 
 test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/sellPlayerItems/getPlayer/getGlobalState n'ont que les sites d'appel attendus, aucune autre commande", async () => {
@@ -1801,15 +1921,15 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
 
   assert.equal(
     countCalls("shouldUsePostgresRuntime"),
-    10,
-    "10 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile",
+    11,
+    "11 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile + resolveMarket",
   );
   assert.equal(countCalls("harvestPlayerCrops"), 1, "un seul site d'appel attendu (resolveHarvestCrops)");
   assert.equal(countCalls("sellPlayerItems"), 1, "un seul site d'appel attendu (resolveSellItems)");
   assert.equal(
     countCalls("ensurePlayerExists"),
     9,
-    "9 sites d'appel attendus : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile",
+    "9 sites d'appel attendus, INCHANGE depuis /profile -- resolveMarket() n'appelle jamais ensurePlayerExists (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile)",
   );
   assert.equal(countCalls("buyPlayerUpgrade"), 1, "un seul site d'appel attendu (resolveBuyUpgrade)");
   assert.equal(countCalls("claimPlayerDaily"), 1, "un seul site d'appel attendu (resolveDailyClaim)");
@@ -1818,22 +1938,26 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
   // "deps.getPlayer(" exclut deliberement "store.getPlayer(" (compte a part,
   // deja verifie test par test ci-dessus) -- seul le repository nous
   // interesse ici, pas la methode FarmStore preexistante.
-  assert.equal(countCalls("deps.getPlayer"), 4, "quatre sites d'appel du repository getPlayer attendus (resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile)");
-  assert.equal(countCalls("deps.getGlobalState"), 3, "trois sites d'appel du repository getGlobalState attendus (resolveInventory + resolveFarmView + resolveProfile)");
+  assert.equal(
+    countCalls("deps.getPlayer"),
+    4,
+    "quatre sites d'appel du repository getPlayer attendus, INCHANGE depuis /profile -- resolveMarket() n'appelle jamais deps.getPlayer (resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile)",
+  );
+  assert.equal(countCalls("deps.getGlobalState"), 4, "quatre sites d'appel du repository getGlobalState attendus (resolveInventory + resolveFarmView + resolveProfile + resolveMarket)");
 });
 
 // ===========================================================================
 // I. Preambule enrichGlobalState/store.save() -- ne doit JAMAIS s'executer
-// pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm ou
-// /profile d'un joueur allowliste (aucune ecriture JSON), mais DOIT
-// continuer a s'executer exactement comme avant pour toute autre commande
-// (V1 inchange). commandSkipsJsonPreamble() est la decision PURE qui
-// gouverne ce garde-fou -- testee ici directement (aucune connexion DB
+// pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm,
+// /profile ou /market d'un joueur allowliste (aucune ecriture JSON), mais
+// DOIT continuer a s'executer exactement comme avant pour toute autre
+// commande (V1 inchange). commandSkipsJsonPreamble() est la decision PURE
+// qui gouverne ce garde-fou -- testee ici directement (aucune connexion DB
 // necessaire). handleSlashCommand("list") verifie separement, en bout en
 // bout, qu'une commande V1 declenche toujours reellement le preambule.
 // ===========================================================================
 
-test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm ou /profile d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
+test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm, /profile ou /market d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
   const allowlisted = { shouldUsePostgresRuntime: () => true };
   const notAllowlisted = { shouldUsePostgresRuntime: () => false };
 
@@ -1846,6 +1970,7 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("inventory", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("farm", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("profile", TEST_PLAYER_ID, allowlisted), true);
+  assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("buy", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("daily", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("plant", TEST_PLAYER_ID, notAllowlisted), false);
@@ -1855,10 +1980,11 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("inventory", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("farm", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("profile", TEST_PLAYER_ID, notAllowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, notAllowlisted), false);
   // Meme allowliste, une commande jamais branchee sur Postgres reste V1 --
   // le preambule doit continuer a s'executer pour elle, sans exception.
-  assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, allowlisted), false);
   assert.equal(commandSkipsJsonPreamble("contract", TEST_PLAYER_ID, allowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("leaderboard", TEST_PLAYER_ID, allowlisted), false);
 });
 
 // Interaction discord.js minimale -- uniquement les champs lus par

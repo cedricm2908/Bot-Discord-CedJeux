@@ -188,8 +188,16 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // totalInventoryValue(player, global), qui depend du GlobalState
 // (marketMultiplier) exactement comme /inventory. resolveProfile() lit ce
 // GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
-// store.global. Ne s'applique JAMAIS a /market, /contract, etc. -- ces
-// commandes restent V1 pour absolument tout le monde, allowliste ou non, et
+// store.global. /market est une QUATRIEME categorie -- GLOBAL-ONLY :
+// commandMarket ne lit AUCUNE donnee Player (verifie a l'audit, aucun
+// store.getPlayer() dans son corps), uniquement store.global.
+// marketMultiplier/previousMarketMultiplier et currentCropPrice(). Consequence
+// directe : resolveMarket() n'appelle jamais le bootstrap ensurePlayerExists
+// pour un joueur allowliste -- creer un joueur Postgres juste pour afficher le
+// marche serait un effet de bord non demande par V1. resolveMarket() lit le
+// GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
+// store.global. Ne s'applique JAMAIS a /contract, etc. -- ces commandes
+// restent V1 pour absolument tout le monde, allowliste ou non, et
 // continuent donc de declencher ce preambule exactement comme avant.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
@@ -201,6 +209,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "inventory",
   "farm",
   "profile",
+  "market",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -723,26 +732,74 @@ async function commandSell(
   });
 }
 
+// LOT 6, bascule TEST-only pour /market UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que les
+// resolveXxx ci-dessus, mais /market est GLOBAL-ONLY : contrairement a
+// /inventory, /farm et /profile, commandMarket ne lit AUCUNE donnee Player
+// (verifie a l'audit -- aucun store.getPlayer() dans son corps), seulement
+// store.global. resolveMarket() n'appelle donc jamais le bootstrap
+// ensurePlayerExists -- creer un joueur Postgres juste pour afficher le marche serait un
+// effet de bord non demande par V1. Un joueur allowliste lit
+// EXCLUSIVEMENT le GlobalState via getGlobalState() (Postgres), jamais
+// store.global (JSON), qui pourrait diverger de l'etat Postgres reellement
+// affiche. Si le GlobalState Postgres est absent, aucune tentative de
+// fallback JSON silencieux : l'erreur remonte telle quelle (meme
+// convention que farmRepository.ts, qui traite un global_state manquant
+// comme un etat incoherent de la base).
+export interface MarketResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realMarketResolutionDeps: MarketResolutionDeps = {
+  shouldUsePostgresRuntime,
+  getGlobalState,
+};
+
+/**
+ * Decide quel backend utiliser pour /market et retourne le GlobalState a
+ * utiliser pour l'affichage, SANS jamais toucher a la reponse Discord. Un
+ * joueur allowliste lit EXCLUSIVEMENT le GlobalState Postgres -- aucune
+ * ecriture, aucun bootstrap joueur (non necessaire, /market ne lit aucune
+ * donnee Player). Un joueur non allowliste (cas par defaut) suit
+ * EXACTEMENT le chemin V1 : store.global.
+ */
+export async function resolveMarket(
+  playerId: string,
+  store: FarmStore,
+  deps: MarketResolutionDeps = realMarketResolutionDeps,
+): Promise<GlobalState> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveMarket : global_state introuvable.");
+    }
+    return global;
+  }
+  return store.global;
+}
+
 async function commandMarket(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const direction = store.global.marketMultiplier > store.global.previousMarketMultiplier
+  const global = await resolveMarket(interaction.user.id, store);
+  const direction = global.marketMultiplier > global.previousMarketMultiplier
     ? "📈"
-    : store.global.marketMultiplier < store.global.previousMarketMultiplier ? "📉" : "➖";
+    : global.marketMultiplier < global.previousMarketMultiplier ? "📉" : "➖";
   await interaction.reply({
     embeds: [
       new EmbedBuilder()
         .setColor(0xd29b32)
         .setTitle("Marché Farm2Win")
         .setDescription(
-          `Multiplicateur global : **×${store.global.marketMultiplier.toFixed(2)}** ${direction}\n` +
+          `Multiplicateur global : **×${global.marketMultiplier.toFixed(2)}** ${direction}\n` +
             `Prochaine mise à jour automatique dans moins de 30 minutes.`,
         )
         .addFields(
           ...CROPS.map((crop) => ({
             name: `${crop.emoji} ${crop.name}`,
-            value: `${currentCropPrice(store.global, crop.id)} pièces`,
+            value: `${currentCropPrice(global, crop.id)} pièces`,
             inline: true,
           })),
         ),
