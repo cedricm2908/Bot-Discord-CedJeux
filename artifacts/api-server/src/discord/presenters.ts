@@ -172,10 +172,17 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // via currentCropPrice()) pour l'affichage de la valeur des cultures ;
 // resolveInventory() lit ce GlobalState via getGlobalState() (Postgres)
 // cote allowliste, jamais store.global -- aucune ecriture, ni joueur ni
-// globale, dans les deux branches. Ne s'applique JAMAIS a /farm,
-// /profile, etc. -- ces commandes restent V1 pour absolument tout le
-// monde, allowliste ou non, et continuent donc de declencher ce preambule
-// exactement comme avant.
+// globale, dans les deux branches. /farm est la MEME categorie que
+// /inventory (LECTURE SEULE, mais depend du GlobalState uniquement pour la
+// ligne meteo affichee, WEATHER_INFO[global.weather] via
+// weatherLineForGlobal()) -- verifie a l'audit : growMinutes()/isReady()/
+// growthPercent() (temps restant, statut pret) ne dependent QUE du
+// PlayerState (plots, irrigationLevel), jamais du GlobalState.
+// resolveFarmView() lit le GlobalState via getGlobalState() (Postgres) cote
+// allowliste, jamais store.global. Ne s'applique JAMAIS a /profile, etc. --
+// ces commandes restent V1 pour absolument tout le monde, allowliste ou
+// non, et continuent donc de declencher ce preambule exactement comme
+// avant.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
   "daily",
@@ -184,6 +191,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "harvest",
   "sell",
   "inventory",
+  "farm",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -359,11 +367,72 @@ async function commandPlant(
   });
 }
 
+// LOT 6, bascule TEST-only pour /farm UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme extraction PURE-DEPS que
+// resolveInventory ci-dessus, et meme categorie qu'elle : /farm est
+// PUREMENT LECTURE SEULE (aucune fonction mutante de farm.ts impliquee),
+// donc ni mutatePlayer() ni mutatePlayerAndGlobal() ne sont utilises ici --
+// seulement les lectures deja existantes getPlayer()/getGlobalState() de
+// farmRepository.ts. Le temps restant/statut pret (growMinutes()/isReady()/
+// growthPercent(), verifie a l'audit) ne depend QUE du PlayerState
+// (plots, irrigationLevel) -- jamais du GlobalState. La ligne meteo est la
+// SEULE donnee affichee qui depend du GlobalState : resolveFarmView() lit
+// ce GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
+// store.global (JSON), qui pourrait diverger de l'etat Postgres reellement
+// affiche a un joueur allowliste -- exactement la meme precaution que pour
+// /harvest, /sell et /inventory.
+export interface FarmViewResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realFarmViewResolutionDeps: FarmViewResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  getPlayer,
+  getGlobalState,
+};
+
+export interface FarmViewResolutionResult {
+  player: PlayerState;
+  global: GlobalState;
+}
+
+/**
+ * Decide quel backend utiliser pour /farm et retourne le PlayerState PLUS
+ * le GlobalState a utiliser pour l'affichage (meteo), SANS jamais toucher a
+ * la reponse Discord. Un joueur allowliste passe EXCLUSIVEMENT par le
+ * bootstrap PUIS une lecture Postgres (getPlayer()/getGlobalState()) --
+ * aucune ecriture, ni joueur ni globale. Un joueur non allowliste (cas par
+ * defaut) suit EXACTEMENT le chemin V1 : store.getPlayer()/store.global.
+ */
+export async function resolveFarmView(
+  playerId: string,
+  store: FarmStore,
+  deps: FarmViewResolutionDeps = realFarmViewResolutionDeps,
+): Promise<FarmViewResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    const player = await deps.getPlayer(playerId);
+    if (!player) {
+      throw new Error(`resolveFarmView : joueur ${playerId} introuvable apres ensurePlayerExists.`);
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveFarmView : global_state introuvable.");
+    }
+    return { player, global };
+  }
+  return { player: store.getPlayer(playerId), global: store.global };
+}
+
 async function commandFarm(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const player = store.getPlayer(interaction.user.id);
+  const { player, global } = await resolveFarmView(interaction.user.id, store);
   const now = Date.now();
   const plots = player.plots.map((plot, index) => {
     if (!plot.cropId) return `**${index + 1}** · 🟫 Parcelle libre`;
@@ -381,7 +450,7 @@ async function commandFarm(
         .setTitle(`🌾 Ferme de ${playerName(interaction)}`)
         .setDescription(plots.join("\n") || "Aucune parcelle.")
         .addFields(
-          { name: "Météo actuelle", value: weatherLine(store), inline: true },
+          { name: "Météo actuelle", value: weatherLineForGlobal(global), inline: true },
           { name: "Prêtes", value: `${readyCount}/${player.plots.length}`, inline: true },
           { name: "Replantation auto", value: player.autoReplant ? "Activée" : "Désactivée", inline: true },
         )

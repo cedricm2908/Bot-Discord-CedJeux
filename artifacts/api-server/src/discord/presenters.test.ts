@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { mock, test } from "node:test";
-import { FarmError, currentCropPrice, growMinutes, productPrice, totalInventoryValue } from "./farm.ts";
+import { FarmError, currentCropPrice, growMinutes, growthPercent, isReady, productPrice, totalInventoryValue } from "./farm.ts";
 import type { ChatInputCommandInteraction } from "discord.js";
 import {
   commandSkipsJsonPreamble,
@@ -25,6 +25,7 @@ import {
   resolveBuyUpgrade,
   resolveCraftItem,
   resolveDailyClaim,
+  resolveFarmView,
   resolveHarvestCrops,
   resolveInventory,
   resolvePlantCrop,
@@ -32,6 +33,7 @@ import {
   type BuyResolutionDeps,
   type CraftResolutionDeps,
   type DailyResolutionDeps,
+  type FarmViewResolutionDeps,
   type HarvestResolutionDeps,
   type InventoryResolutionDeps,
   type PlantResolutionDeps,
@@ -1355,24 +1357,223 @@ test("resolveInventory G. valeur totale (totalInventoryValue de farm.ts) : calcu
 });
 
 // ===========================================================================
+// resolveFarmView -- meme categorie que resolveInventory (LECTURE SEULE,
+// aucun mock de mutatePlayer/mutatePlayerAndGlobal). Contrairement a
+// /inventory, le temps restant/statut pret (growMinutes()/isReady()/
+// growthPercent() de farm.ts) ne depend QUE du PlayerState (plots,
+// irrigationLevel) -- jamais du GlobalState (verifie a l'audit) ; seule la
+// ligne meteo affichee depend du GlobalState. Les tests D-H verifient que
+// les DONNEES retournees par resolveFarmView (pas la construction de
+// l'embed, qui reste dans commandFarm, inchangee) alimentent les memes
+// formules que V1, pour des parcelles vides, une culture en croissance,
+// une culture prete, un niveau d'irrigation et la meteo.
+// ===========================================================================
+
+function buildFarmViewDeps(overrides: Partial<FarmViewResolutionDeps> = {}): FarmViewResolutionDeps {
+  return {
+    shouldUsePostgresRuntime: () => false,
+    ensurePlayerExists: async (playerId: string) => ({ player: buildPlayerState({ userId: playerId }), created: false }),
+    getPlayer: async (playerId: string) => buildPlayerState({ userId: playerId }),
+    getGlobalState: async () => buildGlobalState(),
+    ...overrides,
+  };
+}
+
+test("resolveFarmView A. joueur non allowliste : utilise store.getPlayer()/store.global, jamais ensurePlayerExists/deps.getPlayer/deps.getGlobalState, meme chemin V1", async () => {
+  const player = buildPlayerState({ plots: [{ cropId: "wheat", plantedAt: NOW, notifiedReady: false }] });
+  const global = buildGlobalState();
+  const getPlayer = mock.fn((_playerId: string) => player);
+  const store = buildFakeStoreForInventory(getPlayer as unknown as FarmStore["getPlayer"], global);
+  const ensurePlayerExists = mock.fn(async () => {
+    throw new Error("ensurePlayerExists ne doit jamais etre appele sur le chemin V1");
+  });
+  const pgGetPlayer = mock.fn(async () => {
+    throw new Error("le repository getPlayer ne doit jamais etre appele sur le chemin V1");
+  });
+  const getGlobalState = mock.fn(async () => {
+    throw new Error("getGlobalState ne doit jamais etre appele sur le chemin V1");
+  });
+  const deps = buildFarmViewDeps({
+    shouldUsePostgresRuntime: () => false,
+    ensurePlayerExists,
+    getPlayer: pgGetPlayer,
+    getGlobalState,
+  });
+
+  const result = await resolveFarmView(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(getPlayer.mock.calls.length, 1);
+  assert.equal(ensurePlayerExists.mock.calls.length, 0);
+  assert.equal(pgGetPlayer.mock.calls.length, 0);
+  assert.equal(getGlobalState.mock.calls.length, 0);
+  assert.equal(result.player, player, "doit retourner exactement le PlayerState de store.getPlayer()");
+  assert.equal(result.global, global, "doit retourner exactement store.global");
+});
+
+test("resolveFarmView B. joueur allowliste existant : ensurePlayerExists + deps.getPlayer + deps.getGlobalState avec le bon playerId, jamais store.getPlayer", async () => {
+  const store = buildFakeStoreForInventory(
+    mock.fn(() => {
+      throw new Error("store.getPlayer ne doit jamais etre appele sur le chemin Postgres");
+    }) as unknown as FarmStore["getPlayer"],
+    buildGlobalState(),
+  );
+  const pgPlayer = buildPlayerState({ userId: TEST_PLAYER_ID, plots: [{ cropId: "wheat", plantedAt: NOW, notifiedReady: false }] });
+  const pgGlobal = buildGlobalState({ weather: "rain" });
+  const ensurePlayerExists = mock.fn(async (playerId: string) => ({
+    player: buildPlayerState({ userId: playerId }),
+    created: false,
+  }));
+  const getPlayer = mock.fn(async (_playerId: string) => pgPlayer);
+  const getGlobalState = mock.fn(async () => pgGlobal);
+  const deps = buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, getPlayer, getGlobalState });
+
+  const result = await resolveFarmView(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(ensurePlayerExists.mock.calls.length, 1);
+  assert.equal(ensurePlayerExists.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(getPlayer.mock.calls.length, 1);
+  assert.equal(getPlayer.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(getGlobalState.mock.calls.length, 1);
+  assert.equal(result.player, pgPlayer, "doit retourner exactement le PlayerState du repository Postgres");
+  assert.equal(result.global, pgGlobal, "doit retourner exactement le GlobalState du repository Postgres, jamais store.global");
+});
+
+test("resolveFarmView C. joueur allowliste absent : bootstrap (created=true) PUIS lecture Postgres, aucun chemin JSON", async () => {
+  const store = buildFakeStoreForInventory(
+    mock.fn(() => {
+      throw new Error("aucun chemin JSON attendu pour un joueur allowliste");
+    }) as unknown as FarmStore["getPlayer"],
+    buildGlobalState(),
+  );
+  const callOrder: string[] = [];
+  const ensurePlayerExists = mock.fn(async (playerId: string) => {
+    callOrder.push("ensure");
+    return { player: buildPlayerState({ userId: playerId }), created: true };
+  });
+  const getPlayer = mock.fn(async () => {
+    callOrder.push("getPlayer");
+    return buildPlayerState({ userId: TEST_PLAYER_ID });
+  });
+  const getGlobalState = mock.fn(async () => {
+    callOrder.push("getGlobalState");
+    return buildGlobalState();
+  });
+  const deps = buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, getPlayer, getGlobalState });
+
+  await resolveFarmView(TEST_PLAYER_ID, store, deps);
+
+  assert.deepEqual(callOrder, ["ensure", "getPlayer", "getGlobalState"]);
+});
+
+test("resolveFarmView D. parcelles vides : le PlayerState retourne produit le meme rendu (aucune culture, 0%, jamais pret), V1 et Postgres", async () => {
+  const emptyPlots = [{ cropId: null, plantedAt: null, notifiedReady: false }];
+  const jsonPlayer = buildPlayerState({ plots: emptyPlots });
+  const pgPlayer = buildPlayerState({ plots: emptyPlots });
+  const global = buildGlobalState();
+
+  const v1 = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => jsonPlayer) as unknown as FarmStore["getPlayer"], global),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => false }),
+  );
+  const pg = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => jsonPlayer) as unknown as FarmStore["getPlayer"], global),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, getPlayer: async () => pgPlayer, getGlobalState: async () => global }),
+  );
+
+  assert.equal(isReady(v1.player, 0, NOW), false);
+  assert.equal(isReady(pg.player, 0, NOW), false);
+  assert.equal(growthPercent(v1.player, 0, NOW), 0);
+  assert.equal(growthPercent(pg.player, 0, NOW), 0);
+});
+
+test("resolveFarmView E. culture en croissance : growthPercent/isReady (farm.ts) identiques V1/Postgres pour la meme plantation, aucune formule reimplementee", async () => {
+  const growingPlots = [{ cropId: "wheat" as const, plantedAt: NOW - 2 * 60 * 1000, notifiedReady: false }];
+  const pgPlayer = buildPlayerState({ plots: growingPlots });
+
+  const pg = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => buildPlayerState()) as unknown as FarmStore["getPlayer"], buildGlobalState()),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, getPlayer: async () => pgPlayer }),
+  );
+
+  // ble : growMinutes = 5min, 2min ecoulees -> ni pret, ni 0%, ni 100%.
+  assert.equal(isReady(pg.player, 0, NOW), false);
+  assert.equal(growthPercent(pg.player, 0, NOW), growthPercent(buildPlayerState({ plots: growingPlots }), 0, NOW));
+  assert.ok(growthPercent(pg.player, 0, NOW) > 0 && growthPercent(pg.player, 0, NOW) < 100);
+});
+
+test("resolveFarmView F. culture prete : isReady (farm.ts) identique V1/Postgres pour la meme plantation, aucune formule reimplementee", async () => {
+  const readyPlots = [{ cropId: "wheat" as const, plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false }];
+  const pgPlayer = buildPlayerState({ plots: readyPlots });
+
+  const pg = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => buildPlayerState()) as unknown as FarmStore["getPlayer"], buildGlobalState()),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, getPlayer: async () => pgPlayer }),
+  );
+
+  assert.equal(isReady(pg.player, 0, NOW), true);
+  assert.equal(isReady(buildPlayerState({ plots: readyPlots }), 0, NOW), true);
+});
+
+test("resolveFarmView G. irrigation : growMinutes (farm.ts) identique V1/Postgres pour le meme irrigationLevel, aucune formule reimplementee", async () => {
+  const pgPlayer = buildPlayerState({ irrigationLevel: 5 });
+
+  const pg = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => buildPlayerState()) as unknown as FarmStore["getPlayer"], buildGlobalState()),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, getPlayer: async () => pgPlayer }),
+  );
+
+  assert.equal(pg.player.irrigationLevel, 5);
+  assert.equal(growMinutes(pg.player, "wheat"), growMinutes(buildPlayerState({ irrigationLevel: 5 }), "wheat"));
+});
+
+test("resolveFarmView H. meteo : la ligne affichee (weatherLineForGlobal, via WEATHER_INFO) provient TOUJOURS du GlobalState reellement retourne par resolveFarmView, jamais de store.global", async () => {
+  const jsonGlobal = buildGlobalState({ weather: "normal" });
+  const pgGlobal = buildGlobalState({ weather: "rain" });
+
+  const v1 = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => buildPlayerState()) as unknown as FarmStore["getPlayer"], jsonGlobal),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => false }),
+  );
+  const pg = await resolveFarmView(
+    TEST_PLAYER_ID,
+    buildFakeStoreForInventory((() => buildPlayerState()) as unknown as FarmStore["getPlayer"], jsonGlobal),
+    buildFarmViewDeps({ shouldUsePostgresRuntime: () => true, getPlayer: async () => buildPlayerState(), getGlobalState: async () => pgGlobal }),
+  );
+
+  assert.equal(v1.global, jsonGlobal);
+  assert.equal(pg.global, pgGlobal);
+  assert.notEqual(
+    v1.global.weather,
+    pg.global.weather,
+    "les deux meteos sont volontairement differentes dans ce test, preuve que pg.global est bien utilise, jamais jsonGlobal cote Postgres",
+  );
+});
+
+// ===========================================================================
 // H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
-// EXACTEMENT 8 fois (le garde-fou de preambule + resolveBuyUpgrade +
+// EXACTEMENT 9 fois (le garde-fou de preambule + resolveBuyUpgrade +
 // resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
-// resolveHarvestCrops + resolveSellItems + resolveInventory) ;
-// ensurePlayerExists EXACTEMENT 7 fois (resolveBuyUpgrade +
+// resolveHarvestCrops + resolveSellItems + resolveInventory +
+// resolveFarmView) ; ensurePlayerExists EXACTEMENT 8 fois (resolveBuyUpgrade +
 // resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
-// resolveHarvestCrops + resolveSellItems + resolveInventory) ;
-// buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop, craftPlayerItem,
-// harvestPlayerCrops et sellPlayerItems EXACTEMENT 1 fois chacun (leur
-// seule fonction de resolution respective). deps.getPlayer( (le
-// repository, pas store.getPlayer) EXACTEMENT 2 fois (resolvePlantCrop +
-// resolveInventory) ; deps.getGlobalState( EXACTEMENT 1 fois
-// (resolveInventory). Preuve automatisee (lecture du fichier source, meme
-// technique que les tests transversaux existants de
+// resolveHarvestCrops + resolveSellItems + resolveInventory +
+// resolveFarmView) ; buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop,
+// craftPlayerItem, harvestPlayerCrops et sellPlayerItems EXACTEMENT 1 fois
+// chacun (leur seule fonction de resolution respective). deps.getPlayer( (le
+// repository, pas store.getPlayer) EXACTEMENT 3 fois (resolvePlantCrop +
+// resolveInventory + resolveFarmView) ; deps.getGlobalState( EXACTEMENT 2
+// fois (resolveInventory + resolveFarmView). Preuve automatisee (lecture du
+// fichier source, meme technique que les tests transversaux existants de
 // farmRepository.test.ts/farmPlayerActions.test.ts) qu'aucune autre
-// commande (/market, /contract, etc.) n'a ete branchee sur Postgres par
-// erreur, et que /buy, /daily, /plant, /craft, /harvest, /sell et
-// /inventory sont desormais les SEPT SEULS chemins Postgres.
+// commande (/market, /profile, etc.) n'a ete branchee sur Postgres par
+// erreur, et que /buy, /daily, /plant, /craft, /harvest, /sell, /inventory
+// et /farm sont desormais les HUIT SEULS chemins Postgres.
 // ===========================================================================
 
 test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/sellPlayerItems/getPlayer/getGlobalState n'ont que les sites d'appel attendus, aucune autre commande", async () => {
@@ -1381,15 +1582,15 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
 
   assert.equal(
     countCalls("shouldUsePostgresRuntime"),
-    8,
-    "8 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory",
+    9,
+    "9 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView",
   );
   assert.equal(countCalls("harvestPlayerCrops"), 1, "un seul site d'appel attendu (resolveHarvestCrops)");
   assert.equal(countCalls("sellPlayerItems"), 1, "un seul site d'appel attendu (resolveSellItems)");
   assert.equal(
     countCalls("ensurePlayerExists"),
-    7,
-    "7 sites d'appel attendus : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory",
+    8,
+    "8 sites d'appel attendus : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView",
   );
   assert.equal(countCalls("buyPlayerUpgrade"), 1, "un seul site d'appel attendu (resolveBuyUpgrade)");
   assert.equal(countCalls("claimPlayerDaily"), 1, "un seul site d'appel attendu (resolveDailyClaim)");
@@ -1398,14 +1599,14 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
   // "deps.getPlayer(" exclut deliberement "store.getPlayer(" (compte a part,
   // deja verifie test par test ci-dessus) -- seul le repository nous
   // interesse ici, pas la methode FarmStore preexistante.
-  assert.equal(countCalls("deps.getPlayer"), 2, "deux sites d'appel du repository getPlayer attendus (resolvePlantCrop + resolveInventory)");
-  assert.equal(countCalls("deps.getGlobalState"), 1, "un seul site d'appel du repository getGlobalState attendu (resolveInventory)");
+  assert.equal(countCalls("deps.getPlayer"), 3, "trois sites d'appel du repository getPlayer attendus (resolvePlantCrop + resolveInventory + resolveFarmView)");
+  assert.equal(countCalls("deps.getGlobalState"), 2, "deux sites d'appel du repository getGlobalState attendus (resolveInventory + resolveFarmView)");
 });
 
 // ===========================================================================
 // I. Preambule enrichGlobalState/store.save() -- ne doit JAMAIS s'executer
-// pour /buy, /daily, /plant, /craft, /harvest, /sell ou /inventory d'un
-// joueur allowliste (aucune ecriture JSON), mais DOIT continuer a
+// pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory ou /farm
+// d'un joueur allowliste (aucune ecriture JSON), mais DOIT continuer a
 // s'executer exactement comme avant pour toute autre commande (V1
 // inchange). commandSkipsJsonPreamble() est la decision PURE qui gouverne
 // ce garde-fou -- testee ici directement (aucune connexion DB necessaire).
@@ -1413,7 +1614,7 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
 // commande V1 declenche toujours reellement le preambule.
 // ===========================================================================
 
-test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell ou /inventory d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
+test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory ou /farm d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
   const allowlisted = { shouldUsePostgresRuntime: () => true };
   const notAllowlisted = { shouldUsePostgresRuntime: () => false };
 
@@ -1424,6 +1625,7 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("harvest", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("sell", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("inventory", TEST_PLAYER_ID, allowlisted), true);
+  assert.equal(commandSkipsJsonPreamble("farm", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("buy", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("daily", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("plant", TEST_PLAYER_ID, notAllowlisted), false);
@@ -1431,9 +1633,9 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("harvest", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("sell", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("inventory", TEST_PLAYER_ID, notAllowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("farm", TEST_PLAYER_ID, notAllowlisted), false);
   // Meme allowliste, une commande jamais branchee sur Postgres reste V1 --
   // le preambule doit continuer a s'executer pour elle, sans exception.
-  assert.equal(commandSkipsJsonPreamble("farm", TEST_PLAYER_ID, allowlisted), false);
   assert.equal(commandSkipsJsonPreamble("profile", TEST_PLAYER_ID, allowlisted), false);
   assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, allowlisted), false);
 });
