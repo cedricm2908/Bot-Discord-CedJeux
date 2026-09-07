@@ -34,6 +34,7 @@ import {
   resolvePlantCrop,
   resolveProfile,
   resolveSellItems,
+  resolveWeekly,
   type BuyResolutionDeps,
   type ContractResolutionDeps,
   type CraftResolutionDeps,
@@ -46,6 +47,7 @@ import {
   type PlantResolutionDeps,
   type ProfileResolutionDeps,
   type SellResolutionDeps,
+  type WeeklyResolutionDeps,
 } from "./presenters.ts";
 import { POSTGRES_TEST_PLAYER_IDS_ENV_VAR, shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import { FarmStore } from "./store.ts";
@@ -2199,34 +2201,217 @@ test("resolveLeaderboard J. /leaderboard est MULTI-PLAYER GLOBAL : ensurePlayerE
 });
 
 // ===========================================================================
+// resolveWeekly -- MEME categorie MULTI-PLAYER GLOBAL que resolveLeaderboard,
+// mais ENCORE PLUS SIMPLE : /weekly (V1 reel, verifie a l'audit dedie)
+// n'a AUCUNE dependance a GlobalState (score = coins - weeklySnapshotCoins
+// uniquement) et V1 n'appelle JAMAIS de primitive mutante (le reset/
+// recompense hebdomadaire est exclusivement un mecanisme de scheduler,
+// jamais declenche par /weekly). resolveWeekly() n'accepte donc ni
+// ensurePlayerExists ni getGlobalState dans ses deps. Aucun test ici ne
+// mocke tryClaimWeeklyReset/resumeWeeklyRewards/claimAndMutatePlayer/
+// mutatePlayer/mutatePlayerAndGlobal -- le test K/L ci-dessous prouve par
+// lecture du source que resolveWeekly()/commandWeekly() ne les referencent
+// jamais.
+// ===========================================================================
+
+function buildFakeStoreForWeekly(players: PlayerState[]): FarmStore {
+  return { getPlayers: () => players } as unknown as FarmStore;
+}
+
+function buildWeeklyDeps(overrides: Partial<WeeklyResolutionDeps> = {}): WeeklyResolutionDeps {
+  return {
+    shouldUsePostgresRuntime: () => false,
+    getAllPlayers: async () => [],
+    ...overrides,
+  };
+}
+
+test("resolveWeekly A. joueur non allowliste : utilise store.getPlayers() uniquement, jamais deps.getAllPlayers, meme chemin V1", async () => {
+  const players = [buildPlayerState({ userId: "p1", coins: 100, weeklySnapshotCoins: 20 })];
+  const store = buildFakeStoreForWeekly(players);
+  const getAllPlayers = mock.fn(async () => {
+    throw new Error("getAllPlayers ne doit jamais etre appele sur le chemin V1");
+  });
+  const deps = buildWeeklyDeps({ shouldUsePostgresRuntime: () => false, getAllPlayers });
+
+  const result = await resolveWeekly(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(getAllPlayers.mock.calls.length, 0);
+  assert.equal(result, players, "doit retourner exactement store.getPlayers()");
+});
+
+test("resolveWeekly B. joueur allowliste : utilise deps.getAllPlayers (Postgres) uniquement, jamais store.getPlayers(), aucune mutation JSON", async () => {
+  const jsonPlayers = [buildPlayerState({ userId: "json-only", coins: 9999, weeklySnapshotCoins: 0 })];
+  const store = buildFakeStoreForWeekly(jsonPlayers);
+  const pgPlayers = [buildPlayerState({ userId: "pg1", coins: 500, weeklySnapshotCoins: 100 })];
+  const getAllPlayers = mock.fn(async () => pgPlayers);
+  const deps = buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers });
+
+  const result = await resolveWeekly(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(getAllPlayers.mock.calls.length, 1);
+  assert.equal(result, pgPlayers, "doit retourner exactement les joueurs Postgres, jamais store.getPlayers()");
+});
+
+test("resolveWeekly C. classement : score = coins - weeklySnapshotCoins, tri DESC exact, reproductible a partir des donnees retournees, aucune formule reimplementee", async () => {
+  const pgPlayers = [
+    buildPlayerState({ userId: "low", coins: 100, weeklySnapshotCoins: 90 }),
+    buildPlayerState({ userId: "high", coins: 1000, weeklySnapshotCoins: 200 }),
+    buildPlayerState({ userId: "mid", coins: 500, weeklySnapshotCoins: 300 }),
+  ];
+  const deps = buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => pgPlayers });
+
+  const players = await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly([]), deps);
+
+  const sorted = [...players].sort((a, b) => (b.coins - b.weeklySnapshotCoins) - (a.coins - a.weeklySnapshotCoins));
+  assert.deepEqual(sorted.map((p) => p.userId), ["high", "mid", "low"]);
+});
+
+test("resolveWeekly D. score negatif : accepte et calculable sans crash, identique V1/Postgres", async () => {
+  const pgPlayers = [buildPlayerState({ userId: "spender", coins: 10, weeklySnapshotCoins: 200 })];
+  const deps = buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => pgPlayers });
+
+  const players = await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly([]), deps);
+
+  const score = players[0]!.coins - players[0]!.weeklySnapshotCoins;
+  assert.equal(score, -190);
+});
+
+test("resolveWeekly E. egalite : ordre stable identique V1/Postgres, aucun tie-break ajoute", async () => {
+  const tiedPlayers = [
+    buildPlayerState({ userId: "first", coins: 150, weeklySnapshotCoins: 100 }),
+    buildPlayerState({ userId: "second", coins: 100, weeklySnapshotCoins: 50 }),
+  ];
+
+  const v1 = await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly(tiedPlayers), buildWeeklyDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveWeekly(
+    TEST_PLAYER_ID,
+    buildFakeStoreForWeekly([]),
+    buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => tiedPlayers }),
+  );
+
+  const sortIds = (players: typeof tiedPlayers) =>
+    [...players].sort((a, b) => (b.coins - b.weeklySnapshotCoins) - (a.coins - a.weeklySnapshotCoins)).map((p) => p.userId);
+  assert.deepEqual(sortIds(v1), ["first", "second"]);
+  assert.deepEqual(sortIds(pg), ["first", "second"]);
+});
+
+test("resolveWeekly F. top 10 : la limite reste appliquee dans commandWeekly (inchange), resolveWeekly retourne bien TOUS les joueurs sans les tronquer lui-meme", async () => {
+  const manyPlayers = Array.from({ length: 15 }, (_, i) => buildPlayerState({ userId: `p${i}`, coins: i, weeklySnapshotCoins: 0 }));
+  const deps = buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => manyPlayers });
+
+  const players = await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly([]), deps);
+
+  assert.equal(players.length, 15, "resolveWeekly ne tronque pas -- le slice(0, 10) reste dans commandWeekly, inchange");
+});
+
+test("resolveWeekly G. 0 joueur : tableau vide identique V1/Postgres", async () => {
+  const v1 = await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly([]), buildWeeklyDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveWeekly(
+    TEST_PLAYER_ID,
+    buildFakeStoreForWeekly([]),
+    buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => [] }),
+  );
+
+  assert.deepEqual(v1, []);
+  assert.deepEqual(pg, []);
+});
+
+test("resolveWeekly H. 1 joueur : classement a une seule ligne, identique V1/Postgres, aucun crash", async () => {
+  const soloPlayer = [buildPlayerState({ userId: "solo", coins: 42, weeklySnapshotCoins: 10 })];
+
+  const v1 = await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly(soloPlayer), buildWeeklyDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveWeekly(
+    TEST_PLAYER_ID,
+    buildFakeStoreForWeekly([]),
+    buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => soloPlayer }),
+  );
+
+  assert.equal(v1.length, 1);
+  assert.equal(pg.length, 1);
+  assert.equal(v1[0]!.userId, "solo");
+  assert.equal(pg[0]!.userId, "solo");
+});
+
+test("resolveWeekly I. source Postgres differente du JSON : le resultat correspond uniquement au Postgres, preuve qu'aucun melange des deux sources n'est possible", async () => {
+  const jsonPlayers = [buildPlayerState({ userId: "json-player", coins: 1, weeklySnapshotCoins: 0 })];
+  const store = buildFakeStoreForWeekly(jsonPlayers);
+  const pgPlayers = [buildPlayerState({ userId: "pg-player", coins: 2, weeklySnapshotCoins: 0 })];
+
+  const v1 = await resolveWeekly(TEST_PLAYER_ID, store, buildWeeklyDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveWeekly(TEST_PLAYER_ID, store, buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => pgPlayers }));
+
+  assert.equal(v1, jsonPlayers);
+  assert.equal(pg, pgPlayers);
+  assert.notDeepEqual(v1.map((p) => p.userId), pg.map((p) => p.userId), "les deux listes sont volontairement differentes, preuve que pg est bien utilise, jamais json cote Postgres");
+});
+
+test("resolveWeekly J. deps.getAllPlayers() qui echoue (rejette) : l'erreur remonte telle quelle, aucun fallback JSON silencieux", async () => {
+  const store = buildFakeStoreForWeekly([buildPlayerState()]);
+  const deps = buildWeeklyDeps({
+    shouldUsePostgresRuntime: () => true,
+    getAllPlayers: async () => {
+      throw new Error("panne Postgres simulee");
+    },
+  });
+
+  await assert.rejects(() => resolveWeekly(TEST_PLAYER_ID, store, deps), /panne Postgres simulee/);
+});
+
+test("resolveWeekly K. le resolveur/commandWeekly ne referencent JAMAIS tryClaimWeeklyReset/resumeWeeklyRewards/claimAndMutatePlayer/mutatePlayer/mutatePlayerAndGlobal (aucune mutation weekly dans le presenter, uniquement dans le futur scheduler)", async () => {
+  const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
+  const weeklyBlockStart = source.indexOf("export interface WeeklyResolutionDeps");
+  const weeklyBlockEnd = source.indexOf("// LOT 6, bascule TEST-only pour /daily UNIQUEMENT", weeklyBlockStart);
+  assert.ok(weeklyBlockStart >= 0, "resolveWeekly/commandWeekly doivent exister");
+  assert.ok(weeklyBlockEnd > weeklyBlockStart, "le bloc /daily doit exister juste apres le bloc /weekly");
+  const weeklyBlock = source.slice(weeklyBlockStart, weeklyBlockEnd);
+
+  for (const forbidden of ["tryClaimWeeklyReset", "resumeWeeklyRewards", "claimAndMutatePlayer", "mutatePlayerAndGlobal", "mutatePlayer", "store.save"]) {
+    assert.ok(!weeklyBlock.includes(forbidden), `resolveWeekly/commandWeekly ne doivent jamais referencer ${forbidden}`);
+  }
+});
+
+test("resolveWeekly L. ensurePlayerExists et getGlobalState NE SONT PAS acceptes par WeeklyResolutionDeps (structurellement absents du chemin Postgres)", async () => {
+  const deps = buildWeeklyDeps({ shouldUsePostgresRuntime: () => true, getAllPlayers: async () => [] });
+
+  assert.ok(!("ensurePlayerExists" in deps), "WeeklyResolutionDeps ne doit jamais accepter ensurePlayerExists");
+  assert.ok(!("getGlobalState" in deps), "WeeklyResolutionDeps ne doit jamais accepter getGlobalState");
+  assert.ok(!("getPlayer" in deps), "WeeklyResolutionDeps ne doit jamais accepter getPlayer");
+
+  await resolveWeekly(TEST_PLAYER_ID, buildFakeStoreForWeekly([]), deps);
+});
+
+// ===========================================================================
 // H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
-// EXACTEMENT 13 fois (le garde-fou de preambule + resolveBuyUpgrade +
+// EXACTEMENT 14 fois (le garde-fou de preambule + resolveBuyUpgrade +
 // resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
 // resolveHarvestCrops + resolveSellItems + resolveInventory +
 // resolveFarmView + resolveProfile + resolveMarket + resolveContract +
-// resolveLeaderboard) ; ensurePlayerExists EXACTEMENT 9 fois -- INCHANGE
-// depuis /profile, ce qui PROUVE que ni resolveMarket() ni
-// resolveContract() ni resolveLeaderboard() n'appellent jamais
-// ensurePlayerExists (resolveBuyUpgrade + resolveDailyClaim +
-// resolvePlantCrop + resolveCraftItem + resolveHarvestCrops +
-// resolveSellItems + resolveInventory + resolveFarmView + resolveProfile) ;
-// buyPlayerUpgrade, claimPlayerDaily, plantPlayerCrop, craftPlayerItem,
-// harvestPlayerCrops et sellPlayerItems EXACTEMENT 1 fois chacun (leur
-// seule fonction de resolution respective). deps.getPlayer( (le
-// repository, pas store.getPlayer) EXACTEMENT 4 fois -- INCHANGE depuis
-// /profile, ce qui PROUVE que ni resolveMarket() ni resolveContract() ni
-// resolveLeaderboard() n'appellent jamais deps.getPlayer non plus
-// (resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile) ;
-// deps.getGlobalState( EXACTEMENT 6 fois (resolveInventory +
+// resolveLeaderboard + resolveWeekly) ; ensurePlayerExists EXACTEMENT 9
+// fois -- INCHANGE depuis /profile, ce qui PROUVE que ni resolveMarket()
+// ni resolveContract() ni resolveLeaderboard() ni resolveWeekly()
+// n'appellent jamais ensurePlayerExists (resolveBuyUpgrade +
+// resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
+// resolveHarvestCrops + resolveSellItems + resolveInventory +
+// resolveFarmView + resolveProfile) ; buyPlayerUpgrade, claimPlayerDaily,
+// plantPlayerCrop, craftPlayerItem, harvestPlayerCrops et sellPlayerItems
+// EXACTEMENT 1 fois chacun (leur seule fonction de resolution respective).
+// deps.getPlayer( (le repository, pas store.getPlayer) EXACTEMENT 4 fois --
+// INCHANGE depuis /profile, ce qui PROUVE que ni resolveMarket() ni
+// resolveContract() ni resolveLeaderboard() ni resolveWeekly() n'appellent
+// jamais deps.getPlayer non plus (resolvePlantCrop + resolveInventory +
+// resolveFarmView + resolveProfile) ; deps.getGlobalState( EXACTEMENT 6
+// fois -- INCHANGE depuis /leaderboard, ce qui PROUVE que resolveWeekly()
+// n'appelle jamais deps.getGlobalState non plus (resolveInventory +
 // resolveFarmView + resolveProfile + resolveMarket + resolveContract +
-// resolveLeaderboard) ; deps.getAllPlayers( EXACTEMENT 1 fois
-// (resolveLeaderboard). Preuve automatisee (lecture du fichier source,
-// meme technique que les tests transversaux existants de
+// resolveLeaderboard) ; deps.getAllPlayers( EXACTEMENT 2 fois
+// (resolveLeaderboard + resolveWeekly). Preuve automatisee (lecture du
+// fichier source, meme technique que les tests transversaux existants de
 // farmRepository.test.ts/farmPlayerActions.test.ts) qu'aucune autre
-// commande (/weekly, etc.) n'a ete branchee sur Postgres par erreur, et que
+// commande (/codex, etc.) n'a ete branchee sur Postgres par erreur, et que
 // /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm,
-// /profile, /market, /contract et /leaderboard sont desormais les DOUZE
-// SEULS chemins Postgres.
+// /profile, /market, /contract, /leaderboard et /weekly sont desormais les
+// TREIZE SEULS chemins Postgres.
 // ===========================================================================
 
 test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/sellPlayerItems/getPlayer/getGlobalState/getAllPlayers n'ont que les sites d'appel attendus, aucune autre commande", async () => {
@@ -2235,15 +2420,15 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
 
   assert.equal(
     countCalls("shouldUsePostgresRuntime"),
-    13,
-    "13 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard",
+    14,
+    "14 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard + resolveWeekly",
   );
   assert.equal(countCalls("harvestPlayerCrops"), 1, "un seul site d'appel attendu (resolveHarvestCrops)");
   assert.equal(countCalls("sellPlayerItems"), 1, "un seul site d'appel attendu (resolveSellItems)");
   assert.equal(
     countCalls("ensurePlayerExists"),
     9,
-    "9 sites d'appel attendus, INCHANGE depuis /profile -- ni resolveMarket() ni resolveContract() ni resolveLeaderboard() n'appellent jamais ensurePlayerExists (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile)",
+    "9 sites d'appel attendus, INCHANGE depuis /profile -- ni resolveMarket() ni resolveContract() ni resolveLeaderboard() ni resolveWeekly() n'appellent jamais ensurePlayerExists (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile)",
   );
   assert.equal(countCalls("buyPlayerUpgrade"), 1, "un seul site d'appel attendu (resolveBuyUpgrade)");
   assert.equal(countCalls("claimPlayerDaily"), 1, "un seul site d'appel attendu (resolveDailyClaim)");
@@ -2255,25 +2440,29 @@ test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgra
   assert.equal(
     countCalls("deps.getPlayer"),
     4,
-    "quatre sites d'appel du repository getPlayer attendus, INCHANGE depuis /profile -- ni resolveMarket() ni resolveContract() ni resolveLeaderboard() n'appellent jamais deps.getPlayer (resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile)",
+    "quatre sites d'appel du repository getPlayer attendus, INCHANGE depuis /profile -- ni resolveMarket() ni resolveContract() ni resolveLeaderboard() ni resolveWeekly() n'appellent jamais deps.getPlayer (resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile)",
   );
-  assert.equal(countCalls("deps.getGlobalState"), 6, "six sites d'appel du repository getGlobalState attendus (resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard)");
-  assert.equal(countCalls("deps.getAllPlayers"), 1, "un seul site d'appel du repository getAllPlayers attendu (resolveLeaderboard)");
+  assert.equal(
+    countCalls("deps.getGlobalState"),
+    6,
+    "six sites d'appel du repository getGlobalState attendus, INCHANGE depuis /leaderboard -- resolveWeekly() n'appelle jamais deps.getGlobalState (resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard)",
+  );
+  assert.equal(countCalls("deps.getAllPlayers"), 2, "deux sites d'appel du repository getAllPlayers attendus (resolveLeaderboard + resolveWeekly)");
 });
 
 // ===========================================================================
 // I. Preambule enrichGlobalState/store.save() -- ne doit JAMAIS s'executer
 // pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm,
-// /profile, /market, /contract ou /leaderboard d'un joueur allowliste
-// (aucune ecriture JSON), mais DOIT continuer a s'executer exactement
-// comme avant pour toute autre commande (V1 inchange).
+// /profile, /market, /contract, /leaderboard ou /weekly d'un joueur
+// allowliste (aucune ecriture JSON), mais DOIT continuer a s'executer
+// exactement comme avant pour toute autre commande (V1 inchange).
 // commandSkipsJsonPreamble() est la decision PURE qui gouverne ce
 // garde-fou -- testee ici directement (aucune connexion DB necessaire).
 // handleSlashCommand("list") verifie separement, en bout en bout, qu'une
 // commande V1 declenche toujours reellement le preambule.
 // ===========================================================================
 
-test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm, /profile, /market, /contract ou /leaderboard d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
+test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm, /profile, /market, /contract, /leaderboard ou /weekly d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
   const allowlisted = { shouldUsePostgresRuntime: () => true };
   const notAllowlisted = { shouldUsePostgresRuntime: () => false };
 
@@ -2289,6 +2478,7 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("contract", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("leaderboard", TEST_PLAYER_ID, allowlisted), true);
+  assert.equal(commandSkipsJsonPreamble("weekly", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("buy", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("daily", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("plant", TEST_PLAYER_ID, notAllowlisted), false);
@@ -2301,9 +2491,9 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("market", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("contract", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("leaderboard", TEST_PLAYER_ID, notAllowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("weekly", TEST_PLAYER_ID, notAllowlisted), false);
   // Meme allowliste, une commande jamais branchee sur Postgres reste V1 --
   // le preambule doit continuer a s'executer pour elle, sans exception.
-  assert.equal(commandSkipsJsonPreamble("weekly", TEST_PLAYER_ID, allowlisted), false);
   assert.equal(commandSkipsJsonPreamble("codex", TEST_PLAYER_ID, allowlisted), false);
 });
 

@@ -212,10 +212,21 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // bootstrap ne doit donc pas non plus avoir lieu cote Postgres.
 // resolveLeaderboard() lit TOUS les joueurs via getAllPlayers() (Postgres)
 // et le GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
-// store.getPlayers()/store.global. Ne s'applique JAMAIS a /weekly, etc. --
-// ces commandes restent V1 pour absolument tout le monde, allowliste ou
-// non, et continuent donc de declencher ce preambule exactement comme
-// avant.
+// store.getPlayers()/store.global. /weekly est la MEME categorie
+// MULTI-PLAYER GLOBAL que /leaderboard, mais ENCORE PLUS SIMPLE : audit
+// dedie confirme que commandWeekly n'a AUCUNE dependance a GlobalState
+// (score = coins - weeklySnapshotCoins uniquement, aucun marketMultiplier
+// implique) ET que V1 n'appelle JAMAIS resetWeeklyIfNeeded()/aucune
+// primitive mutante depuis /weekly (le reset/recompense hebdomadaire est
+// EXCLUSIVEMENT un mecanisme de scheduler en V1 -- voir bot.ts, jamais
+// presenters.ts). resolveWeekly() n'accepte donc meme pas
+// ensurePlayerExists/getGlobalState dans ses deps, et ne doit JAMAIS
+// appeler tryClaimWeeklyReset/resumeWeeklyRewards/claimAndMutatePlayer/
+// mutatePlayer/mutatePlayerAndGlobal -- ces primitives restent
+// exclusivement reservees au futur scheduler, jamais au presenter. Ne
+// s'applique JAMAIS a /codex, etc. -- ces commandes restent V1 pour
+// absolument tout le monde, allowliste ou non, et continuent donc de
+// declencher ce preambule exactement comme avant.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
   "daily",
@@ -229,6 +240,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "market",
   "contract",
   "leaderboard",
+  "weekly",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -1191,11 +1203,59 @@ async function commandLeaderboard(
   });
 }
 
+// LOT 6, bascule TEST-only pour /weekly UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- categorie MULTI-PLAYER GLOBAL, meme
+// famille que resolveLeaderboard, mais ENCORE PLUS SIMPLE : audit dedie
+// confirme que commandWeekly n'a AUCUNE dependance a GlobalState (score =
+// coins - weeklySnapshotCoins uniquement) et que V1 n'appelle JAMAIS de
+// primitive mutante depuis cette commande -- le reset/recompense
+// hebdomadaire (resetWeeklyIfNeeded en V1) est EXCLUSIVEMENT un mecanisme
+// de scheduler, jamais declenche par /weekly. resolveWeekly() n'accepte
+// donc pas ensurePlayerExists/getGlobalState dans ses deps, et cette
+// fonction (ni commandWeekly) N'APPELLE JAMAIS tryClaimWeeklyReset,
+// resumeWeeklyRewards, claimAndMutatePlayer, mutatePlayer ni
+// mutatePlayerAndGlobal -- ces primitives restent exclusivement reservees
+// au futur scheduler. Un joueur allowliste lit EXCLUSIVEMENT tous les
+// joueurs via getAllPlayers() (Postgres), jamais store.getPlayers()
+// (JSON), qui pourrait diverger de l'etat Postgres reellement affiche. Si
+// getAllPlayers() echoue, aucun fallback JSON silencieux : l'erreur
+// remonte telle quelle (meme convention que resolveLeaderboard()).
+export interface WeeklyResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  getAllPlayers: typeof getAllPlayers;
+}
+
+const realWeeklyResolutionDeps: WeeklyResolutionDeps = {
+  shouldUsePostgresRuntime,
+  getAllPlayers,
+};
+
+/**
+ * Decide quel backend utiliser pour /weekly et retourne TOUS les joueurs a
+ * utiliser pour le classement, SANS jamais toucher a la reponse Discord ni
+ * a la logique de tri (qui reste dans commandWeekly, inchangee). Un joueur
+ * allowliste lit EXCLUSIVEMENT la source Postgres (getAllPlayers()) --
+ * aucune ecriture, aucun bootstrap joueur, aucune lecture de GlobalState
+ * (non necessaire, /weekly n'en depend pas). Un joueur non allowliste (cas
+ * par defaut) suit EXACTEMENT le chemin V1 : store.getPlayers().
+ */
+export async function resolveWeekly(
+  playerId: string,
+  store: FarmStore,
+  deps: WeeklyResolutionDeps = realWeeklyResolutionDeps,
+): Promise<PlayerState[]> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    return deps.getAllPlayers();
+  }
+  return store.getPlayers();
+}
+
 async function commandWeekly(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const top = [...store.getPlayers()]
+  const players = await resolveWeekly(interaction.user.id, store);
+  const top = [...players]
     .sort((a, b) => (b.coins - b.weeklySnapshotCoins) - (a.coins - a.weeklySnapshotCoins))
     .slice(0, 10);
   const lines = await Promise.all(top.map(async (player, index) => {
