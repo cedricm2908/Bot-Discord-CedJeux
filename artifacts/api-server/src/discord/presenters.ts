@@ -196,8 +196,15 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // pour un joueur allowliste -- creer un joueur Postgres juste pour afficher le
 // marche serait un effet de bord non demande par V1. resolveMarket() lit le
 // GlobalState via getGlobalState() (Postgres) cote allowliste, jamais
-// store.global. Ne s'applique JAMAIS a /contract, etc. -- ces commandes
-// restent V1 pour absolument tout le monde, allowliste ou non, et
+// store.global. /contract est la MEME categorie GLOBAL-ONLY que /market --
+// verifie a l'audit : commandContract ne lit AUCUNE donnee Player, seulement
+// store.global.contract (cropId/required/bonusMultiplier/remaining) et
+// cropById() (constants.ts) pour le nom/emoji de la culture. renewedAt
+// n'est PAS affiche (le texte "Toutes les 4 heures" est statique, meme
+// convention que le texte statique de /market). resolveContract() n'appelle
+// donc jamais le bootstrap ensurePlayerExists non plus, exactement comme
+// resolveMarket(). Ne s'applique JAMAIS a /leaderboard, etc. -- ces
+// commandes restent V1 pour absolument tout le monde, allowliste ou non, et
 // continuent donc de declencher ce preambule exactement comme avant.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
@@ -210,6 +217,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "farm",
   "profile",
   "market",
+  "contract",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -939,11 +947,57 @@ async function commandCraft(
   });
 }
 
+// LOT 6, bascule TEST-only pour /contract UNIQUEMENT (voir
+// postgresRuntimeAllowlist.ts) -- meme categorie GLOBAL-ONLY que
+// resolveMarket ci-dessus : commandContract ne lit AUCUNE donnee Player
+// (verifie a l'audit -- aucun store.getPlayer() dans son corps), seulement
+// store.global.contract. resolveContract() n'accepte donc meme pas
+// ensurePlayerExists/getPlayer dans ses deps -- aucun bootstrap joueur ne
+// doit jamais avoir lieu pour /contract, allowliste ou non. Un joueur
+// allowliste lit EXCLUSIVEMENT le GlobalState via getGlobalState()
+// (Postgres), jamais store.global (JSON), qui pourrait diverger de l'etat
+// Postgres reellement affiche. Si le GlobalState Postgres est absent,
+// aucun fallback JSON silencieux : l'erreur remonte telle quelle (meme
+// convention que resolveMarket()).
+export interface ContractResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realContractResolutionDeps: ContractResolutionDeps = {
+  shouldUsePostgresRuntime,
+  getGlobalState,
+};
+
+/**
+ * Decide quel backend utiliser pour /contract et retourne le GlobalState a
+ * utiliser pour l'affichage, SANS jamais toucher a la reponse Discord. Un
+ * joueur allowliste lit EXCLUSIVEMENT le GlobalState Postgres -- aucune
+ * ecriture, aucun bootstrap joueur (non necessaire, /contract ne lit aucune
+ * donnee Player). Un joueur non allowliste (cas par defaut) suit
+ * EXACTEMENT le chemin V1 : store.global.
+ */
+export async function resolveContract(
+  playerId: string,
+  store: FarmStore,
+  deps: ContractResolutionDeps = realContractResolutionDeps,
+): Promise<GlobalState> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveContract : global_state introuvable.");
+    }
+    return global;
+  }
+  return store.global;
+}
+
 async function commandContract(
   interaction: ChatInputCommandInteraction,
   store: FarmStore,
 ): Promise<void> {
-  const contract = store.global.contract;
+  const global = await resolveContract(interaction.user.id, store);
+  const contract = global.contract;
   const crop = cropById(contract.cropId);
   await interaction.reply({
     embeds: [
