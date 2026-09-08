@@ -2891,9 +2891,15 @@ test("handleSlashCommand : erreur generique (non-FarmError) pendant le preambule
     await handleSlashCommand(interaction, store);
 
     assert.equal(errorSpy.mock.calls.length, 1, "une erreur non-FarmError doit declencher logger.error exactement une fois");
-    const [logPayload] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; command: string }, string];
+    const [logPayload, logMessage] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; command: string }, string];
     assert.equal(logPayload.command, "list");
     assert.ok(logPayload.err instanceof Error);
+    // DIAGNOSTIC TEMPORAIRE : Railway n'affiche pas les champs structures,
+    // les valeurs doivent donc AUSSI apparaitre dans le texte du message.
+    assert.ok(logMessage.includes("command=list"), "le texte du log doit contenir command=list");
+    assert.ok(logMessage.includes("errorName=Error"), "le texte du log doit contenir errorName=Error");
+    assert.ok(logMessage.includes("errorMessage=panne DB simulee, non-FarmError"), "le texte du log doit contenir le errorMessage reel");
+    assert.ok(!logMessage.includes(TEST_PLAYER_ID), "le texte du log ne doit jamais contenir de playerId");
     assert.equal(reply.mock.calls.length, 1);
     const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
     assert.ok(
@@ -2928,9 +2934,16 @@ test("handleCodexComponent : erreur generique (non-FarmError) -> logger.error ap
     await handleCodexComponent(interaction, store);
 
     assert.equal(errorSpy.mock.calls.length, 1, "une erreur non-FarmError doit declencher logger.error exactement une fois");
-    const [logPayload] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; customIdCategory: string }, string];
+    const [logPayload, logMessage] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; customIdCategory: string }, string];
     assert.equal(logPayload.customIdCategory, "replant", "seule la categorie (parts[1]) doit etre loggee, jamais le customId complet (qui contient le playerId)");
     assert.ok(logPayload.err instanceof Error);
+    // DIAGNOSTIC TEMPORAIRE : Railway n'affiche pas les champs structures,
+    // les valeurs doivent donc AUSSI apparaitre dans le texte du message.
+    assert.ok(logMessage.includes("customIdCategory=replant"), "le texte du log doit contenir customIdCategory=replant");
+    assert.ok(logMessage.includes("errorName=Error"), "le texte du log doit contenir errorName=Error");
+    assert.ok(logMessage.includes("errorMessage=panne inattendue simulee, non-FarmError"), "le texte du log doit contenir le errorMessage reel");
+    assert.ok(!logMessage.includes(`codex:replant:${TEST_PLAYER_ID}`), "le texte du log ne doit jamais contenir le customId complet");
+    assert.ok(!logMessage.includes(TEST_PLAYER_ID), "le texte du log ne doit jamais contenir de playerId");
     assert.equal(reply.mock.calls.length, 1);
     const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
     assert.ok(

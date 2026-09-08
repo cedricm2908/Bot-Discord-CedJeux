@@ -341,7 +341,17 @@ export async function handleSlashCommand(
     }
   } catch (error) {
     if (!(error instanceof FarmError)) {
-      logger.error({ err: error, command: interaction.commandName }, "[handleSlashCommand] unexpected Farm2Win error");
+      // DIAGNOSTIC TEMPORAIRE (a retirer une fois la cause de /harvest
+      // identifiee) : errorName/errorMessage/command inclus directement
+      // dans le TEXTE du log, pas seulement dans les champs structures --
+      // Railway Deploy Logs n'affiche pas ces derniers pour le moment.
+      // Toujours aucun playerId/token/DATABASE_URL/payload Discord.
+      const errorName = error instanceof Error ? error.name : typeof error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.error(
+        { err: error, command: interaction.commandName },
+        `[handleSlashCommand] unexpected Farm2Win error command=${interaction.commandName} errorName=${errorName} errorMessage=${errorMessage}`,
+      );
     }
     await replyError(interaction, error);
   }
@@ -1696,9 +1706,13 @@ export async function handleCodexComponent(
     await interaction.update(codexPayload(global, player, view, feedback));
   } catch (error) {
     if (!(error instanceof FarmError)) {
+      // DIAGNOSTIC TEMPORAIRE, meme raison que handleSlashCommand ci-dessus.
+      const customIdCategory = interaction.customId.split(":")[1];
+      const errorName = error instanceof Error ? error.name : typeof error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error(
-        { err: error, customIdCategory: interaction.customId.split(":")[1] },
-        "[handleCodexComponent] unexpected Farm2Win error",
+        { err: error, customIdCategory },
+        `[handleCodexComponent] unexpected Farm2Win error customIdCategory=${customIdCategory} errorName=${errorName} errorMessage=${errorMessage}`,
       );
     }
     await replyError(interaction, error);
