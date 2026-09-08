@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -12,6 +13,7 @@ import {
   type InteractionReplyOptions,
   type InteractionUpdateOptions,
 } from "discord.js";
+import { logger } from "../lib/logger.ts";
 import {
   CROPS,
   MINI_GAMES,
@@ -35,6 +37,7 @@ import {
   plant,
   productPrice,
   sell,
+  toggleAutoReplant,
   totalInventoryValue,
   xpToNextLevel,
 } from "./farm.ts";
@@ -43,9 +46,11 @@ import {
   buyPlayerUpgrade,
   claimPlayerDaily,
   craftPlayerItem,
+  enrichGlobalStateInPostgres,
   harvestPlayerCrops,
   plantPlayerCrop,
   sellPlayerItems,
+  togglePlayerAutoReplant,
 } from "./db/farmPlayerActions.ts";
 import { ensurePlayerExists, getAllPlayers, getGlobalState, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
@@ -223,10 +228,24 @@ function playerName(interaction: ChatInputCommandInteraction): string {
 // ensurePlayerExists/getGlobalState dans ses deps, et ne doit JAMAIS
 // appeler tryClaimWeeklyReset/resumeWeeklyRewards/claimAndMutatePlayer/
 // mutatePlayer/mutatePlayerAndGlobal -- ces primitives restent
-// exclusivement reservees au futur scheduler, jamais au presenter. Ne
-// s'applique JAMAIS a /codex, etc. -- ces commandes restent V1 pour
-// absolument tout le monde, allowliste ou non, et continuent donc de
-// declencher ce preambule exactement comme avant.
+// exclusivement reservees au futur scheduler, jamais au presenter. /codex
+// est la DERNIERE slash command -- categorie MIXTE, UNIQUE dans ce LOT :
+// contrairement a toutes les precedentes (un seul chemin lecture OU
+// mutation), /codex initial est LECTURE SEULE (affiche player+global),
+// MAIS les composants interactifs qu'il envoie (boutons/select-menus,
+// customId "codex:...") declenchent ENSUITE deux mutations reelles (bouton
+// "Planter" -> plant(), bouton "Replantation auto" -> toggleAutoReplant())
+// et une mutation GlobalState (bouton "Actualiser" -> enrichGlobalState()).
+// CE Set gouverne UNIQUEMENT le preambule JSON de handleSlashCommand (donc
+// UNIQUEMENT /codex, la slash command initiale) -- verifie a l'audit :
+// handleCodexComponent() (les boutons/selects) est routee DIRECTEMENT
+// depuis bot.ts, JAMAIS via handleSlashCommand, donc jamais via ce
+// preambule -- ce Set n'a donc aucun effet sur les composants. La garantie
+// "zero ecriture JSON pour un joueur allowliste" sur le chemin composant
+// est assuree independamment, directement a l'interieur de
+// handleCodexComponent et des resolveurs qu'il appelle -- resolveCodexRefresh,
+// resolveCodexReplant, et resolvePlantCrop, reutilisee telle quelle pour
+// le bouton "Planter" plutot que dupliquee.
 const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "buy",
   "daily",
@@ -241,6 +260,7 @@ const POSTGRES_ROUTED_COMMAND_NAMES = new Set([
   "contract",
   "leaderboard",
   "weekly",
+  "codex",
 ]);
 
 export function commandSkipsJsonPreamble(
@@ -1346,16 +1366,16 @@ function filteredCrops(filter: string) {
 }
 
 function codexPayload(
-  store: FarmStore,
+  global: GlobalState,
   player: PlayerState,
   view: CodexViewState,
   feedback?: string,
 ): Pick<InteractionReplyOptions, "embeds" | "components"> {
   const crop = cropById(view.cropId);
   const tier = stageFor(crop.unlockLevel);
-  const price = currentCropPrice(store.global, crop.id);
+  const price = currentCropPrice(global, crop.id);
   const realMinutes = growMinutes(player, crop.id);
-  const yieldPerPlot = Math.max(1, Math.round(crop.baseYield * (1 + player.fertilizerLevel * 0.05)) * store.global.weatherMultiplier);
+  const yieldPerPlot = Math.max(1, Math.round(crop.baseYield * (1 + player.fertilizerLevel * 0.05)) * global.weatherMultiplier);
   const totalCost = view.simulatedPlots * crop.seedCost;
   const totalHarvest = view.simulatedPlots * yieldPerPlot;
   const profit = totalHarvest * price - totalCost;
@@ -1380,7 +1400,7 @@ function codexPayload(
     .setDescription(
       `Pousse : ${progressBar((crop.growMinutes / 60) * 100)} (${crop.growMinutes} min)\n` +
         `${tier.emoji} Palier ${tier.name} · niveau ${crop.unlockLevel}\n` +
-        `Météo actuelle : ${weatherLine(store)}\n\n` +
+        `Météo actuelle : ${weatherLineForGlobal(global)}\n\n` +
         (feedback ? `**${feedback}**` : ""),
     )
     .addFields(
@@ -1391,7 +1411,7 @@ function codexPayload(
       { name: "RENDEMENT", value: `${yieldPerPlot} / parcelle`, inline: true },
       { name: invisible, value: invisible },
       { name: "XP GAGNÉE", value: `${crop.xp}`, inline: true },
-      { name: "MARCHÉ", value: `×${store.global.marketMultiplier.toFixed(2)}`, inline: true },
+      { name: "MARCHÉ", value: `×${global.marketMultiplier.toFixed(2)}`, inline: true },
       { name: invisible, value: invisible },
       {
         name: "Simulateur de récolte",
@@ -1493,19 +1513,131 @@ async function commandCodex(
     ],
     ephemeral: true,
   });
-  const player = store.getPlayer(interaction.user.id);
+  // LOT 6, bascule TEST-only pour /codex (slash command initiale
+  // UNIQUEMENT ici) : reutilise resolveFarmView telle quelle -- MEME forme
+  // exacte que /codex a besoin (PlayerState + GlobalState, lecture seule,
+  // bootstrap uniquement si necessaire), aucune raison de dupliquer un
+  // second resolver identique.
+  const { player, global } = await resolveFarmView(interaction.user.id, store);
   const view: CodexViewState = {
     userId: interaction.user.id,
     cropId: "wheat",
     filter: "all",
     simulatedPlots: player.plots.filter((plot) => plot.cropId === null).length,
   };
-  const payload = codexPayload(store, player, view);
+  const payload = codexPayload(global, player, view);
   const message = await channel.send({
     embeds: payload.embeds,
     components: payload.components,
   });
   codexViews.set(message.id, view);
+}
+
+// LOT 6, bascule TEST-only pour le bouton "Replantation auto" du Codex
+// UNIQUEMENT (voir postgresRuntimeAllowlist.ts) -- meme extraction
+// PURE-DEPS que les resolveXxx precedents. Reutilise toggleAutoReplant()
+// de ../farm.ts telle quelle (deja extraite pour remplacer ce meme bouton
+// et la route /activity/autoreplant, voir son commentaire dans farm.ts),
+// ainsi que togglePlayerAutoReplant() de db/farmPlayerActions.ts (deja
+// existante, jusqu'ici jamais appelee -- voir son commentaire de doc).
+// AVANT ce lot, le chemin V1 mutait `player` directement (getPlayer ->
+// mutation en place -> store.save() separe, SANS passer par
+// store.mutatePlayer()) -- corrige ici pour utiliser store.mutatePlayer(),
+// qui effectue exactement les MEMES etapes dans le MEME ordre (voir
+// store.ts : mutatePlayer = getPlayer -> mutator -> updatedAt -> save),
+// donc AUCUN changement de comportement observable, uniquement l'usage de
+// la methode partagee deja utilisee par toutes les autres commandes
+// migrees plutot qu'une reimplementation manuelle des memes etapes.
+export interface CodexReplantResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  togglePlayerAutoReplant: typeof togglePlayerAutoReplant;
+  getPlayer: typeof getPlayer;
+}
+
+const realCodexReplantResolutionDeps: CodexReplantResolutionDeps = {
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  togglePlayerAutoReplant,
+  getPlayer,
+};
+
+/**
+ * Decide quel backend utiliser pour le bouton "Replantation auto" du Codex
+ * et retourne l'etat complet du joueur apres bascule, SANS jamais toucher
+ * a la reponse Discord. Un joueur allowliste passe EXCLUSIVEMENT par le
+ * bootstrap PUIS la bascule cote Postgres (togglePlayerAutoReplant, jamais
+ * store.mutatePlayer ni store.save), puis une relecture read-only via le
+ * repository. Un joueur non allowliste (cas par defaut) suit
+ * store.mutatePlayer() + toggleAutoReplant().
+ */
+export async function resolveCodexReplant(
+  playerId: string,
+  store: FarmStore,
+  deps: CodexReplantResolutionDeps = realCodexReplantResolutionDeps,
+): Promise<{ player: PlayerState }> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    await deps.ensurePlayerExists(playerId);
+    await deps.togglePlayerAutoReplant(playerId);
+    const player = await deps.getPlayer(playerId);
+    if (!player) {
+      throw new Error(`resolveCodexReplant : joueur "${playerId}" introuvable apres bascule -- etat incoherent.`);
+    }
+    return { player };
+  }
+  const player = await store.mutatePlayer(playerId, (p) => {
+    toggleAutoReplant(p);
+  });
+  return { player };
+}
+
+// LOT 6, bascule TEST-only pour le bouton "Actualiser le prix" du Codex
+// UNIQUEMENT -- categorie GLOBAL-ONLY (aucune donnee Player impliquee,
+// meme famille que resolveMarket/resolveContract). Reutilise
+// enrichGlobalState() de ../farm.ts telle quelle, via
+// enrichGlobalStateInPostgres() (db/farmPlayerActions.ts), qui verrouille
+// et ecrit via mutateGlobalState() -- primitive DEJA existante et DEJA
+// documentee comme destinee a recevoir exactement cette fonction, aucune
+// nouvelle regle metier de marche/meteo/contrat/defi n'est introduite ici.
+// N'accepte meme pas ensurePlayerExists/getPlayer dans ses deps -- aucun
+// bootstrap joueur possible pour cette action, qui ne touche jamais de
+// PlayerState.
+export interface CodexRefreshResolutionDeps {
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  enrichGlobalStateInPostgres: typeof enrichGlobalStateInPostgres;
+}
+
+const realCodexRefreshResolutionDeps: CodexRefreshResolutionDeps = {
+  shouldUsePostgresRuntime,
+  enrichGlobalStateInPostgres,
+};
+
+export interface CodexRefreshResolutionResult {
+  global: GlobalState;
+  changed: boolean;
+}
+
+/**
+ * Decide quel backend utiliser pour le bouton "Actualiser le prix" du
+ * Codex et retourne le GlobalState complet apres tentative d'actualisation
+ * PLUS le booleen `changed` (pour reproduire le message de feedback V1),
+ * SANS jamais toucher a la reponse Discord. Un joueur allowliste lit
+ * EXCLUSIVEMENT et ecrit EXCLUSIVEMENT via Postgres
+ * (enrichGlobalStateInPostgres) -- jamais store.global/store.save() (JSON).
+ * Un joueur non allowliste (cas par defaut) suit EXACTEMENT le chemin V1 :
+ * enrichGlobalState(store.global) puis store.save() si change.
+ */
+export async function resolveCodexRefresh(
+  playerId: string,
+  store: FarmStore,
+  deps: CodexRefreshResolutionDeps = realCodexRefreshResolutionDeps,
+): Promise<CodexRefreshResolutionResult> {
+  if (deps.shouldUsePostgresRuntime(playerId)) {
+    return deps.enrichGlobalStateInPostgres();
+  }
+  const changed = enrichGlobalState(store.global);
+  if (changed) await store.save();
+  return { global: store.global, changed };
 }
 
 export async function handleCodexComponent(
@@ -1520,13 +1652,37 @@ export async function handleCodexComponent(
       await interaction.reply({ embeds: [embedError(new FarmError("Ce Codex appartient à un autre joueur."))], ephemeral: true });
       return;
     }
+    // DIAGNOSTIC TEMPORAIRE (bug reel signale : Discord affiche "ON" apres
+    // clic sur "Replantation auto" mais Neon persiste auto_replant=false --
+    // hypothese a verifier : double invocation de ce handler pour un seul
+    // clic). Instrumentation UNIQUEMENT -- aucune logique metier modifiee,
+    // aucun debounce/garde-fou ajoute, le toggle et les transactions
+    // restent strictement inchanges. Scope volontairement limite au
+    // customId "codex:replant" (jamais culture/filter/plant/refresh/plots) :
+    // replantInvocationId reste `null` pour toute autre action, donc aucun
+    // des logs ci-dessous ne s'execute en dehors de ce chemin precis. A
+    // RETIRER une fois la cause du bug confirmee.
+    const replantInvocationId = parts[1] === "replant" ? randomUUID() : null;
+    if (replantInvocationId) {
+      // customId masque : "codex:replant:<userId>" -> "codex:replant:***"
+      // (le playerId Discord n'est jamais logge en clair).
+      const maskedCustomId = `${parts.slice(0, -1).join(":")}:***`;
+      logger.info(
+        { invocationId: replantInvocationId, at: Date.now(), customId: maskedCustomId },
+        "[DIAG codex:replant] handler start",
+      );
+    }
+    // LOT 6, bascule TEST-only pour /codex : reutilise resolveFarmView
+    // telle quelle (meme lecture player+global qu'a besoin chaque branche
+    // de ce handler, mutatrice ou non -- codexPayload() a TOUJOURS besoin
+    // des deux, quelle que soit l'action declenchee).
+    let { player, global } = await resolveFarmView(userId, store);
     const view = codexViews.get(interaction.message.id) ?? {
       userId,
       cropId: "wheat" as CropId,
       filter: "all",
-      simulatedPlots: store.getPlayer(userId).plots.filter((plot) => plot.cropId === null).length,
+      simulatedPlots: player.plots.filter((plot) => plot.cropId === null).length,
     };
-    const player = store.getPlayer(userId);
     let feedback: string | undefined;
     if (interaction.isStringSelectMenu()) {
       if (parts[1] === "culture") view.cropId = cropIdFrom(interaction.values[0] ?? "wheat");
@@ -1536,25 +1692,49 @@ export async function handleCodexComponent(
         if (!options.some((crop) => crop.id === view.cropId)) view.cropId = options[0]?.id ?? "wheat";
       }
     } else if (parts[1] === "plant") {
-      const plot = plant(player, view.cropId, null);
-      player.updatedAt = Date.now();
-      await store.save();
-      feedback = `Culture plantée sur la parcelle ${plot}.`;
+      // Reutilise resolvePlantCrop telle quelle -- MEME primitive que la
+      // slash command /plant deja migree (requestedPlot=null, comme le
+      // bouton l'a toujours fait), aucune logique dupliquee.
+      const result = await resolvePlantCrop(userId, view.cropId, null, store);
+      player = result.player;
+      feedback = `Culture plantée sur la parcelle ${result.plantedPlot}.`;
     } else if (parts[1] === "refresh") {
-      const changed = enrichGlobalState(store.global);
-      if (changed) await store.save();
-      feedback = changed ? "Prix et événements actualisés." : "Prix déjà à jour.";
+      const result = await resolveCodexRefresh(userId, store);
+      global = result.global;
+      feedback = result.changed ? "Prix et événements actualisés." : "Prix déjà à jour.";
     } else if (parts[1] === "plots") {
       const freePlots = player.plots.filter((plot) => plot.cropId === null).length;
       view.simulatedPlots = Math.max(0, Math.min(freePlots, view.simulatedPlots + (parts[2] === "up" ? 1 : -1)));
     } else if (parts[1] === "replant") {
-      player.autoReplant = !player.autoReplant;
-      player.updatedAt = Date.now();
-      await store.save();
+      // DIAGNOSTIC TEMPORAIRE -- voir commentaire ci-dessus. "before
+      // toggle"/"after toggle" bracket l'appel a resolveCodexReplant (qui
+      // appelle togglePlayerAutoReplant en interne cote allowliste) plutot
+      // que de modifier la signature/le corps de resolveCodexReplant lui-
+      // meme -- zero changement des resolveurs deja testes.
+      if (replantInvocationId) {
+        logger.info({ invocationId: replantInvocationId }, "[DIAG codex:replant] before toggle");
+      }
+      const result = await resolveCodexReplant(userId, store);
+      player = result.player;
       feedback = `Replantation automatique ${player.autoReplant ? "activée" : "désactivée"}.`;
+      if (replantInvocationId) {
+        logger.info(
+          { invocationId: replantInvocationId, autoReplant: player.autoReplant },
+          "[DIAG codex:replant] after toggle",
+        );
+      }
+    }
+    if (replantInvocationId) {
+      logger.info(
+        { invocationId: replantInvocationId, autoReplant: player.autoReplant },
+        "[DIAG codex:replant] before interaction.update",
+      );
     }
     codexViews.set(interaction.message.id, view);
-    await interaction.update(codexPayload(store, player, view, feedback));
+    await interaction.update(codexPayload(global, player, view, feedback));
+    if (replantInvocationId) {
+      logger.info({ invocationId: replantInvocationId }, "[DIAG codex:replant] handler end");
+    }
   } catch (error) {
     await replyError(interaction, error);
   }

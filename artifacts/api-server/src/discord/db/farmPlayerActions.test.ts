@@ -508,12 +508,11 @@ test("sellPlayerItems : aucune ressource a vendre => FarmError propagee telle qu
   await assert.rejects(() => sellPlayerItems(TEST_PLAYER_ID, "wheat", null, deps), FarmError);
 });
 
-test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/sharedStore.ts, ni mutateGlobalState (mutatePlayerAndGlobal est desormais attendue, pour harvestPlayerCrops -- LOT 6)", async () => {
+test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/sharedStore.ts ; mutatePlayerAndGlobal (harvestPlayerCrops) ET mutateGlobalState (enrichGlobalStateInPostgres, bouton codex 'Actualiser') sont desormais toutes deux attendues -- LOT 6", async () => {
   const filePath = new URL("./farmPlayerActions.ts", import.meta.url);
   const source = await readFile(filePath, "utf8");
-  // Seules les lignes d'import (et non les commentaires explicatifs, qui
-  // citent volontairement FarmStore/mutateGlobalState pour documenter
-  // pourquoi ce fichier ne les utilise pas) sont examinees.
+  // Seules les lignes d'import (et non les commentaires explicatifs) sont
+  // examinees.
   const importLines = source
     .split("\n")
     .filter((line) => /^\s*import\b/.test(line))
@@ -523,6 +522,6 @@ test("farmPlayerActions.ts n'importe ni FarmStore/getFarmStore, ni store.ts/shar
   assert.ok(!/getFarmStore/.test(importLines), "aucun import de getFarmStore attendu");
   assert.ok(!/from ["']\.\/store/.test(importLines), "aucun import de ./store attendu");
   assert.ok(!/from ["']\.\/sharedStore/.test(importLines), "aucun import de ./sharedStore attendu");
-  assert.ok(!/mutateGlobalState/.test(importLines), "mutateGlobalState (sans lien avec un joueur) n'est pas necessaire ici et ne doit pas etre importe");
   assert.ok(/mutatePlayerAndGlobal/.test(importLines), "mutatePlayerAndGlobal DOIT desormais etre importe (harvestPlayerCrops, LOT 6)");
+  assert.ok(/mutateGlobalState/.test(importLines), "mutateGlobalState DOIT desormais etre importe (enrichGlobalStateInPostgres, bouton codex 'Actualiser', LOT 6)");
 });

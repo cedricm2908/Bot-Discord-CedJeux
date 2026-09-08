@@ -29,6 +29,7 @@ import {
   claimDaily,
   claimQuest,
   craft,
+  enrichGlobalState,
   FarmError,
   harvest,
   plant,
@@ -37,7 +38,7 @@ import {
   type HarvestResult,
   type SellResult,
 } from "../farm.ts";
-import { getGlobalState, mutatePlayer, mutatePlayerAndGlobal } from "./farmRepository.ts";
+import { getGlobalState, mutateGlobalState, mutatePlayer, mutatePlayerAndGlobal } from "./farmRepository.ts";
 import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId, WeatherKey } from "../types";
 
 // Dependances injectables -- meme convention que FarmRepositoryDeps/
@@ -288,4 +289,46 @@ export async function sellPlayerItems(
     result = sell(player, global, itemId, requestedAmount);
   });
   return { result: result!, global };
+}
+
+// Dependances injectables dediees a enrichGlobalStateInPostgres() -- separees
+// de FarmPlayerActionsDeps (qui n'expose que mutatePlayer/getGlobalState) car
+// cette action ne touche JAMAIS de joueur, uniquement mutateGlobalState().
+export interface EnrichGlobalStateDeps {
+  mutateGlobalState: typeof mutateGlobalState;
+}
+
+const realEnrichGlobalStateDeps: EnrichGlobalStateDeps = { mutateGlobalState };
+
+export interface EnrichGlobalStateResult {
+  global: GlobalState;
+  changed: boolean;
+}
+
+/**
+ * LOT 6 (wiring /codex, bouton "Actualiser"). Reutilise enrichGlobalState()
+ * de ../farm.ts telle quelle -- aucune regle de marche/meteo/contrat/defi
+ * quotidien n'est dupliquee ici. `mutateGlobalState()` (farmRepository.ts)
+ * verrouille global_state + contract + daily_challenge dans UNE SEULE
+ * transaction et est explicitement documentee comme destinee a recevoir
+ * exactement `(global) => enrichGlobalState(global)` -- c'est le seul appel
+ * fait ici. Retourne le GlobalState complet apres mutation (meme etat
+ * verrouille/relu que celui ecrit, jamais une lecture separee) PLUS le
+ * booleen `changed` (capture de la valeur de retour de enrichGlobalState(),
+ * qui `mutateGlobalState()` lui-meme ignore puisqu'il attend un mutator
+ * void) -- necessaire pour reproduire le message de feedback V1 ("Prix et
+ * evenements actualises." vs "Prix deja a jour."), sans quoi l'appelant
+ * n'aurait aucun moyen de savoir si quelque chose a reellement change.
+ * Aucune ecriture si rien n'est du (mutateGlobalState() re-verifie les
+ * memes conditions d'echeance que enrichGlobalState() sous le verrou avant
+ * toute ecriture -- pas de mutation inutile).
+ */
+export async function enrichGlobalStateInPostgres(
+  deps: EnrichGlobalStateDeps = realEnrichGlobalStateDeps,
+): Promise<EnrichGlobalStateResult> {
+  let changed = false;
+  const global = await deps.mutateGlobalState((globalState) => {
+    changed = enrichGlobalState(globalState);
+  });
+  return { global, changed };
 }

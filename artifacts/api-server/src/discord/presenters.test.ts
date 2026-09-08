@@ -23,6 +23,8 @@ import {
   commandSkipsJsonPreamble,
   handleSlashCommand,
   resolveBuyUpgrade,
+  resolveCodexRefresh,
+  resolveCodexReplant,
   resolveCraftItem,
   resolveDailyClaim,
   resolveContract,
@@ -36,6 +38,8 @@ import {
   resolveSellItems,
   resolveWeekly,
   type BuyResolutionDeps,
+  type CodexRefreshResolutionDeps,
+  type CodexReplantResolutionDeps,
   type ContractResolutionDeps,
   type CraftResolutionDeps,
   type DailyResolutionDeps,
@@ -2382,87 +2386,413 @@ test("resolveWeekly L. ensurePlayerExists et getGlobalState NE SONT PAS acceptes
 });
 
 // ===========================================================================
-// H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
-// EXACTEMENT 14 fois (le garde-fou de preambule + resolveBuyUpgrade +
-// resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
-// resolveHarvestCrops + resolveSellItems + resolveInventory +
-// resolveFarmView + resolveProfile + resolveMarket + resolveContract +
-// resolveLeaderboard + resolveWeekly) ; ensurePlayerExists EXACTEMENT 9
-// fois -- INCHANGE depuis /profile, ce qui PROUVE que ni resolveMarket()
-// ni resolveContract() ni resolveLeaderboard() ni resolveWeekly()
-// n'appellent jamais ensurePlayerExists (resolveBuyUpgrade +
-// resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
-// resolveHarvestCrops + resolveSellItems + resolveInventory +
-// resolveFarmView + resolveProfile) ; buyPlayerUpgrade, claimPlayerDaily,
-// plantPlayerCrop, craftPlayerItem, harvestPlayerCrops et sellPlayerItems
-// EXACTEMENT 1 fois chacun (leur seule fonction de resolution respective).
-// deps.getPlayer( (le repository, pas store.getPlayer) EXACTEMENT 4 fois --
-// INCHANGE depuis /profile, ce qui PROUVE que ni resolveMarket() ni
-// resolveContract() ni resolveLeaderboard() ni resolveWeekly() n'appellent
-// jamais deps.getPlayer non plus (resolvePlantCrop + resolveInventory +
-// resolveFarmView + resolveProfile) ; deps.getGlobalState( EXACTEMENT 6
-// fois -- INCHANGE depuis /leaderboard, ce qui PROUVE que resolveWeekly()
-// n'appelle jamais deps.getGlobalState non plus (resolveInventory +
-// resolveFarmView + resolveProfile + resolveMarket + resolveContract +
-// resolveLeaderboard) ; deps.getAllPlayers( EXACTEMENT 2 fois
-// (resolveLeaderboard + resolveWeekly). Preuve automatisee (lecture du
-// fichier source, meme technique que les tests transversaux existants de
-// farmRepository.test.ts/farmPlayerActions.test.ts) qu'aucune autre
-// commande (/codex, etc.) n'a ete branchee sur Postgres par erreur, et que
-// /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm,
-// /profile, /market, /contract, /leaderboard et /weekly sont desormais les
-// TREIZE SEULS chemins Postgres.
+// resolveCodexReplant/resolveCodexRefresh -- LOT 6, dernier branchement
+// (/codex). /codex initial (slash command) et son bouton "Planter"
+// reutilisent respectivement resolveFarmView et resolvePlantCrop TELS
+// QUELS (deja testes ailleurs dans ce fichier, aucun test redondant ici).
+// Seuls DEUX nouveaux resolveurs sont introduits : resolveCodexReplant
+// (bouton "Replantation auto", PLAYER-ONLY) et resolveCodexRefresh (bouton
+// "Actualiser le prix", GLOBAL-ONLY, meme famille que resolveMarket/
+// resolveContract). Les boutons "culture"/"filter"/"plots" restent de la
+// vue pure (aucun store touche, testes structurellement plus bas).
 // ===========================================================================
 
-test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/sellPlayerItems/getPlayer/getGlobalState/getAllPlayers n'ont que les sites d'appel attendus, aucune autre commande", async () => {
+function buildCodexReplantDeps(overrides: Partial<CodexReplantResolutionDeps> = {}): CodexReplantResolutionDeps {
+  return {
+    shouldUsePostgresRuntime: () => false,
+    ensurePlayerExists: async (playerId: string) => ({ player: buildPlayerState({ userId: playerId }), created: false }),
+    togglePlayerAutoReplant: async () => true,
+    getPlayer: async (playerId: string) => buildPlayerState({ userId: playerId }),
+    ...overrides,
+  };
+}
+
+test("resolveCodexReplant A. joueur non allowliste : utilise store.mutatePlayer, jamais ensurePlayerExists/togglePlayerAutoReplant/deps.getPlayer, meme regle V1 (toggleAutoReplant reel de farm.ts)", async () => {
+  const player = buildPlayerState({ autoReplant: false });
+  const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    mutator(player);
+    return player;
+  });
+  const store = buildFakeStore(mutatePlayer as unknown as FarmStore["mutatePlayer"]);
+  const ensurePlayerExists = mock.fn(async () => {
+    throw new Error("ensurePlayerExists ne doit jamais etre appele sur le chemin V1");
+  });
+  const togglePlayerAutoReplant = mock.fn(async () => {
+    throw new Error("togglePlayerAutoReplant ne doit jamais etre appele sur le chemin V1");
+  });
+  const getPlayer = mock.fn(async () => {
+    throw new Error("le repository getPlayer ne doit jamais etre appele sur le chemin V1");
+  });
+  const deps = buildCodexReplantDeps({ shouldUsePostgresRuntime: () => false, ensurePlayerExists, togglePlayerAutoReplant, getPlayer });
+
+  const result = await resolveCodexReplant(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(mutatePlayer.mock.calls.length, 1);
+  assert.equal(ensurePlayerExists.mock.calls.length, 0);
+  assert.equal(togglePlayerAutoReplant.mock.calls.length, 0);
+  assert.equal(getPlayer.mock.calls.length, 0);
+  // toggleAutoReplant() reel de farm.ts : bascule false -> true, regle V1 inchangee.
+  assert.equal(result.player.autoReplant, true);
+});
+
+test("resolveCodexReplant B. joueur allowliste existant : ensurePlayerExists + togglePlayerAutoReplant + deps.getPlayer avec le bon playerId, jamais store.mutatePlayer", async () => {
+  const mutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer ne doit jamais etre appele sur le chemin Postgres");
+  });
+  const store = buildFakeStore(mutatePlayer as unknown as FarmStore["mutatePlayer"]);
+  const ensurePlayerExists = mock.fn(async (playerId: string) => ({ player: buildPlayerState({ userId: playerId }), created: false }));
+  const togglePlayerAutoReplant = mock.fn(async (_playerId: string) => true);
+  const pgPlayer = buildPlayerState({ userId: TEST_PLAYER_ID, autoReplant: true });
+  const getPlayer = mock.fn(async () => pgPlayer);
+  const deps = buildCodexReplantDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, togglePlayerAutoReplant, getPlayer });
+
+  const result = await resolveCodexReplant(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(ensurePlayerExists.mock.calls.length, 1);
+  assert.equal(ensurePlayerExists.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(togglePlayerAutoReplant.mock.calls.length, 1);
+  assert.equal(togglePlayerAutoReplant.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(getPlayer.mock.calls.length, 1);
+  assert.equal(mutatePlayer.mock.calls.length, 0);
+  assert.equal(result.player, pgPlayer, "doit retourner exactement le PlayerState relu du repository Postgres");
+});
+
+test("resolveCodexReplant C. joueur allowliste absent : bootstrap (created=true) PUIS togglePlayerAutoReplant PUIS deps.getPlayer, aucun chemin JSON", async () => {
+  const mutatePlayer = mock.fn(async () => {
+    throw new Error("aucun chemin JSON attendu pour un joueur allowliste");
+  });
+  const store = buildFakeStore(mutatePlayer as unknown as FarmStore["mutatePlayer"]);
+  const callOrder: string[] = [];
+  const ensurePlayerExists = mock.fn(async (playerId: string) => {
+    callOrder.push("ensure");
+    return { player: buildPlayerState({ userId: playerId }), created: true };
+  });
+  const togglePlayerAutoReplant = mock.fn(async () => {
+    callOrder.push("toggle");
+    return true;
+  });
+  const getPlayer = mock.fn(async () => {
+    callOrder.push("getPlayer");
+    return buildPlayerState({ userId: TEST_PLAYER_ID });
+  });
+  const deps = buildCodexReplantDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, togglePlayerAutoReplant, getPlayer });
+
+  await resolveCodexReplant(TEST_PLAYER_ID, store, deps);
+
+  assert.deepEqual(callOrder, ["ensure", "toggle", "getPlayer"]);
+  assert.equal(mutatePlayer.mock.calls.length, 0);
+});
+
+test("resolveCodexReplant D. source Postgres differente du JSON : le resultat correspond uniquement au Postgres, preuve qu'aucun melange des deux sources n'est possible", async () => {
+  const jsonPlayer = buildPlayerState({ autoReplant: false });
+  const mutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    mutator(jsonPlayer);
+    return jsonPlayer;
+  });
+  const store = buildFakeStore(mutatePlayer as unknown as FarmStore["mutatePlayer"]);
+  const pgPlayer = buildPlayerState({ userId: TEST_PLAYER_ID, autoReplant: true });
+
+  const v1 = await resolveCodexReplant(TEST_PLAYER_ID, store, buildCodexReplantDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveCodexReplant(
+    TEST_PLAYER_ID,
+    store,
+    buildCodexReplantDeps({ shouldUsePostgresRuntime: () => true, getPlayer: async () => pgPlayer }),
+  );
+
+  assert.equal(v1.player, jsonPlayer);
+  assert.equal(pg.player, pgPlayer);
+});
+
+test("resolveCodexReplant E. reproduction du bug signale (UI Discord ON / Neon auto_replant=false) : DB initiale autoReplant=false -> toggle -> lecture suivante DOIT refleter exactement l'ecriture, aucun PlayerState pre-lu/stale n'est utilise pour l'affichage", async () => {
+  // Simule fidelement le contrat reel de mutatePlayer()/getPlayer() cote
+  // Postgres avec UNE SEULE 'ligne' partagee en memoire (jamais le meme
+  // objet reference expose a l'appelant -- chaque acces retourne une
+  // COPIE, exactement comme deux requetes SQL independantes le feraient) :
+  // togglePlayerAutoReplant() mute cette ligne (comme mutatePlayer() dans
+  // sa propre transaction reelle), PUIS getPlayer() la relit
+  // INDEPENDAMMENT. Si resolveCodexReplant() utilisait par erreur un
+  // player pre-lu/stale (lu AVANT la bascule, ou l'objet retourne par
+  // ensurePlayerExists) pour construire sa reponse plutot que le resultat
+  // de cette relecture post-toggle, ce test le detecterait immediatement.
+  let dbRow = buildPlayerState({ userId: TEST_PLAYER_ID, autoReplant: false });
+  const ensurePlayerExists = mock.fn(async (playerId: string) => ({ player: { ...dbRow, userId: playerId }, created: false }));
+  const togglePlayerAutoReplant = mock.fn(async (_playerId: string) => {
+    dbRow = { ...dbRow, autoReplant: !dbRow.autoReplant };
+    return dbRow.autoReplant;
+  });
+  const getPlayer = mock.fn(async (_playerId: string) => ({ ...dbRow }));
+  const deps = buildCodexReplantDeps({ shouldUsePostgresRuntime: () => true, ensurePlayerExists, togglePlayerAutoReplant, getPlayer });
+  const store = buildFakeStore(mock.fn(async () => {
+    throw new Error("store.mutatePlayer ne doit jamais etre appele sur le chemin Postgres");
+  }) as unknown as FarmStore["mutatePlayer"]);
+
+  const result = await resolveCodexReplant(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(dbRow.autoReplant, true, "la 'DB' partagee doit refleter la bascule (false -> true) apres togglePlayerAutoReplant");
+  assert.equal(
+    result.player.autoReplant,
+    true,
+    "resolveCodexReplant doit retourner exactement ce que la relecture post-toggle rapporte (true), jamais l'etat pre-toggle (false) ni l'objet retourne par ensurePlayerExists",
+  );
+  assert.notEqual(result.player, dbRow, "result.player doit provenir de la copie retournee par getPlayer(), jamais une reference partagee mutable");
+});
+
+function buildCodexRefreshDeps(overrides: Partial<CodexRefreshResolutionDeps> = {}): CodexRefreshResolutionDeps {
+  return {
+    shouldUsePostgresRuntime: () => false,
+    enrichGlobalStateInPostgres: async () => ({ global: buildGlobalState(), changed: false }),
+    ...overrides,
+  };
+}
+
+test("resolveCodexRefresh A. joueur non allowliste : utilise enrichGlobalState(store.global) + store.save() conditionnel, jamais deps.enrichGlobalStateInPostgres, meme chemin V1", async () => {
+  // marketUpdatedAt tres ancien (epoch 0) : garantit enrichGlobalState(...)
+  // === true de maniere deterministe (fonction reelle de farm.ts).
+  const globalState = defaultGlobalState(0);
+  const save = mock.fn(async () => {});
+  const store = { global: globalState, save } as unknown as FarmStore;
+  const enrichGlobalStateInPostgres = mock.fn(async () => {
+    throw new Error("enrichGlobalStateInPostgres ne doit jamais etre appele sur le chemin V1");
+  });
+  const deps = buildCodexRefreshDeps({ shouldUsePostgresRuntime: () => false, enrichGlobalStateInPostgres });
+
+  const result = await resolveCodexRefresh(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(enrichGlobalStateInPostgres.mock.calls.length, 0);
+  assert.equal(save.mock.calls.length, 1, "le marche est du (epoch 0) : store.save() doit etre appele, meme regle V1");
+  assert.equal(result.changed, true);
+  assert.equal(result.global, globalState);
+});
+
+test("resolveCodexRefresh B. joueur non allowliste, rien a actualiser : store.save() jamais appele, meme regle V1", async () => {
+  // Construit avec Date.now() (pas NOW, un timestamp fixe passe) : garantit
+  // qu'aucun intervalle (marche/meteo/contrat/defi) n'est du au moment ou
+  // enrichGlobalState(...) tourne reellement (son propre `now` par defaut).
+  const globalState = defaultGlobalState(Date.now());
+  const save = mock.fn(async () => {});
+  const store = { global: globalState, save } as unknown as FarmStore;
+  const deps = buildCodexRefreshDeps({ shouldUsePostgresRuntime: () => false });
+
+  const result = await resolveCodexRefresh(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(save.mock.calls.length, 0, "rien n'est du : aucune ecriture JSON attendue");
+  assert.equal(result.changed, false);
+});
+
+test("resolveCodexRefresh C. joueur allowliste : utilise deps.enrichGlobalStateInPostgres (Postgres) uniquement, jamais store.global/store.save, aucune mutation JSON", async () => {
+  const save = mock.fn(async () => {});
+  const store = { global: buildGlobalState(), save } as unknown as FarmStore;
+  const pgGlobal = buildGlobalState({ marketMultiplier: 1.5 });
+  const enrichGlobalStateInPostgres = mock.fn(async () => ({ global: pgGlobal, changed: true }));
+  const deps = buildCodexRefreshDeps({ shouldUsePostgresRuntime: () => true, enrichGlobalStateInPostgres });
+
+  const result = await resolveCodexRefresh(TEST_PLAYER_ID, store, deps);
+
+  assert.equal(enrichGlobalStateInPostgres.mock.calls.length, 1);
+  assert.equal(save.mock.calls.length, 0, "aucune ecriture JSON attendue cote Postgres");
+  assert.equal(result.global, pgGlobal, "doit retourner exactement le GlobalState Postgres, jamais store.global");
+  assert.equal(result.changed, true);
+});
+
+test("resolveCodexRefresh D. source Postgres differente du JSON : le resultat correspond uniquement au Postgres, preuve qu'aucun melange des deux sources n'est possible", async () => {
+  const jsonGlobal = buildGlobalState({ marketMultiplier: 1 });
+  const store = { global: jsonGlobal, save: async () => {} } as unknown as FarmStore;
+  const pgGlobal = buildGlobalState({ marketMultiplier: 2 });
+
+  const v1 = await resolveCodexRefresh(TEST_PLAYER_ID, store, buildCodexRefreshDeps({ shouldUsePostgresRuntime: () => false }));
+  const pg = await resolveCodexRefresh(
+    TEST_PLAYER_ID,
+    store,
+    buildCodexRefreshDeps({ shouldUsePostgresRuntime: () => true, enrichGlobalStateInPostgres: async () => ({ global: pgGlobal, changed: false }) }),
+  );
+
+  assert.equal(v1.global, jsonGlobal);
+  assert.equal(pg.global, pgGlobal);
+});
+
+test("resolveCodexRefresh E. /codex refresh est GLOBAL-ONLY : ensurePlayerExists/getPlayer n'existent meme pas dans CodexRefreshResolutionDeps, aucun bootstrap joueur possible", async () => {
+  const deps = buildCodexRefreshDeps({ shouldUsePostgresRuntime: () => true, enrichGlobalStateInPostgres: async () => ({ global: buildGlobalState(), changed: false }) });
+
+  assert.ok(!("ensurePlayerExists" in deps), "CodexRefreshResolutionDeps ne doit jamais accepter ensurePlayerExists");
+  assert.ok(!("getPlayer" in deps), "CodexRefreshResolutionDeps ne doit jamais accepter getPlayer");
+  assert.ok(!("getGlobalState" in deps), "CodexRefreshResolutionDeps ne doit jamais accepter getGlobalState (le verrou/relecture vit dans mutateGlobalState(), via enrichGlobalStateInPostgres)");
+
+  await resolveCodexRefresh(TEST_PLAYER_ID, { global: buildGlobalState(), save: async () => {} } as unknown as FarmStore, deps);
+});
+
+// ===========================================================================
+// handleCodexComponent -- audit structurel (source-scan, meme technique que
+// resolveProfile H / resolveWeekly K) : /codex initial et son bouton
+// "Planter" reutilisent resolveFarmView/resolvePlantCrop TELS QUELS (aucune
+// duplication de logique), et handleCodexComponent lui-meme ne doit JAMAIS
+// muter le store directement (ni store.mutatePlayer, ni store.save, ni
+// mutation en place de `player`/`enrichGlobalState(store.global)`) -- toute
+// mutation vit exclusivement dans les resolveurs qu'il appelle. Preuve
+// egalement que chaque appel mutateur (plant/replant/refresh) ne recoit
+// QUE `userId`/`store` (et cropId pour plant) en argument -- jamais le
+// `player`/`global` deja lus plus haut -- ce qui garantit que deux
+// interactions concurrentes ne partent jamais d'un etat pre-lu perime :
+// chaque resolveur relit/verrouille sa propre transaction depuis zero.
+// ===========================================================================
+
+test("handleCodexComponent : reutilise resolveFarmView/resolvePlantCrop/resolveCodexReplant/resolveCodexRefresh, ne mute jamais le store directement lui-meme", async () => {
+  const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
+  const handlerStart = source.indexOf("export async function handleCodexComponent(");
+  assert.ok(handlerStart >= 0, "handleCodexComponent doit exister");
+  const handlerBody = source.slice(handlerStart);
+
+  for (const reused of ["resolveFarmView(", "resolvePlantCrop(", "resolveCodexReplant(", "resolveCodexRefresh("]) {
+    assert.ok(handlerBody.includes(reused), `handleCodexComponent doit reutiliser ${reused}`);
+  }
+  for (const forbidden of ["store.mutatePlayer(", "store.save(", "enrichGlobalState(store.global)", "player.autoReplant =", "await plant("]) {
+    assert.ok(!handlerBody.includes(forbidden), `handleCodexComponent ne doit jamais referencer ${forbidden} directement -- toute mutation vit dans les resolveurs`);
+  }
+});
+
+test("handleCodexComponent : les appels mutateurs (plant/replant/refresh) ne recoivent jamais le player/global deja lus en argument (chaque resolveur relit sa propre transaction, aucun etat perime partage entre interactions concurrentes)", async () => {
+  const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
+  const handlerStart = source.indexOf("export async function handleCodexComponent(");
+  const handlerBody = source.slice(handlerStart);
+
+  assert.ok(
+    /resolvePlantCrop\(userId, view\.cropId, null, store\)/.test(handlerBody),
+    "resolvePlantCrop doit etre appele avec (userId, view.cropId, null, store) uniquement, jamais un player/global pre-lu",
+  );
+  assert.ok(
+    /resolveCodexReplant\(userId, store\)/.test(handlerBody),
+    "resolveCodexReplant doit etre appele avec (userId, store) uniquement, jamais un player pre-lu",
+  );
+  assert.ok(
+    /resolveCodexRefresh\(userId, store\)/.test(handlerBody),
+    "resolveCodexRefresh doit etre appele avec (userId, store) uniquement, jamais un global pre-lu",
+  );
+});
+
+// ===========================================================================
+// DIAGNOSTIC TEMPORAIRE (bug reel /codex replant) -- instrumentation
+// uniquement, aucune logique metier modifiee. Ce test verifie
+// structurellement (source-scan, meme technique que les tests
+// anti-divergence) que l'instrumentation est correctement bornee au
+// customId "codex:replant" et ne fuit jamais le playerId en clair -- il ne
+// remplace PAS les tests comportementaux existants ci-dessus (deja tous
+// verts avec cette instrumentation en place, preuve qu'elle n'altere rien).
+// A RETIRER avec l'instrumentation elle-meme une fois la cause confirmee.
+// ===========================================================================
+
+test("handleCodexComponent : instrumentation diagnostique temporaire (codex:replant) correctement bornee -- jamais de customId non masque, jamais declenchee pour culture/filter/plant/refresh/plots", async () => {
+  const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
+  const handlerStart = source.indexOf("export async function handleCodexComponent(");
+  const handlerBody = source.slice(handlerStart);
+
+  assert.ok(handlerBody.includes("randomUUID()"), "un invocationId doit etre genere");
+  assert.ok(handlerBody.includes('parts[1] === "replant" ? randomUUID() : null'), "l'invocationId ne doit exister QUE pour le customId codex:replant, jamais pour les autres actions");
+  assert.ok(handlerBody.includes("logger.info"), "le logger existant du projet doit etre reutilise, jamais console.log");
+  assert.ok(!handlerBody.includes("console.log"), "aucun console.log ne doit etre utilise, uniquement le logger du projet");
+  assert.ok(!/customId:\s*interaction\.customId/.test(handlerBody), "le customId brut (qui contient le playerId Discord) ne doit jamais etre logge tel quel, uniquement masque");
+  assert.ok(handlerBody.includes('`:***`') === false && handlerBody.includes(':***`'), "le customId logge doit etre masque (userId remplace par ***)");
+
+  const logCallCount = (handlerBody.match(/logger\.info\(/g) ?? []).length;
+  assert.equal(logCallCount, 5, "exactement 5 sites d'appel logger.info attendus : start, before toggle, after toggle, before update, end");
+});
+
+// ===========================================================================
+// H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
+// EXACTEMENT 16 fois (le garde-fou de preambule + resolveBuyUpgrade +
+// resolveDailyClaim + resolvePlantCrop + resolveCraftItem +
+// resolveHarvestCrops + resolveSellItems + resolveInventory +
+// resolveFarmView + resolveProfile + resolveMarket + resolveContract +
+// resolveLeaderboard + resolveWeekly + resolveCodexReplant +
+// resolveCodexRefresh) ; ensurePlayerExists EXACTEMENT 10 fois -- +1 depuis
+// /weekly (resolveCodexReplant, seul nouveau resolveur de ce lot a
+// bootstrapper un joueur -- resolveCodexRefresh est GLOBAL-ONLY, aucun
+// bootstrap) : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop +
+// resolveCraftItem + resolveHarvestCrops + resolveSellItems +
+// resolveInventory + resolveFarmView + resolveProfile + resolveCodexReplant
+// (ni resolveMarket, ni resolveContract, ni resolveLeaderboard, ni
+// resolveWeekly, ni resolveCodexRefresh) ; buyPlayerUpgrade,
+// claimPlayerDaily, plantPlayerCrop, craftPlayerItem, harvestPlayerCrops et
+// sellPlayerItems EXACTEMENT 1 fois chacun (leur seule fonction de
+// resolution respective, resolveCodexPlant reutilisant resolvePlantCrop
+// directement plutot que dupliquer plantPlayerCrop). deps.getPlayer( (le
+// repository, pas store.getPlayer) EXACTEMENT 5 fois -- +1 depuis /weekly
+// (resolveCodexReplant) : resolvePlantCrop + resolveInventory +
+// resolveFarmView + resolveProfile + resolveCodexReplant ; deps.getGlobalState(
+// EXACTEMENT 6 fois -- INCHANGE depuis /leaderboard, ce qui PROUVE que
+// resolveCodexRefresh n'appelle jamais deps.getGlobalState (le
+// verrou/relecture vit dans mutateGlobalState(), via
+// enrichGlobalStateInPostgres) : resolveInventory + resolveFarmView +
+// resolveProfile + resolveMarket + resolveContract + resolveLeaderboard ;
+// deps.getAllPlayers( EXACTEMENT 2 fois -- INCHANGE (resolveLeaderboard +
+// resolveWeekly, /codex n'en a pas besoin) ; deps.togglePlayerAutoReplant(
+// EXACTEMENT 1 fois (resolveCodexReplant) ; deps.enrichGlobalStateInPostgres(
+// EXACTEMENT 1 fois (resolveCodexRefresh). Preuve automatisee (lecture du
+// fichier source, meme technique que les tests transversaux existants de
+// farmRepository.test.ts/farmPlayerActions.test.ts) qu'aucune autre
+// commande n'a ete branchee sur Postgres par erreur, et que /buy, /daily,
+// /plant, /craft, /harvest, /sell, /inventory, /farm, /profile, /market,
+// /contract, /leaderboard, /weekly et /codex (toutes les slash commands
+// Farm2Win) sont desormais les QUATORZE chemins Postgres.
+// ===========================================================================
+
+test("presenters.ts : shouldUsePostgresRuntime/ensurePlayerExists/buyPlayerUpgrade/claimPlayerDaily/plantPlayerCrop/craftPlayerItem/harvestPlayerCrops/sellPlayerItems/getPlayer/getGlobalState/getAllPlayers/togglePlayerAutoReplant/enrichGlobalStateInPostgres n'ont que les sites d'appel attendus, aucune autre commande", async () => {
   const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
   const countCalls = (name: string) => (source.match(new RegExp(`${name}\\(`, "g")) ?? []).length;
 
   assert.equal(
     countCalls("shouldUsePostgresRuntime"),
-    14,
-    "14 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard + resolveWeekly",
+    16,
+    "16 sites d'appel attendus : garde-fou de preambule + resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard + resolveWeekly + resolveCodexReplant + resolveCodexRefresh",
   );
   assert.equal(countCalls("harvestPlayerCrops"), 1, "un seul site d'appel attendu (resolveHarvestCrops)");
   assert.equal(countCalls("sellPlayerItems"), 1, "un seul site d'appel attendu (resolveSellItems)");
   assert.equal(
     countCalls("ensurePlayerExists"),
-    9,
-    "9 sites d'appel attendus, INCHANGE depuis /profile -- ni resolveMarket() ni resolveContract() ni resolveLeaderboard() ni resolveWeekly() n'appellent jamais ensurePlayerExists (resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile)",
+    10,
+    "10 sites d'appel attendus, +1 depuis /weekly (resolveCodexReplant, seul nouveau resolveur de /codex a bootstrapper un joueur) : resolveBuyUpgrade + resolveDailyClaim + resolvePlantCrop + resolveCraftItem + resolveHarvestCrops + resolveSellItems + resolveInventory + resolveFarmView + resolveProfile + resolveCodexReplant",
   );
   assert.equal(countCalls("buyPlayerUpgrade"), 1, "un seul site d'appel attendu (resolveBuyUpgrade)");
   assert.equal(countCalls("claimPlayerDaily"), 1, "un seul site d'appel attendu (resolveDailyClaim)");
-  assert.equal(countCalls("plantPlayerCrop"), 1, "un seul site d'appel attendu (resolvePlantCrop)");
+  assert.equal(countCalls("plantPlayerCrop"), 1, "un seul site d'appel attendu (resolvePlantCrop) -- le bouton codex 'Planter' reutilise resolvePlantCrop directement, jamais un second appel a plantPlayerCrop");
   assert.equal(countCalls("craftPlayerItem"), 1, "un seul site d'appel attendu (resolveCraftItem)");
   // "deps.getPlayer(" exclut deliberement "store.getPlayer(" (compte a part,
   // deja verifie test par test ci-dessus) -- seul le repository nous
   // interesse ici, pas la methode FarmStore preexistante.
   assert.equal(
     countCalls("deps.getPlayer"),
-    4,
-    "quatre sites d'appel du repository getPlayer attendus, INCHANGE depuis /profile -- ni resolveMarket() ni resolveContract() ni resolveLeaderboard() ni resolveWeekly() n'appellent jamais deps.getPlayer (resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile)",
+    5,
+    "cinq sites d'appel du repository getPlayer attendus, +1 depuis /weekly (resolveCodexReplant) : resolvePlantCrop + resolveInventory + resolveFarmView + resolveProfile + resolveCodexReplant",
   );
   assert.equal(
     countCalls("deps.getGlobalState"),
     6,
-    "six sites d'appel du repository getGlobalState attendus, INCHANGE depuis /leaderboard -- resolveWeekly() n'appelle jamais deps.getGlobalState (resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard)",
+    "six sites d'appel du repository getGlobalState attendus, INCHANGE depuis /leaderboard -- resolveCodexRefresh n'appelle jamais deps.getGlobalState (resolveInventory + resolveFarmView + resolveProfile + resolveMarket + resolveContract + resolveLeaderboard)",
   );
-  assert.equal(countCalls("deps.getAllPlayers"), 2, "deux sites d'appel du repository getAllPlayers attendus (resolveLeaderboard + resolveWeekly)");
+  assert.equal(countCalls("deps.getAllPlayers"), 2, "deux sites d'appel du repository getAllPlayers attendus, INCHANGE -- /codex n'en a pas besoin (resolveLeaderboard + resolveWeekly)");
+  assert.equal(countCalls("deps.togglePlayerAutoReplant"), 1, "un seul site d'appel attendu (resolveCodexReplant)");
+  assert.equal(countCalls("deps.enrichGlobalStateInPostgres"), 1, "un seul site d'appel attendu (resolveCodexRefresh)");
 });
 
 // ===========================================================================
 // I. Preambule enrichGlobalState/store.save() -- ne doit JAMAIS s'executer
 // pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm,
-// /profile, /market, /contract, /leaderboard ou /weekly d'un joueur
-// allowliste (aucune ecriture JSON), mais DOIT continuer a s'executer
-// exactement comme avant pour toute autre commande (V1 inchange).
-// commandSkipsJsonPreamble() est la decision PURE qui gouverne ce
-// garde-fou -- testee ici directement (aucune connexion DB necessaire).
-// handleSlashCommand("list") verifie separement, en bout en bout, qu'une
-// commande V1 declenche toujours reellement le preambule.
+// /profile, /market, /contract, /leaderboard, /weekly ou /codex d'un
+// joueur allowliste (aucune ecriture JSON), mais DOIT continuer a
+// s'executer exactement comme avant pour toute autre commande (V1
+// inchange). commandSkipsJsonPreamble() est la decision PURE qui gouverne
+// ce garde-fou -- testee ici directement (aucune connexion DB necessaire).
+// IMPORTANT : ce garde-fou ne gouverne QUE le preambule de
+// handleSlashCommand, donc UNIQUEMENT la slash command /codex elle-meme --
+// verifie a l'audit dedie, les composants (boutons/select-menus)
+// interactifs de /codex sont routes DIRECTEMENT depuis bot.ts vers
+// handleCodexComponent, jamais via handleSlashCommand, donc jamais via ce
+// preambule (ce Set n'a donc aucun effet sur eux, testes separement plus
+// haut). handleSlashCommand("list") verifie separement, en bout en bout,
+// qu'une commande V1 declenche toujours reellement le preambule -- "list"
+// est desormais la SEULE commande utilisee comme exemple V1 encore
+// intacte : toutes les slash commands Farm2Win sont a present migrees.
 // ===========================================================================
 
-test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm, /profile, /market, /contract, /leaderboard ou /weekly d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
+test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /craft, /harvest, /sell, /inventory, /farm, /profile, /market, /contract, /leaderboard, /weekly ou /codex d'un joueur allowliste, jamais pour une autre commande ni un joueur non allowliste", () => {
   const allowlisted = { shouldUsePostgresRuntime: () => true };
   const notAllowlisted = { shouldUsePostgresRuntime: () => false };
 
@@ -2479,6 +2809,7 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("contract", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("leaderboard", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("weekly", TEST_PLAYER_ID, allowlisted), true);
+  assert.equal(commandSkipsJsonPreamble("codex", TEST_PLAYER_ID, allowlisted), true);
   assert.equal(commandSkipsJsonPreamble("buy", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("daily", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("plant", TEST_PLAYER_ID, notAllowlisted), false);
@@ -2492,9 +2823,12 @@ test("commandSkipsJsonPreamble : true UNIQUEMENT pour /buy, /daily, /plant, /cra
   assert.equal(commandSkipsJsonPreamble("contract", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("leaderboard", TEST_PLAYER_ID, notAllowlisted), false);
   assert.equal(commandSkipsJsonPreamble("weekly", TEST_PLAYER_ID, notAllowlisted), false);
+  assert.equal(commandSkipsJsonPreamble("codex", TEST_PLAYER_ID, notAllowlisted), false);
   // Meme allowliste, une commande jamais branchee sur Postgres reste V1 --
   // le preambule doit continuer a s'executer pour elle, sans exception.
-  assert.equal(commandSkipsJsonPreamble("codex", TEST_PLAYER_ID, allowlisted), false);
+  // Toutes les slash commands Farm2Win sont desormais migrees : "list" est
+  // la seule commande restant volontairement hors de ce Set.
+  assert.equal(commandSkipsJsonPreamble("list", TEST_PLAYER_ID, allowlisted), false);
 });
 
 // Interaction discord.js minimale -- uniquement les champs lus par
