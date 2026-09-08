@@ -1583,6 +1583,14 @@ export async function resolveCodexReplant(
     if (!player) {
       throw new Error(`resolveCodexReplant : joueur "${playerId}" introuvable apres bascule -- etat incoherent.`);
     }
+    // DIAGNOSTIC TEMPORAIRE (bug reel /codex replant) -- instrumentation
+    // uniquement, aucune logique modifiee, aucun SELECT supplementaire (le
+    // getPlayer() independant ci-dessus existait deja). A RETIRER une fois
+    // la cause confirmee.
+    logger.info(
+      { autoReplant: player.autoReplant },
+      `[DIAG codex:db] reread after mutate autoReplant=${player.autoReplant}`,
+    );
     return { player };
   }
   const player = await store.mutatePlayer(playerId, (p) => {

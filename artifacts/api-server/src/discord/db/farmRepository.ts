@@ -21,6 +21,7 @@
 // lib/db/src/index.ts des le chargement de ce fichier (donc aussi pendant
 // les tests), ce que ce fichier evite deliberement.
 import { and, asc, desc, eq, isNotNull, like, sql } from "drizzle-orm";
+import { logger } from "../../lib/logger.ts";
 import { toGlobalState } from "./globalStateAdapter.ts";
 import { toPlayerState } from "./playerAdapter.ts";
 import type { GlobalState, PlayerState } from "../types";
@@ -282,6 +283,15 @@ async function writePlayerStateAssumingLock(
   updatedAt: Date,
   deps: PlayerWriteCoreDeps,
 ): Promise<void> {
+  // DIAGNOSTIC TEMPORAIRE (bug reel /codex replant, voir presenters.ts) --
+  // instrumentation uniquement, aucune logique modifiee. A RETIRER une fois
+  // la cause confirmee. S'applique a TOUT appelant de writePlayerStateAssumingLock
+  // (savePlayerWithTx/mutatePlayer, donc toutes les commandes migrees), pas
+  // seulement /codex -- filtrer les logs par "[DIAG codex:db]" a la lecture.
+  logger.info(
+    { autoReplant: playerState.autoReplant },
+    `[DIAG codex:db] before update autoReplant=${playerState.autoReplant}`,
+  );
   await deps.updatePlayerRow(tx, playerState.userId, {
     coins: playerState.coins,
     level: playerState.level,
@@ -484,6 +494,16 @@ export async function mutatePlayer(
     const updatedAt = new Date();
     await writePlayerStateAssumingLock(tx, player, updatedAt, deps);
     player.updatedAt = updatedAt.getTime();
+
+    // DIAGNOSTIC TEMPORAIRE (bug reel /codex replant) -- instrumentation
+    // uniquement, aucune logique modifiee, aucune ecriture supplementaire.
+    // A RETIRER une fois la cause confirmee. S'applique a TOUT appelant de
+    // mutatePlayer (donc toutes les commandes migrees), pas seulement
+    // /codex -- filtrer les logs par "[DIAG codex:db]" a la lecture.
+    logger.info(
+      { autoReplant: player.autoReplant },
+      `[DIAG codex:db] after write in transaction autoReplant=${player.autoReplant}`,
+    );
 
     return player;
   });
