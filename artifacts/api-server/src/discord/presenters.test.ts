@@ -2669,33 +2669,6 @@ test("handleCodexComponent : les appels mutateurs (plant/replant/refresh) ne rec
 });
 
 // ===========================================================================
-// DIAGNOSTIC TEMPORAIRE (bug reel /codex replant) -- instrumentation
-// uniquement, aucune logique metier modifiee. Ce test verifie
-// structurellement (source-scan, meme technique que les tests
-// anti-divergence) que l'instrumentation est correctement bornee au
-// customId "codex:replant" et ne fuit jamais le playerId en clair -- il ne
-// remplace PAS les tests comportementaux existants ci-dessus (deja tous
-// verts avec cette instrumentation en place, preuve qu'elle n'altere rien).
-// A RETIRER avec l'instrumentation elle-meme une fois la cause confirmee.
-// ===========================================================================
-
-test("handleCodexComponent : instrumentation diagnostique temporaire (codex:replant) correctement bornee -- jamais de customId non masque, jamais declenchee pour culture/filter/plant/refresh/plots", async () => {
-  const source = await readFile(new URL("./presenters.ts", import.meta.url), "utf8");
-  const handlerStart = source.indexOf("export async function handleCodexComponent(");
-  const handlerBody = source.slice(handlerStart);
-
-  assert.ok(handlerBody.includes("randomUUID()"), "un invocationId doit etre genere");
-  assert.ok(handlerBody.includes('parts[1] === "replant" ? randomUUID() : null'), "l'invocationId ne doit exister QUE pour le customId codex:replant, jamais pour les autres actions");
-  assert.ok(handlerBody.includes("logger.info"), "le logger existant du projet doit etre reutilise, jamais console.log");
-  assert.ok(!handlerBody.includes("console.log"), "aucun console.log ne doit etre utilise, uniquement le logger du projet");
-  assert.ok(!/customId:\s*interaction\.customId/.test(handlerBody), "le customId brut (qui contient le playerId Discord) ne doit jamais etre logge tel quel, uniquement masque");
-  assert.ok(handlerBody.includes('`:***`') === false && handlerBody.includes(':***`'), "le customId logge doit etre masque (userId remplace par ***)");
-
-  const logCallCount = (handlerBody.match(/logger\.info\(/g) ?? []).length;
-  assert.equal(logCallCount, 5, "exactement 5 sites d'appel logger.info attendus : start, before toggle, after toggle, before update, end");
-});
-
-// ===========================================================================
 // H. Audit anti-divergence (LOT 6) : shouldUsePostgresRuntime doit apparaitre
 // EXACTEMENT 16 fois (le garde-fou de preambule + resolveBuyUpgrade +
 // resolveDailyClaim + resolvePlantCrop + resolveCraftItem +

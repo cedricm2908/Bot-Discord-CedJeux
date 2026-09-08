@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -13,7 +12,6 @@ import {
   type InteractionReplyOptions,
   type InteractionUpdateOptions,
 } from "discord.js";
-import { logger } from "../lib/logger.ts";
 import {
   CROPS,
   MINI_GAMES,
@@ -1583,14 +1581,6 @@ export async function resolveCodexReplant(
     if (!player) {
       throw new Error(`resolveCodexReplant : joueur "${playerId}" introuvable apres bascule -- etat incoherent.`);
     }
-    // DIAGNOSTIC TEMPORAIRE (bug reel /codex replant) -- instrumentation
-    // uniquement, aucune logique modifiee, aucun SELECT supplementaire (le
-    // getPlayer() independant ci-dessus existait deja). A RETIRER une fois
-    // la cause confirmee.
-    logger.info(
-      { autoReplant: player.autoReplant },
-      `[DIAG codex:db] reread after mutate autoReplant=${player.autoReplant}`,
-    );
     return { player };
   }
   const player = await store.mutatePlayer(playerId, (p) => {
@@ -1660,26 +1650,6 @@ export async function handleCodexComponent(
       await interaction.reply({ embeds: [embedError(new FarmError("Ce Codex appartient à un autre joueur."))], ephemeral: true });
       return;
     }
-    // DIAGNOSTIC TEMPORAIRE (bug reel signale : Discord affiche "ON" apres
-    // clic sur "Replantation auto" mais Neon persiste auto_replant=false --
-    // hypothese a verifier : double invocation de ce handler pour un seul
-    // clic). Instrumentation UNIQUEMENT -- aucune logique metier modifiee,
-    // aucun debounce/garde-fou ajoute, le toggle et les transactions
-    // restent strictement inchanges. Scope volontairement limite au
-    // customId "codex:replant" (jamais culture/filter/plant/refresh/plots) :
-    // replantInvocationId reste `null` pour toute autre action, donc aucun
-    // des logs ci-dessous ne s'execute en dehors de ce chemin precis. A
-    // RETIRER une fois la cause du bug confirmee.
-    const replantInvocationId = parts[1] === "replant" ? randomUUID() : null;
-    if (replantInvocationId) {
-      // customId masque : "codex:replant:<userId>" -> "codex:replant:***"
-      // (le playerId Discord n'est jamais logge en clair).
-      const maskedCustomId = `${parts.slice(0, -1).join(":")}:***`;
-      logger.info(
-        { invocationId: replantInvocationId, at: Date.now(), customId: maskedCustomId },
-        "[DIAG codex:replant] handler start",
-      );
-    }
     // LOT 6, bascule TEST-only pour /codex : reutilise resolveFarmView
     // telle quelle (meme lecture player+global qu'a besoin chaque branche
     // de ce handler, mutatrice ou non -- codexPayload() a TOUJOURS besoin
@@ -1714,39 +1684,12 @@ export async function handleCodexComponent(
       const freePlots = player.plots.filter((plot) => plot.cropId === null).length;
       view.simulatedPlots = Math.max(0, Math.min(freePlots, view.simulatedPlots + (parts[2] === "up" ? 1 : -1)));
     } else if (parts[1] === "replant") {
-      // DIAGNOSTIC TEMPORAIRE -- voir commentaire ci-dessus. "before
-      // toggle"/"after toggle" bracket l'appel a resolveCodexReplant (qui
-      // appelle togglePlayerAutoReplant en interne cote allowliste) plutot
-      // que de modifier la signature/le corps de resolveCodexReplant lui-
-      // meme -- zero changement des resolveurs deja testes.
-      if (replantInvocationId) {
-        logger.info({ invocationId: replantInvocationId }, "[DIAG codex:replant] before toggle");
-      }
       const result = await resolveCodexReplant(userId, store);
       player = result.player;
       feedback = `Replantation automatique ${player.autoReplant ? "activée" : "désactivée"}.`;
-      if (replantInvocationId) {
-        // Valeur incluse directement dans le texte du message (en plus du
-        // champ structure ci-dessus) : Railway n'affiche pas les champs
-        // structures Pino dans sa vue par defaut, ceci la rend visible sans
-        // outillage supplementaire.
-        logger.info(
-          { invocationId: replantInvocationId, autoReplant: player.autoReplant },
-          `[DIAG codex:replant] after toggle autoReplant=${player.autoReplant}`,
-        );
-      }
-    }
-    if (replantInvocationId) {
-      logger.info(
-        { invocationId: replantInvocationId, autoReplant: player.autoReplant },
-        `[DIAG codex:replant] before interaction.update autoReplant=${player.autoReplant}`,
-      );
     }
     codexViews.set(interaction.message.id, view);
     await interaction.update(codexPayload(global, player, view, feedback));
-    if (replantInvocationId) {
-      logger.info({ invocationId: replantInvocationId }, "[DIAG codex:replant] handler end");
-    }
   } catch (error) {
     await replyError(interaction, error);
   }
