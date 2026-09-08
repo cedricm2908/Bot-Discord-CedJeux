@@ -52,6 +52,7 @@ import {
 } from "./db/farmPlayerActions.ts";
 import { ensurePlayerExists, getAllPlayers, getGlobalState, getPlayer } from "./db/farmRepository.ts";
 import { shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
+import { logger } from "../lib/logger.ts";
 import type {
   CropId,
   GlobalState,
@@ -339,6 +340,9 @@ export async function handleSlashCommand(
         throw new FarmError("Commande inconnue.");
     }
   } catch (error) {
+    if (!(error instanceof FarmError)) {
+      logger.error({ err: error, command: interaction.commandName }, "[handleSlashCommand] unexpected Farm2Win error");
+    }
     await replyError(interaction, error);
   }
 }
@@ -1691,6 +1695,12 @@ export async function handleCodexComponent(
     codexViews.set(interaction.message.id, view);
     await interaction.update(codexPayload(global, player, view, feedback));
   } catch (error) {
+    if (!(error instanceof FarmError)) {
+      logger.error(
+        { err: error, customIdCategory: interaction.customId.split(":")[1] },
+        "[handleCodexComponent] unexpected Farm2Win error",
+      );
+    }
     await replyError(interaction, error);
   }
 }

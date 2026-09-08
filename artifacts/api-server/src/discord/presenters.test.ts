@@ -18,9 +18,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { mock, test } from "node:test";
 import { FarmError, currentCropPrice, growMinutes, growthPercent, isReady, productPrice, totalInventoryValue, xpToNextLevel } from "./farm.ts";
+import { logger } from "../lib/logger.ts";
 import type { ChatInputCommandInteraction } from "discord.js";
 import {
   commandSkipsJsonPreamble,
+  handleCodexComponent,
   handleSlashCommand,
   resolveBuyUpgrade,
   resolveCodexRefresh,
@@ -2828,4 +2830,114 @@ test("handleSlashCommand G. commande V1 (list, jamais routee vers Postgres) : en
   await handleSlashCommand(buildListInteraction(TEST_PLAYER_ID), store);
 
   assert.equal(save.mock.calls.length, 1, "le preambule doit toujours sauvegarder pour une commande non routee vers Postgres");
+});
+
+// ===========================================================================
+// Logging diagnostique des erreurs inattendues (catch global de
+// handleSlashCommand / handleCodexComponent) -- prouve que : (A) une
+// FarmError (erreur metier attendue, deja affichee a l'utilisateur) ne
+// declenche JAMAIS logger.error (bruit inutile, deja visible via le
+// message Discord), et (B) une erreur NON-FarmError (inattendue) declenche
+// logger.error EXACTEMENT une fois, sans jamais changer le message
+// generique affiche a l'utilisateur.
+// ===========================================================================
+
+test("handleSlashCommand : commande inconnue (FarmError \"Commande inconnue.\") -> replyError repond normalement, logger.error N'EST PAS appele", async () => {
+  const errorSpy = mock.method(logger, "error", () => {});
+  try {
+    const global = defaultGlobalState(Date.now());
+    const reply = mock.fn(async (_payload: unknown) => {});
+    const store = { global, save: mock.fn(async () => {}) } as unknown as FarmStore;
+    const interaction = {
+      commandName: "commande-inexistante",
+      user: { id: TEST_PLAYER_ID },
+      replied: false,
+      deferred: false,
+      reply,
+    } as unknown as ChatInputCommandInteraction;
+
+    await handleSlashCommand(interaction, store);
+
+    assert.equal(errorSpy.mock.calls.length, 0, "une FarmError ne doit jamais declencher logger.error");
+    assert.equal(reply.mock.calls.length, 1, "replyError doit tout de meme repondre a l'utilisateur");
+    const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
+    assert.ok(payload.embeds[0]!.data.description?.includes("Commande inconnue."), "le message FarmError original doit rester affiche");
+  } finally {
+    errorSpy.mock.restore();
+  }
+});
+
+test("handleSlashCommand : erreur generique (non-FarmError) pendant le preambule -> logger.error appele EXACTEMENT une fois, message utilisateur reste generique/inchange", async () => {
+  const errorSpy = mock.method(logger, "error", () => {});
+  try {
+    // marketUpdatedAt=0 : enrichGlobalState() reel retourne true de maniere
+    // deterministe, donc store.save() est bien appele et peut jeter.
+    const global = defaultGlobalState(0);
+    const reply = mock.fn(async (_payload: unknown) => {});
+    const store = {
+      global,
+      save: mock.fn(async () => {
+        throw new Error("panne DB simulee, non-FarmError");
+      }),
+    } as unknown as FarmStore;
+    const interaction = {
+      commandName: "list",
+      user: { id: TEST_PLAYER_ID },
+      replied: false,
+      deferred: false,
+      reply,
+    } as unknown as ChatInputCommandInteraction;
+
+    await handleSlashCommand(interaction, store);
+
+    assert.equal(errorSpy.mock.calls.length, 1, "une erreur non-FarmError doit declencher logger.error exactement une fois");
+    const [logPayload] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; command: string }, string];
+    assert.equal(logPayload.command, "list");
+    assert.ok(logPayload.err instanceof Error);
+    assert.equal(reply.mock.calls.length, 1);
+    const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
+    assert.ok(
+      payload.embeds[0]!.data.description?.includes("Une erreur inattendue est survenue"),
+      "le message utilisateur doit rester le message generique inchange, jamais le detail de l'erreur reelle",
+    );
+  } finally {
+    errorSpy.mock.restore();
+  }
+});
+
+test("handleCodexComponent : erreur generique (non-FarmError) -> logger.error appele EXACTEMENT une fois, message utilisateur reste generique/inchange", async () => {
+  const errorSpy = mock.method(logger, "error", () => {});
+  try {
+    const reply = mock.fn(async (_payload: unknown) => {});
+    const store = {
+      global: defaultGlobalState(Date.now()),
+      getPlayer: () => {
+        throw new Error("panne inattendue simulee, non-FarmError");
+      },
+    } as unknown as FarmStore;
+    const interaction = {
+      customId: `codex:replant:${TEST_PLAYER_ID}`,
+      user: { id: TEST_PLAYER_ID },
+      message: { id: "codex-message-1" },
+      replied: false,
+      deferred: false,
+      reply,
+      isStringSelectMenu: () => false,
+    } as unknown as Parameters<typeof handleCodexComponent>[0];
+
+    await handleCodexComponent(interaction, store);
+
+    assert.equal(errorSpy.mock.calls.length, 1, "une erreur non-FarmError doit declencher logger.error exactement une fois");
+    const [logPayload] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; customIdCategory: string }, string];
+    assert.equal(logPayload.customIdCategory, "replant", "seule la categorie (parts[1]) doit etre loggee, jamais le customId complet (qui contient le playerId)");
+    assert.ok(logPayload.err instanceof Error);
+    assert.equal(reply.mock.calls.length, 1);
+    const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
+    assert.ok(
+      payload.embeds[0]!.data.description?.includes("Une erreur inattendue est survenue"),
+      "le message utilisateur doit rester le message generique inchange",
+    );
+  } finally {
+    errorSpy.mock.restore();
+  }
 });
