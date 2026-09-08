@@ -24,6 +24,12 @@ import type { FarmStore } from "./store";
 import { handleCodexComponent, handleSlashCommand } from "./presenters";
 import { cropById } from "./constants";
 import { isReady } from "./farm";
+import {
+  buildRealPostgresSchedulerDeps,
+  createPostgresSchedulerTickRunner,
+  isPostgresSchedulerEnabled,
+  type ReadyPlotNotification,
+} from "./db/postgresScheduler";
 
 const slashCommands = [
   new SlashCommandBuilder()
@@ -158,6 +164,34 @@ async function notifyReadyCrops(client: Client, store: FarmStore): Promise<void>
   if (changed) await store.save();
 }
 
+// LOT SCHEDULER 1 : callback d'envoi de DM injecte dans le scheduler
+// PostgreSQL (postgresScheduler.ts), qui ne cree jamais son propre Client
+// discord.js. Reutilise EXACTEMENT le meme contenu/format que
+// notifyReadyCrops() ci-dessus (V1 JSON) -- meme titre, meme couleur, meme
+// format de ligne par parcelle, meme footer -- aucun changement du contenu
+// utilisateur. Ne catch PAS l'erreur ici : le scheduler (postgresScheduler.ts)
+// est deja responsable de logger un echec d'envoi sans jamais exposer de
+// playerId, et de ne jamais laisser cette erreur interrompre le tick.
+function buildRealSendReadyNotification(
+  client: Client,
+): (playerId: string, readyPlots: ReadyPlotNotification[]) => Promise<void> {
+  return async (playerId, readyPlots) => {
+    const user = await client.users.fetch(playerId);
+    await user.send({
+      embeds: [
+        {
+          color: 0x3f6b2f,
+          title: "🌾 Une récolte est prête",
+          description: readyPlots
+            .map(({ cropId, plotIndex }) => `${cropById(cropId).emoji} ${cropById(cropId).name} · parcelle ${plotIndex + 1}`)
+            .join("\n"),
+          footer: { text: "Utilise /harvest pour récolter." },
+        },
+      ],
+    });
+  };
+}
+
 export async function startDiscordBot(): Promise<void> {
   const store = await getFarmStore();
   const token = process.env["DISCORD_TOKEN"];
@@ -192,6 +226,29 @@ export async function startDiscordBot(): Promise<void> {
           await notifyReadyCrops(readyClient, store);
         })().catch((error) => logger.error({ err: error }, "Farm2Win scheduler failed"));
       }, 60_000);
+
+      // LOT SCHEDULER 1 : scheduler PostgreSQL, COEXISTE avec le scheduler
+      // JSON V1 ci-dessus (jamais un remplacement) -- positionne
+      // volontairement APRES registerCommands()/setActivity()/
+      // notifyReadyCrops()/l'enregistrement du setInterval JSON, et
+      // toujours en fire-and-forget (jamais awaite ici) : un echec de ce
+      // bloc ne peut donc jamais empecher ce qui precede, qui a deja
+      // termine avec succes a ce stade. Desactive par defaut (fail-closed,
+      // voir isPostgresSchedulerEnabled()) -- aucun effet si la variable
+      // d'environnement n'est pas exactement "true".
+      if (isPostgresSchedulerEnabled()) {
+        const runPostgresSchedulerTick = createPostgresSchedulerTickRunner(
+          buildRealPostgresSchedulerDeps(buildRealSendReadyNotification(readyClient)),
+        );
+        void runPostgresSchedulerTick().catch((error) =>
+          logger.error({ err: error }, "[postgresScheduler] tick initial en echec"),
+        );
+        setInterval(() => {
+          void runPostgresSchedulerTick().catch((error) =>
+            logger.error({ err: error }, "[postgresScheduler] tick periodique en echec"),
+          );
+        }, 60_000);
+      }
     } catch (error) {
       logger.error({ err: error }, "Discord bot initialization failed");
     }
