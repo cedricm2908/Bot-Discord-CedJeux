@@ -1718,16 +1718,20 @@ export async function handleCodexComponent(
       player = result.player;
       feedback = `Replantation automatique ${player.autoReplant ? "activée" : "désactivée"}.`;
       if (replantInvocationId) {
+        // Valeur incluse directement dans le texte du message (en plus du
+        // champ structure ci-dessus) : Railway n'affiche pas les champs
+        // structures Pino dans sa vue par defaut, ceci la rend visible sans
+        // outillage supplementaire.
         logger.info(
           { invocationId: replantInvocationId, autoReplant: player.autoReplant },
-          "[DIAG codex:replant] after toggle",
+          `[DIAG codex:replant] after toggle autoReplant=${player.autoReplant}`,
         );
       }
     }
     if (replantInvocationId) {
       logger.info(
         { invocationId: replantInvocationId, autoReplant: player.autoReplant },
-        "[DIAG codex:replant] before interaction.update",
+        `[DIAG codex:replant] before interaction.update autoReplant=${player.autoReplant}`,
       );
     }
     codexViews.set(interaction.message.id, view);
