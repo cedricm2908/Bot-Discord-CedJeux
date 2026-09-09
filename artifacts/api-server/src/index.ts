@@ -22,7 +22,7 @@ app.listen(port, (err) => {
     process.exit(1);
   }
 
-  logger.info({ port }, "Server listening");
+  logger.info({ port }, `Server listening on port ${port}`);
 });
 
 void startDiscordBot().catch((error) => {
