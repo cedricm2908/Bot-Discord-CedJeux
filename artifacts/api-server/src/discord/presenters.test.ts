@@ -57,7 +57,7 @@ import {
 } from "./presenters.ts";
 import { POSTGRES_TEST_PLAYER_IDS_ENV_VAR, shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
 import { FarmStore } from "./store.ts";
-import { defaultGlobalState } from "./constants.ts";
+import { CROPS, defaultGlobalState } from "./constants.ts";
 import type { GlobalState, PlayerState } from "./types";
 
 const TEST_PLAYER_ID = "v2-test-player-001";
@@ -2894,12 +2894,7 @@ test("handleSlashCommand : erreur generique (non-FarmError) pendant le preambule
     const [logPayload, logMessage] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; command: string }, string];
     assert.equal(logPayload.command, "list");
     assert.ok(logPayload.err instanceof Error);
-    // DIAGNOSTIC TEMPORAIRE : Railway n'affiche pas les champs structures,
-    // les valeurs doivent donc AUSSI apparaitre dans le texte du message.
-    assert.ok(logMessage.includes("command=list"), "le texte du log doit contenir command=list");
-    assert.ok(logMessage.includes("errorName=Error"), "le texte du log doit contenir errorName=Error");
-    assert.ok(logMessage.includes("errorMessage=panne DB simulee, non-FarmError"), "le texte du log doit contenir le errorMessage reel");
-    assert.ok(!logMessage.includes(TEST_PLAYER_ID), "le texte du log ne doit jamais contenir de playerId");
+    assert.equal(logMessage, "[handleSlashCommand] unexpected Farm2Win error", "le message de log permanent doit etre exactement ce texte fixe (diagnostic temporaire retire)");
     assert.equal(reply.mock.calls.length, 1);
     const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
     assert.ok(
@@ -2937,13 +2932,7 @@ test("handleCodexComponent : erreur generique (non-FarmError) -> logger.error ap
     const [logPayload, logMessage] = errorSpy.mock.calls[0]!.arguments as [{ err: unknown; customIdCategory: string }, string];
     assert.equal(logPayload.customIdCategory, "replant", "seule la categorie (parts[1]) doit etre loggee, jamais le customId complet (qui contient le playerId)");
     assert.ok(logPayload.err instanceof Error);
-    // DIAGNOSTIC TEMPORAIRE : Railway n'affiche pas les champs structures,
-    // les valeurs doivent donc AUSSI apparaitre dans le texte du message.
-    assert.ok(logMessage.includes("customIdCategory=replant"), "le texte du log doit contenir customIdCategory=replant");
-    assert.ok(logMessage.includes("errorName=Error"), "le texte du log doit contenir errorName=Error");
-    assert.ok(logMessage.includes("errorMessage=panne inattendue simulee, non-FarmError"), "le texte du log doit contenir le errorMessage reel");
-    assert.ok(!logMessage.includes(`codex:replant:${TEST_PLAYER_ID}`), "le texte du log ne doit jamais contenir le customId complet");
-    assert.ok(!logMessage.includes(TEST_PLAYER_ID), "le texte du log ne doit jamais contenir de playerId");
+    assert.equal(logMessage, "[handleCodexComponent] unexpected Farm2Win error", "le message de log permanent doit etre exactement ce texte fixe (diagnostic temporaire retire)");
     assert.equal(reply.mock.calls.length, 1);
     const [payload] = reply.mock.calls[0]!.arguments as [{ embeds: { data: { description?: string } }[] }];
     assert.ok(
@@ -2953,4 +2942,59 @@ test("handleCodexComponent : erreur generique (non-FarmError) -> logger.error ap
   } finally {
     errorSpy.mock.restore();
   }
+});
+
+// ===========================================================================
+// Aperçu /codex (codexPayload, champ "RENDEMENT") -- doit utiliser EXACTEMENT
+// la meme formule d'arrondi final que harvest() (../farm.ts), corrigee suite
+// au bug rendement fractionnaire confirme sur /harvest (ex. wheat x1.25 ->
+// 3.75, rejete par la colonne integer Postgres). Teste la VRAIE formule via
+// handleCodexComponent (jamais un yieldPerPlot mocke), en declenchant
+// l'action "plots" (UI seule, aucune mutation joueur) pour atteindre
+// codexPayload() en bout en bout.
+// ===========================================================================
+
+function buildCodexPlotsInteraction(messageId: string, reply: (payload: unknown) => Promise<void>) {
+  return {
+    customId: `codex:plots:up:${TEST_PLAYER_ID}`,
+    user: { id: TEST_PLAYER_ID },
+    message: { id: messageId },
+    replied: false,
+    deferred: false,
+    reply: mock.fn(reply),
+    update: mock.fn(async (_payload: unknown) => {}),
+    isStringSelectMenu: () => false,
+  } as unknown as Parameters<typeof handleCodexComponent>[0] & { update: ReturnType<typeof mock.fn> };
+}
+
+test("codexPayload (via handleCodexComponent) : meteo pluie x1.25, wheat baseYield=3, fertilizerLevel=0 -> RENDEMENT = 4, jamais 3.75", async () => {
+  const wheat = CROPS.find((crop) => crop.id === "wheat")!;
+  assert.equal(wheat.baseYield, 3, "precondition : baseYield de wheat suppose etre 3");
+  const player = buildPlayerState({ plots: [], fertilizerLevel: 0 });
+  const global = defaultGlobalState(NOW);
+  const store = { getPlayer: () => player, global: { ...global, weather: "rain" as const, weatherMultiplier: 1.25 } } as unknown as FarmStore;
+  const interaction = buildCodexPlotsInteraction("codex-yield-msg-rain", async () => {});
+
+  await handleCodexComponent(interaction, store);
+
+  assert.equal(interaction.update.mock.calls.length, 1);
+  const [updatePayload] = interaction.update.mock.calls[0]!.arguments as [{ embeds: { data: { fields?: { name: string; value: string }[] } }[] }];
+  const yieldField = updatePayload.embeds[0]!.data.fields?.find((field) => field.name === "RENDEMENT");
+  assert.ok(yieldField, "le champ RENDEMENT doit exister dans l'embed codex");
+  assert.equal(yieldField!.value, "4 / parcelle", "Math.round(3 * 1 * 1.25) = Math.round(3.75) = 4, jamais 3.75 affiche");
+});
+
+test("codexPayload (via handleCodexComponent) : meteo nuisibles x0.75, wheat baseYield=3, fertilizerLevel=0 -> RENDEMENT = 2", async () => {
+  const player = buildPlayerState({ plots: [], fertilizerLevel: 0 });
+  const global = defaultGlobalState(NOW);
+  const store = { getPlayer: () => player, global: { ...global, weather: "pests" as const, weatherMultiplier: 0.75 } } as unknown as FarmStore;
+  const interaction = buildCodexPlotsInteraction("codex-yield-msg-pests", async () => {});
+
+  await handleCodexComponent(interaction, store);
+
+  assert.equal(interaction.update.mock.calls.length, 1);
+  const [updatePayload] = interaction.update.mock.calls[0]!.arguments as [{ embeds: { data: { fields?: { name: string; value: string }[] } }[] }];
+  const yieldField = updatePayload.embeds[0]!.data.fields?.find((field) => field.name === "RENDEMENT");
+  assert.ok(yieldField, "le champ RENDEMENT doit exister dans l'embed codex");
+  assert.equal(yieldField!.value, "2 / parcelle", "Math.round(3 * 1 * 0.75) = Math.round(2.25) = 2");
 });
