@@ -1,4 +1,4 @@
-import { FarmStore } from "./store";
+import { FarmStore } from "./store.ts";
 
 let initPromise: Promise<FarmStore> | null = null;
 

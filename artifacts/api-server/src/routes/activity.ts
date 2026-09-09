@@ -1,6 +1,6 @@
-import { Router, type IRouter } from "express";
-import { getFarmStore } from "../discord/sharedStore";
-import { CROPS, PLOT_SKINS, RECIPES } from "../discord/constants";
+import { Router, type IRouter, type Request, type Response } from "express";
+import { getFarmStore } from "../discord/sharedStore.ts";
+import { CROPS, PLOT_SKINS, RECIPES } from "../discord/constants.ts";
 import {
   FarmError,
   buyUpgrade,
@@ -20,7 +20,9 @@ import {
   totalInventoryValue,
   unlockedAchievements,
   xpToNextLevel,
-} from "../discord/farm";
+} from "../discord/farm.ts";
+import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
+import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
 import type { CropId, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
 
@@ -30,7 +32,7 @@ const CLIENT_ID = process.env["DISCORD_CLIENT_ID"] ?? "1544005975307059250";
 const CLIENT_SECRET = process.env["DISCORD_CLIENT_SECRET"];
 const REDIRECT_URI = "https://cedricm2908.github.io/CedJeux/activity/";
 
-interface DiscordUser {
+export interface DiscordUser {
   id: string;
   username: string;
   global_name?: string;
@@ -104,6 +106,100 @@ function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: Fa
   };
 }
 
+// ===========================================================================
+// LOT A -- Activity PostgreSQL, GET /activity/me UNIQUEMENT (lecture seule).
+// ===========================================================================
+//
+// Meme principe d'allowlist que les slash commands (shouldUsePostgresRuntime,
+// ../discord/postgresRuntimeAllowlist.ts) : un joueur NON allowliste continue
+// EXACTEMENT sur le runtime JSON V1 (store.getPlayer/resetQuestsIfNeeded/
+// store.save, inchange). Un joueur allowliste lit son etat via les MEMES
+// primitives Postgres deja utilisees par les slash commands
+// (ensurePlayerExists/getPlayer/getGlobalState de ../discord/db/farmRepository.ts
+// -- AUCUNE nouvelle primitive, aucune regle metier reimplementee ici).
+//
+// LECTURE SEULE cote Postgres : ni mutatePlayer, ni resetQuestsIfNeeded
+// Postgres, ni aucune autre ecriture n'est declenchee dans cette branche --
+// le reset de quetes Postgres est explicitement reserve au LOT B (voir
+// commentaire ci-dessous sur resolveActivityMe).
+//
+// buildMePayload() ci-dessus reste STRICTEMENT INCHANGEE : elle ne lit
+// jamais rien d'autre que `store.global` (jamais store.getPlayer/mutatePlayer/
+// save), donc la branche Postgres peut lui passer un objet minimal
+// `{ global }` portant uniquement le GlobalState reellement lu -- le
+// contrat de reponse JSON envoye au frontend reste identique, meme forme,
+// memes cles, dans les deux branches.
+//
+// Erreur Postgres (ensurePlayerExists/getPlayer/getGlobalState qui rejette,
+// ou getPlayer qui retourne null malgre ensurePlayerExists) => l'erreur
+// remonte telle quelle jusqu'au catch de handleGetActivityMe (reponse 500
+// controlee) -- JAMAIS de repli silencieux vers le store JSON pour un
+// joueur allowliste.
+export interface ActivityMeDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityMeDeps: ActivityMeDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityMe(
+  discordUser: DiscordUser,
+  store: FarmStore,
+  deps: ActivityMeDeps = realActivityMeDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityMe : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityMe : global_state introuvable.");
+    }
+    // LOT A = lecture seule : PAS de resetQuestsIfNeeded/mutatePlayer ici,
+    // volontairement reserve au LOT B (voir en-tete de section ci-dessus).
+    return buildMePayload(discordUser, player, { global } as unknown as FarmStore);
+  }
+  const player = store.getPlayer(discordUser.id);
+  if (resetQuestsIfNeeded(player)) await store.save();
+  return buildMePayload(discordUser, player, store);
+}
+
+export async function handleGetActivityMe(
+  req: Request,
+  res: Response,
+  deps: ActivityMeDeps = realActivityMeDeps,
+): Promise<void> {
+  try {
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
+    if (!discordUser) {
+      res.status(401).json({ error: "Token Discord invalide" });
+      return;
+    }
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityMe(discordUser, store, deps));
+  } catch (error) {
+    res.status(500).json({
+      error: "Erreur serveur",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 router.post("/activity/token", async (req, res) => {
   try {
     const code = req.body?.code;
@@ -142,23 +238,8 @@ router.post("/activity/token", async (req, res) => {
   }
 });
 
-router.get("/activity/me", async (req, res) => {
-  try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
-    if (!discordUser) {
-      res.status(401).json({ error: "Token Discord invalide" });
-      return;
-    }
-    const store = await getFarmStore();
-    const player = store.getPlayer(discordUser.id);
-    if (resetQuestsIfNeeded(player)) await store.save();
-    res.json(buildMePayload(discordUser, player, store));
-  } catch (error) {
-    res.status(500).json({
-      error: "Erreur serveur",
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
+router.get("/activity/me", (req, res) => {
+  void handleGetActivityMe(req, res);
 });
 
 router.get("/activity/crops", (_req, res) => {
