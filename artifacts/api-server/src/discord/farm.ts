@@ -314,8 +314,11 @@ export function harvest(
     const crop = cropById(plot.cropId);
     const amount = Math.max(
       1,
-      Math.round(crop.baseYield * (1 + player.fertilizerLevel * 0.05)) *
-        global.weatherMultiplier,
+      Math.round(
+        crop.baseYield *
+          (1 + player.fertilizerLevel * 0.05) *
+          global.weatherMultiplier,
+      ),
     );
     player.inventory[crop.id] = (player.inventory[crop.id] ?? 0) + amount;
     player.xp += crop.xp;
