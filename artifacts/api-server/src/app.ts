@@ -23,6 +23,17 @@ app.use(
         };
       },
     },
+    // DIAGNOSTIC TEMPORAIRE (a retirer une fois l'Activity validee en
+    // reel) : Railway n'affiche pas les champs structures req/res
+    // ci-dessus, seulement le texte du message ("request completed") --
+    // meme raison que le diagnostic /harvest precedent. method/path/status
+    // inclus directement dans le TEXTE du log, jamais de query string
+    // (deja retiree via split("?")[0], meme convention que serializers.req
+    // ci-dessus), jamais de body/Authorization/token/playerId/secret.
+    customSuccessMessage: (req, res) =>
+      `${req.method} ${req.url?.split("?")[0]} -> ${res.statusCode}`,
+    customErrorMessage: (req, res) =>
+      `${req.method} ${req.url?.split("?")[0]} -> ${res.statusCode}`,
   }),
 );
 app.use(cors());
