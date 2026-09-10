@@ -30,7 +30,7 @@ const router: IRouter = Router();
 
 const CLIENT_ID = process.env["DISCORD_CLIENT_ID"] ?? "1544005975307059250";
 const CLIENT_SECRET = process.env["DISCORD_CLIENT_SECRET"];
-const REDIRECT_URI = "https://cedricm2908.github.io/CedJeux/activity/";
+const REDIRECT_URI = "https://workspaceapi-server-production-e501.up.railway.app/activity/";
 
 export interface DiscordUser {
   id: string;
