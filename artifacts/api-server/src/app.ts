@@ -40,6 +40,30 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// LOT A -- page de test minimale prouvant que Railway peut servir
+// directement le frontend Discord Activity sur /activity, SANS
+// redirection (contrairement au comportement par defaut de
+// express.static, qui redirigerait /activity vers /activity/ -- voir
+// l'audit d'architecture Railway-only). Les deux chemins repondent
+// directement au meme contenu, jamais de header Location. Remplacee par
+// le vrai build farm2win-activity dans un lot ulterieur.
+const ACTIVITY_TEST_PAGE_HTML = `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Farm2Win Activity Test</title>
+</head>
+<body>
+<h1>FARM2WIN RAILWAY ACTIVITY TEST</h1>
+<p>Railway Activity Test</p>
+<p>Frontend servi directement depuis Railway.</p>
+</body>
+</html>`;
+
+app.get(["/activity", "/activity/"], (_req, res) => {
+  res.type("html").send(ACTIVITY_TEST_PAGE_HTML);
+});
+
 app.use("/api", router);
 
 export default app;
