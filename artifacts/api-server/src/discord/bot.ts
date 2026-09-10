@@ -128,7 +128,14 @@ async function registerCommands(client: Client): Promise<void> {
     ? [entryPoint.toJSON() as ApplicationCommandDataResolvable, ...slashCommands]
     : [...slashCommands];
   await client.application.commands.set(commandsToSet);
-  logger.info({ commands: slashCommands.length }, "Discord slash commands registered");
+  logger.info(
+    {
+      commands: commandsToSet.length,
+      slashCommands: slashCommands.length,
+      entryPointPreserved: Boolean(entryPoint),
+    },
+    "Discord slash commands registered",
+  );
 }
 
 async function notifyReadyCrops(client: Client, store: FarmStore): Promise<void> {
