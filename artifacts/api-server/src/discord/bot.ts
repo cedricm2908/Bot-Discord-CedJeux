@@ -124,6 +124,16 @@ async function registerCommands(client: Client): Promise<void> {
   const entryPoint = existing.find(
     (command) => command.type === ApplicationCommandType.PrimaryEntryPoint,
   );
+  if (entryPoint) {
+    logger.info(
+      {
+        handler: entryPoint.handler,
+        contexts: entryPoint.contexts,
+        integrationTypes: entryPoint.integrationTypes,
+      },
+      "Discord Primary Entry Point state",
+    );
+  }
   const commandsToSet: ApplicationCommandDataResolvable[] = entryPoint
     ? [entryPoint.toJSON() as ApplicationCommandDataResolvable, ...slashCommands]
     : [...slashCommands];
