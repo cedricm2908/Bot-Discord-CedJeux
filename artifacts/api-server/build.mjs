@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuild } from "esbuild";
 import esbuildPluginPino from "esbuild-plugin-pino";
-import { rm } from "node:fs/promises";
+import { cp, rm } from "node:fs/promises";
 
 // Plugins (e.g. 'esbuild-plugin-pino') may use `require` to resolve dependencies
 globalThis.require = createRequire(import.meta.url);
@@ -118,6 +118,19 @@ globalThis.__dirname = __bannerPath.dirname(globalThis.__filename);
     `,
     },
   });
+
+  // LOT B -- copie le build deja produit du frontend Discord Activity
+  // (artifacts/activity-frontend, doit avoir tourne AVANT ce script --
+  // voir la Build Command Railway) vers dist-static/activity, un
+  // repertoire FRERE de dist/ (jamais a l'interieur : dist/ est purge au
+  // debut de ce script, dist-static/ ne l'est que specifiquement ici,
+  // pour ne jamais servir d'anciens assets perimes). Utilise fs/promises
+  // (cp/rm), jamais une commande shell externe -- portable Windows/Linux,
+  // donc fonctionne de facon identique en local et sur Railway.
+  const frontendDistDir = path.resolve(artifactDir, "../activity-frontend/dist");
+  const activityStaticDir = path.resolve(artifactDir, "dist-static/activity");
+  await rm(activityStaticDir, { recursive: true, force: true });
+  await cp(frontendDistDir, activityStaticDir, { recursive: true });
 }
 
 buildAll().catch((err) => {

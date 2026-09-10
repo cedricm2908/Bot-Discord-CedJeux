@@ -1,6 +1,8 @@
 import express, { type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import router from "./routes";
 import { logger } from "./lib/logger";
 
@@ -40,29 +42,25 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// LOT A -- page de test minimale prouvant que Railway peut servir
-// directement le frontend Discord Activity sur /activity, SANS
-// redirection (contrairement au comportement par defaut de
-// express.static, qui redirigerait /activity vers /activity/ -- voir
-// l'audit d'architecture Railway-only). Les deux chemins repondent
-// directement au meme contenu, jamais de header Location. Remplacee par
-// le vrai build farm2win-activity dans un lot ulterieur.
-const ACTIVITY_TEST_PAGE_HTML = `<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<title>Farm2Win Activity Test</title>
-</head>
-<body>
-<h1>FARM2WIN RAILWAY ACTIVITY TEST</h1>
-<p>Railway Activity Test</p>
-<p>Frontend servi directement depuis Railway.</p>
-</body>
-</html>`;
+// LOT B -- sert le vrai frontend Farm2Win Activity (artifacts/activity-frontend),
+// buildé séparément puis copié par build.mjs vers dist-static/activity/, un
+// répertoire FRÈRE du bundle dist/index.mjs (jamais dedans). Résolu depuis
+// import.meta.url (jamais process.cwd(), instable selon le contexte de
+// lancement) pour fonctionner identiquement en local et sur Railway.
+// Route explicite pour /activity et /activity/ AVANT le middleware static,
+// garantissant zéro redirection 301/302 quel que soit le comportement de
+// express.static pour un chemin sans slash final -- voir l'audit
+// d'architecture Railway-only. Remplace la page de test du LOT A.
+const activityStaticDir = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../dist-static/activity",
+);
+const activityIndexHtmlPath = path.join(activityStaticDir, "index.html");
 
 app.get(["/activity", "/activity/"], (_req, res) => {
-  res.type("html").send(ACTIVITY_TEST_PAGE_HTML);
+  res.sendFile(activityIndexHtmlPath);
 });
+app.use("/activity", express.static(activityStaticDir, { redirect: false }));
 
 app.use("/api", router);
 
