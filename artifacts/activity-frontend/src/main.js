@@ -1,4 +1,5 @@
 import { DiscordSDK, patchUrlMappings } from '@discord/embedded-app-sdk';
+import { buildWeatherViewModel, multiplierToEffectLabel } from './weatherFormat.js';
 
 const CLIENT_ID = '1545070811713372262';
 const API_TARGET = 'workspaceapi-server-production-e501.up.railway.app';
@@ -26,12 +27,9 @@ const STARTING_PLOTS = 4;
 const MAX_PLOTS = 40;
 const MAX_IRRIGATION = 15;
 const MAX_FERTILIZER = 20;
-
-const WEATHER_LABELS = {
-  normal: { label: 'Normal', emoji: '☀️' },
-  rain: { label: 'Pluie bénie', emoji: '☔' },
-  pests: { label: 'Invasion de parasites', emoji: '🐛' },
-};
+// Doit rester identique a FORECAST_COST (artifacts/api-server/src/discord/constants.ts) --
+// prix inchange par ce LOT, affiche ici uniquement pour le bouton d'achat.
+const FORECAST_COST = 15;
 
 function itemUnitPrice(itemId, marketMultiplier) {
   const crop = cropById[itemId];
@@ -62,12 +60,15 @@ function upgradeInfo(kind, me) {
 let accessToken = null;
 let crops = [];
 let recipes = [];
+let weatherTypes = [];
 let cropById = {};
 let recipeById = {};
 let currentMe = null;
 let pickerOpenForPlot = null;
 let feedback = null;
 let refreshTimer = null;
+let weatherHelpOpen = false;
+let weatherTickTimer = null;
 
 function tierFor(unlockLevel) {
   const levels = Object.keys(TIER_COLORS).map(Number).sort((a, b) => a - b);
@@ -147,8 +148,9 @@ function chooseSkinAction(skinId) {
   runAction(() => postAction('/activity/skin', { skinId }), 'Thème de parcelle changé !');
 }
 function buyForecastAction() {
-  runAction(() => postAction('/activity/forecast'), 'Prévision météo achetée !');
+  runAction(() => postAction('/activity/forecast'), 'Prévision météo débloquée !');
 }
+function toggleWeatherHelp() { weatherHelpOpen = !weatherHelpOpen; render(); }
 
 function scheduleRefresh() {
   if (refreshTimer) clearTimeout(refreshTimer);
@@ -161,6 +163,26 @@ function scheduleRefresh() {
     }
     scheduleRefresh();
   }, 12000);
+}
+
+// Fait vivre le compte a rebours meteo (parcelle "Changement dans MM:SS")
+// cote client SANS jamais interroger l'API chaque seconde : ne met a jour
+// QUE le texte des noeuds DOM dedies (#weatherCountdown/#forecastCountdown),
+// jamais un render() complet (qui reconstruirait toute la page a chaque
+// tick). L'etat serveur reel (GET /activity/me, toutes les 12s via
+// scheduleRefresh()) reste la SEULE source de verite -- quand le compte a
+// rebours atteint 00:00, on ne simule JAMAIS localement le changement de
+// meteo : le texte reste a 00:00 jusqu'au prochain refresh reel.
+function scheduleWeatherTick() {
+  if (weatherTickTimer) clearInterval(weatherTickTimer);
+  weatherTickTimer = setInterval(() => {
+    if (!currentMe) return;
+    const vm = buildWeatherViewModel(currentMe);
+    const currentEl = document.getElementById('weatherCountdown');
+    if (currentEl) currentEl.textContent = `Changement dans ${vm.countdown}`;
+    const forecastEl = document.getElementById('forecastCountdown');
+    if (forecastEl) forecastEl.textContent = `Arrive dans ${vm.countdown}`;
+  }, 1000);
 }
 
 function pickerHtml(me) {
@@ -302,13 +324,58 @@ function challengeHtml(me) {
     </div>`;
 }
 
-function forecastHtml(me) {
-  const forecast = me.weatherForecast;
-  const info = forecast ? WEATHER_LABELS[forecast] : null;
+// LOT ACTIVITY-UX-WEATHER -- section météo complète : météo actuelle +
+// effet réel + compte à rebours (D. temps restant) ; prévision VERROUILLÉE
+// tant qu'elle n'est pas achetée (aucune fuite du nom/icône/multiplicateur
+// de la prochaine météo -- me.weather.forecast reste `null` côté backend
+// tant que POST /activity/forecast n'a pas été appelé avec succès) puis
+// détaillée après achat ; panneau d'aide repliable listant TOUTES les
+// météos réelles (weatherTypes, dérivé de GET /activity/crops).
+function weatherSectionHtml(me) {
+  const vm = buildWeatherViewModel(me);
+
+  const forecastBody = vm.forecastPurchased && vm.forecast
+    ? `
+      <div class="weather-forecast unlocked">
+        <span class="weather-forecast-title">🔮 Prévision débloquée</span>
+        <div class="weather-current-line">
+          <span class="weather-emoji">${vm.forecast.emoji}</span>
+          <span class="weather-name">${vm.forecast.label}</span>
+        </div>
+        <span class="weather-effect">Rendement prévu : ${vm.forecast.effectLabel}</span>
+        <span class="weather-countdown" id="forecastCountdown">Arrive dans ${vm.countdown}</span>
+      </div>`
+    : `
+      <div class="weather-forecast locked">
+        <span class="weather-forecast-title">🔮 Prévision</span>
+        <span class="weather-locked">🔒 Prochaine météo inconnue</span>
+        <p class="weather-hint">Achète une prévision pour connaître les prochaines conditions avant qu'elles arrivent.</p>
+        <button class="action-btn" id="forecastBtn">🔮 Acheter la prévision — ${FORECAST_COST} 🪙</button>
+      </div>`;
+
+  const helpBody = weatherHelpOpen
+    ? `<div class="weather-help-list">${weatherTypes.map((w) => `
+        <div class="weather-help-row">
+          <span class="weather-emoji">${w.emoji}</span>
+          <span class="weather-name">${w.label}</span>
+          <span class="weather-effect">Rendement : ${multiplierToEffectLabel(w.multiplier)}</span>
+        </div>`).join('')}</div>`
+    : '';
+
   return `
-    <div class="forecast-box">
-      <span class="forecast-value">${info ? `Prochaine météo : ${info.emoji} ${info.label}` : 'Aucune prévision achetée'}</span>
-      <button class="mini-btn" id="forecastBtn">🔮 Acheter une prévision (💰 15)</button>
+    <div class="panel weather-panel">
+      <h3>🌦️ Météo</h3>
+      <div class="weather-current">
+        <div class="weather-current-line">
+          <span class="weather-emoji">${vm.current.emoji}</span>
+          <span class="weather-name">${vm.current.label}</span>
+        </div>
+        <span class="weather-effect">Rendement : ${vm.current.effectLabel}</span>
+        <span class="weather-countdown" id="weatherCountdown">Changement dans ${vm.countdown}</span>
+      </div>
+      ${forecastBody}
+      <button class="weather-help-toggle" id="weatherHelpToggle">ⓘ Effets météo ${weatherHelpOpen ? '▲' : '▼'}</button>
+      ${helpBody}
     </div>`;
 }
 
@@ -447,8 +514,23 @@ function renderFarm() {
       .challenge-bar > span{ display:block; height:100%; background:linear-gradient(90deg, var(--leaf), var(--harvest)); }
       .challenge-progress{ font-size:.7rem; color:var(--ink-700); font-family:ui-monospace, monospace; }
 
-      .forecast-box{ display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
-      .forecast-value{ font-size:.8rem; }
+      .weather-panel{ display:flex; flex-direction:column; gap:10px; }
+      .weather-current{ display:flex; flex-direction:column; gap:3px; background:var(--stone-100); border-radius:10px; padding:10px 12px; }
+      .weather-current-line{ display:flex; align-items:center; gap:6px; }
+      .weather-emoji{ font-size:1.2rem; }
+      .weather-name{ font-size:.85rem; font-weight:700; }
+      .weather-effect{ font-size:.76rem; color:var(--harvest); font-family:ui-monospace, monospace; font-weight:600; }
+      .weather-countdown{ font-size:.7rem; color:var(--ink-700); font-family:ui-monospace, monospace; }
+      .weather-forecast{ display:flex; flex-direction:column; gap:4px; border-radius:10px; padding:10px 12px; }
+      .weather-forecast.locked{ background:var(--stone-100); }
+      .weather-forecast.unlocked{ background:linear-gradient(135deg, var(--stone-100), #e6ddf4); }
+      .weather-forecast-title{ font-size:.76rem; font-weight:700; }
+      .weather-locked{ font-size:.82rem; font-weight:600; color:var(--ink-700); }
+      .weather-hint{ margin:0; font-size:.72rem; color:var(--ink-700); }
+      .weather-help-toggle{ align-self:flex-start; font-family:inherit; font-size:.72rem; font-weight:600; background:none; border:none; color:var(--ink-700); cursor:pointer; padding:2px 0; }
+      .weather-help-list{ display:flex; flex-direction:column; gap:6px; }
+      .weather-help-row{ display:flex; align-items:center; gap:8px; font-size:.76rem; background:var(--stone-100); border-radius:8px; padding:6px 10px; }
+      .weather-help-row .weather-name{ flex:1; font-size:.78rem; }
 
       .footnote{ font-size:.75rem; color:var(--ink-700); text-align:center; }
 
@@ -472,7 +554,7 @@ function renderFarm() {
           <span class="stat-chip">${readyCount} prête${readyCount > 1 ? 's' : ''}</span>
         </div>
       </div>
-      <div class="weather-line">${me.user.username} · Marché ×${me.global.marketMultiplier.toFixed(2)}</div>
+      <div class="weather-line">${me.user.username} · Marché ×${me.global.marketMultiplier.toFixed(2)} · ${me.weather.current.emoji} ${me.weather.current.label} ×${me.weather.current.multiplier.toFixed(2)}</div>
       <div class="xp-row">
         <span class="xp-label">⭐ Niveau ${me.level}</span>
         <div class="xp-bar"><span style="width:${Math.min(100, Math.round((me.xp / me.xpToNext) * 100))}%"></span></div>
@@ -498,7 +580,7 @@ function renderFarm() {
       <div class="panel"><h3>📜 Missions quotidiennes</h3>${questsHtml(me)}</div>
       <div class="panel"><h3>🏅 Succès</h3>${achievementsHtml(me)}</div>
       <div class="panel"><h3>🎨 Skins de parcelles</h3>${skinsHtml(me)}</div>
-      <div class="panel"><h3>🔮 Prévisions météo</h3>${forecastHtml(me)}</div>
+      ${weatherSectionHtml(me)}
 
       <div class="footnote">La ferme se met à jour automatiquement toutes les 12 secondes.</div>
     </div>
@@ -519,11 +601,13 @@ function renderFarm() {
   appEl.querySelectorAll('[data-quest]').forEach((el) => el.addEventListener('click', () => claimQuestAction(Number(el.dataset.quest))));
   appEl.querySelectorAll('[data-skin]').forEach((el) => el.addEventListener('click', () => chooseSkinAction(el.dataset.skin)));
   document.getElementById('forecastBtn')?.addEventListener('click', buyForecastAction);
+  document.getElementById('weatherHelpToggle')?.addEventListener('click', toggleWeatherHelp);
 }
 
 function render() {
   if (!currentMe) return;
   renderFarm();
+  scheduleWeatherTick();
 }
 
 async function setup() {
@@ -569,6 +653,7 @@ async function setup() {
 
     crops = cropsData.crops;
     recipes = cropsData.recipes ?? [];
+    weatherTypes = cropsData.weatherTypes ?? [];
     cropById = Object.fromEntries(crops.map((c) => [c.id, c]));
     recipeById = Object.fromEntries(recipes.map((r) => [r.id, r]));
     currentMe = me;

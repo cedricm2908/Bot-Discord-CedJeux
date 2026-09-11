@@ -1,6 +1,6 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { getFarmStore } from "../discord/sharedStore.ts";
-import { CROPS, PLOT_SKINS, RECIPES } from "../discord/constants.ts";
+import { CROPS, PLOT_SKINS, RECIPES, WEATHER_INFO } from "../discord/constants.ts";
 import {
   FarmError,
   buyUpgrade,
@@ -36,7 +36,7 @@ import {
 } from "../discord/db/farmPlayerActions.ts";
 import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
-import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
+import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId, WeatherKey } from "../discord/types";
 
 const router: IRouter = Router();
 
@@ -60,6 +60,14 @@ async function requireDiscordUser(
   });
   if (!userResponse.ok) return null;
   return (await userResponse.json()) as DiscordUser;
+}
+
+// LOT ACTIVITY-UX-WEATHER -- transforme une WeatherKey en objet d'affichage
+// { key, label, emoji, multiplier } a partir de WEATHER_INFO (constants.ts),
+// LA SEULE source de verite -- aucune nouvelle valeur/regle introduite ici,
+// simple mise en forme de donnees deja existantes.
+function weatherDetail(key: WeatherKey): { key: WeatherKey; label: string; emoji: string; multiplier: number } {
+  return { key, ...WEATHER_INFO[key] };
 }
 
 // Ne prend que le GlobalState (jamais un FarmStore complet) : cette
@@ -119,6 +127,22 @@ function buildMePayload(discordUser: DiscordUser, player: PlayerState, global: G
       rewardCoins: global.dailyChallenge.rewardCoins,
       completed: global.dailyChallenge.completed,
       contributed: global.dailyChallenge.contributors.includes(player.userId),
+    },
+    // LOT ACTIVITY-UX-WEATHER -- objet meteo enrichi pour l'Activity :
+    // `current` (meteo active + son effet reel, toujours visible), et
+    // `nextChangeAt` (global.nextWeatherAt telle quelle -- un TIMESTAMP,
+    // jamais le type de meteo a venir : permet au frontend d'afficher un
+    // compte a rebours SANS jamais reveler gratuitement la prochaine
+    // meteo). `forecast` ne reflete QUE player.weatherForecast (deja
+    // strictement reserve a buyWeatherForecast()/farm.ts, jamais peuple
+    // autrement) -- donc null tant que la prevision n'a pas ete achetee,
+    // AUCUNE nouvelle regle metier introduite. weatherForecast (brut) reste
+    // egalement expose ci-dessous, inchange, pour compatibilite.
+    weather: {
+      current: weatherDetail(global.weather),
+      nextChangeAt: global.nextWeatherAt,
+      forecastPurchased: player.weatherForecast !== null,
+      forecast: player.weatherForecast === null ? null : weatherDetail(player.weatherForecast),
     },
     weatherForecast: player.weatherForecast,
   };
@@ -260,8 +284,20 @@ router.get("/activity/me", (req, res) => {
   void handleGetActivityMe(req, res);
 });
 
+// LOT ACTIVITY-UX-WEATHER -- extrait en fonction nommee (donnee 100%
+// statique/synchrone, aucune dependance a injecter) uniquement pour
+// pouvoir la tester directement, meme convention que les autres routes.
+// Expose le catalogue COMPLET des meteos (WEATHER_INFO, constants.ts) au
+// meme titre que crops/recipes : le panneau d'aide "Effets meteo" du
+// frontend derive ainsi TOUTE sa liste et ses valeurs du code reel, sans
+// jamais dupliquer les libelles/emojis/multiplicateurs localement.
+export function buildActivityCropsPayload(): { crops: typeof CROPS; recipes: typeof RECIPES; weatherTypes: ReturnType<typeof weatherDetail>[] } {
+  const weatherTypes = (Object.keys(WEATHER_INFO) as WeatherKey[]).map(weatherDetail);
+  return { crops: CROPS, recipes: RECIPES, weatherTypes };
+}
+
 router.get("/activity/crops", (_req, res) => {
-  res.json({ crops: CROPS, recipes: RECIPES });
+  res.json(buildActivityCropsPayload());
 });
 
 // ===========================================================================

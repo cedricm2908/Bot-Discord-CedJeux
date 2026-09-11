@@ -16,6 +16,7 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
+  buildActivityCropsPayload,
   handleActivityAutoreplant,
   handleActivityBuy,
   handleActivityCraft,
@@ -52,8 +53,9 @@ import {
   type DiscordUser,
 } from "./activity.ts";
 import { FarmError } from "../discord/farm.ts";
+import { WEATHER_INFO } from "../discord/constants.ts";
 import type { FarmStore } from "../discord/store";
-import type { GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId, QuestProgress } from "../discord/types";
+import type { GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId, QuestProgress, WeatherKey } from "../discord/types";
 
 const NOW = 1_700_000_000_000;
 const TEST_PLAYER_ID = "v2-test-player-001";
@@ -2089,4 +2091,133 @@ test("POST /activity/autoreplant puis GET /activity/me -- TEST 3 : meme flag des
 
   assert.equal(meResult.autoReplant, autoreplantResult.autoReplant, "GET /activity/me juste apres POST /activity/autoreplant doit refleter EXACTEMENT le meme flag");
   assert.equal(meResult.autoReplant, true);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-UX-WEATHER -- GET /activity/me : objet `weather` enrichi
+// ===========================================================================
+//
+// Verifie que la fuite de la prochaine meteo (le "bug" signale : le texte
+// "Prochaine meteo : ..." affiche cote frontend AVANT tout achat de
+// prevision) est bien impossible cote backend : `weather.forecast` doit
+// rester `null` tant que `player.weatherForecast` (peuple UNIQUEMENT par
+// buyWeatherForecast()/farm.ts, jamais autrement) ne l'est pas.
+// `weather.nextChangeAt` (un TIMESTAMP, jamais le type de meteo a venir)
+// reste lui TOUJOURS expose -- il ne revele rien sur la prochaine meteo,
+// seulement le moment du prochain changement.
+
+test("GET /activity/me -- weather.current reflete EXACTEMENT WEATHER_INFO[global.weather], aucune valeur inventee", async () => {
+  const global = buildGlobalState({ weather: "pests", nextWeatherAt: NOW + 522_000 });
+  const player = buildPlayerState({ weatherForecast: null });
+  const store = buildFakeStore({ player, global });
+  const deps = buildDeps({ getFarmStore: mock.fn(async () => store) });
+  const req = buildFakeReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleGetActivityMe(req as never, res as never, deps);
+
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ weather: { current: { key: WeatherKey; label: string; emoji: string; multiplier: number }; nextChangeAt: number; forecastPurchased: boolean; forecast: unknown } }];
+  assert.deepEqual(payload.weather.current, { key: "pests", ...WEATHER_INFO.pests }, "current doit venir de WEATHER_INFO, pas d'une valeur codee en dur");
+  assert.equal(payload.weather.nextChangeAt, NOW + 522_000, "nextChangeAt = global.nextWeatherAt telle quelle");
+});
+
+test("GET /activity/me -- forecast NON achete -> weather.forecast est null et weather.forecastPurchased est false (AUCUNE fuite de la prochaine meteo)", async () => {
+  const global = buildGlobalState({ nextWeatherType: "pests" });
+  const player = buildPlayerState({ weatherForecast: null });
+  const store = buildFakeStore({ player, global });
+  const deps = buildDeps({ getFarmStore: mock.fn(async () => store) });
+  const req = buildFakeReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleGetActivityMe(req as never, res as never, deps);
+
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ weather: { forecast: unknown; forecastPurchased: boolean } }];
+  assert.equal(payload.weather.forecast, null, "AUCUNE prevision affichee tant qu'elle n'a pas ete achetee");
+  assert.equal(payload.weather.forecastPurchased, false);
+  assert.equal(JSON.stringify(payload).includes("pests"), false, "le payload entier ne doit contenir AUCUNE trace du type de la prochaine meteo (global.nextWeatherType) avant achat");
+});
+
+test("GET /activity/me -- forecast DEJA achete (player.weatherForecast peuple) -> weather.forecast expose EXACTEMENT ce type, weather.forecastPurchased est true", async () => {
+  const global = buildGlobalState();
+  const player = buildPlayerState({ weatherForecast: "rain" });
+  const store = buildFakeStore({ player, global });
+  const deps = buildDeps({ getFarmStore: mock.fn(async () => store) });
+  const req = buildFakeReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleGetActivityMe(req as never, res as never, deps);
+
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ weather: { forecast: { key: WeatherKey; label: string; emoji: string; multiplier: number } | null; forecastPurchased: boolean } }];
+  assert.deepEqual(payload.weather.forecast, { key: "rain", ...WEATHER_INFO.rain });
+  assert.equal(payload.weather.forecastPurchased, true);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-UX-WEATHER -- POST /activity/forecast : la prevision achetee
+// est immediatement revelee dans la reponse ET reste cohérente au refresh
+// ===========================================================================
+
+test("POST /activity/forecast -- TEST 5 : apres achat reussi, la reponse expose immediatement weather.forecast (plus de bouton d'achat qui ne revele rien)", async () => {
+  const forecastPlayer = buildPlayerState({ coins: 150, weatherForecast: "pests" });
+  const deps = buildForecastDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: forecastPlayer, created: false })) as unknown as ActivityForecastDeps["ensurePlayerExists"],
+    buyPlayerWeatherForecast: mock.fn(async (_playerId: string) => "pests") as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"],
+    getPlayer: mock.fn(async (_playerId: string) => forecastPlayer) as unknown as ActivityForecastDeps["getPlayer"],
+  });
+  const req = buildFakeForecastReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityForecast(req as never, res as never, deps);
+
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ weather: { forecast: { key: WeatherKey } | null; forecastPurchased: boolean } }];
+  assert.deepEqual(payload.weather.forecast, { key: "pests", ...WEATHER_INFO.pests });
+  assert.equal(payload.weather.forecastPurchased, true);
+});
+
+test("POST /activity/forecast puis GET /activity/me -- TEST 6 : le forecast achete reste expose de facon identique au refresh (pas de re-verrouillage incorrect)", async () => {
+  const pgPlayerState = buildPlayerState({ coins: 200, weatherForecast: null });
+  const pgGlobal = buildGlobalState({ nextWeatherType: "rain" });
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityForecastDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityForecastDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const buyPlayerWeatherForecast = mock.fn(async (_playerId: string) => {
+    pgPlayerState.coins -= 15;
+    pgPlayerState.weatherForecast = pgGlobal.nextWeatherType;
+    return pgGlobal.nextWeatherType;
+  }) as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityForecastDeps["ensurePlayerExists"];
+
+  const forecastResult = await resolveActivityForecast(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, buyPlayerWeatherForecast, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  // Simule le refresh automatique (12s) de l'Activity : un second appel
+  // GET /activity/me, independant du precedent, sur le MEME etat Postgres.
+  const meAfterRefresh = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.deepEqual(meAfterRefresh.weather.forecast, forecastResult.weather.forecast, "le refresh ne doit JAMAIS re-verrouiller un forecast deja achete");
+  assert.equal(meAfterRefresh.weather.forecastPurchased, true);
+  assert.deepEqual(meAfterRefresh.weather.forecast, { key: "rain", ...WEATHER_INFO.rain });
+});
+
+// ===========================================================================
+// LOT ACTIVITY-UX-WEATHER -- GET /activity/crops : catalogue meteo statique
+// ===========================================================================
+
+test("buildActivityCropsPayload -- weatherTypes derive EXACTEMENT de WEATHER_INFO (aucune valeur dupliquee/inventee)", () => {
+  const payload = buildActivityCropsPayload();
+
+  assert.equal(payload.weatherTypes.length, Object.keys(WEATHER_INFO).length);
+  for (const key of Object.keys(WEATHER_INFO) as WeatherKey[]) {
+    const entry = payload.weatherTypes.find((w) => w.key === key);
+    assert.ok(entry, `weatherTypes doit contenir l'entree "${key}"`);
+    assert.deepEqual(entry, { key, ...WEATHER_INFO[key] });
+  }
 });

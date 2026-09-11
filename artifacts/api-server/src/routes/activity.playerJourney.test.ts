@@ -60,6 +60,7 @@ import {
   sellPlayerItems,
   togglePlayerAutoReplant,
 } from "../discord/db/farmPlayerActions.ts";
+import { WEATHER_INFO } from "../discord/constants.ts";
 import type { FarmStore } from "../discord/store";
 import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
 
@@ -403,16 +404,28 @@ test("PLAYER JOURNEY -- parcours complet Activity Farm2Win PostgreSQL (plant -> 
   assert.equal(meAfterSkin.plotSkin, skinResult.plotSkin, "GET /me juste après skin() doit refléter EXACTEMENT le même thème");
 
   // ==========================================================================
-  // Y. Marché/météo -- acheter une prévision météo
+  // Y. Marché/météo -- météo actuelle visible, prochaine météo VERROUILLEE
+  // tant qu'aucune prévision n'a été achetée, puis achat d'une prévision
   // ==========================================================================
+  const meBeforeForecast = await getMe();
+  assert.deepEqual(meBeforeForecast.weather.current, { key: "normal", ...WEATHER_INFO.normal }, "météo actuelle toujours visible, sans achat");
+  assert.equal(meBeforeForecast.weather.nextChangeAt, dbGlobal.nextWeatherAt, "le TIMESTAMP du prochain changement est toujours exposé (ne révèle pas le type de météo)");
+  assert.equal(meBeforeForecast.weather.forecast, null, "aucune prévision achetée -> prochaine météo VERROUILLÉE, aucune fuite");
+  assert.equal(meBeforeForecast.weather.forecastPurchased, false);
+  assert.equal(JSON.stringify(meBeforeForecast).includes(dbGlobal.nextWeatherType), false, "le payload ne doit contenir AUCUNE trace du type de la prochaine météo avant achat");
+
   const forecastDeps: ActivityForecastDeps = { ...commonDeps, buyPlayerWeatherForecast: journeyBuyPlayerWeatherForecast };
   const forecastResult = await resolveActivityForecast(DISCORD_USER, poisonedJsonStore, forecastDeps);
   assert.equal(forecastResult.coins, 585, "600 - 15 (coût de la prévision météo) = 585");
   assert.equal(forecastResult.weatherForecast, "rain", "doit refléter global.nextWeatherType");
+  assert.deepEqual(forecastResult.weather.forecast, { key: "rain", ...WEATHER_INFO.rain }, "la prévision achetée est immédiatement révélée avec son effet réel");
+  assert.equal(forecastResult.weather.forecastPurchased, true);
 
   const meAfterForecast = await getMe();
   assert.equal(meAfterForecast.coins, forecastResult.coins, "GET /me juste après forecast() doit refléter EXACTEMENT les mêmes coins");
   assert.equal(meAfterForecast.weatherForecast, forecastResult.weatherForecast);
+  assert.deepEqual(meAfterForecast.weather.forecast, forecastResult.weather.forecast, "GET /me juste après forecast() doit refléter EXACTEMENT la même prévision (pas de re-verrouillage)");
+  assert.equal(meAfterForecast.weather.forecastPurchased, true);
 
   // ==========================================================================
   // Z. Simuler fermeture/réouverture de l'Activity : relire /activity/me et
@@ -434,4 +447,7 @@ test("PLAYER JOURNEY -- parcours complet Activity Farm2Win PostgreSQL (plant -> 
   assert.equal(finalMe.totalHarvested, 9, "3 + 3 + 3 = 9 blés récoltés au total");
   assert.equal(finalMe.quests[0]!.claimed, true);
   assert.equal(finalMe.weatherForecast, "rain");
+  assert.deepEqual(finalMe.weather.forecast, { key: "rain", ...WEATHER_INFO.rain }, "la prévision achetée respecte exactement l'état PostgreSQL réel après fermeture/réouverture");
+  assert.equal(finalMe.weather.forecastPurchased, true);
+  assert.deepEqual(finalMe.weather.current, { key: "normal", ...WEATHER_INFO.normal });
 });
