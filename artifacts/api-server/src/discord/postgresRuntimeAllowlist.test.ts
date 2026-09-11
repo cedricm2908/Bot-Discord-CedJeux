@@ -5,7 +5,11 @@
 // aucun secret manipule.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { POSTGRES_TEST_PLAYER_IDS_ENV_VAR, shouldUsePostgresRuntime } from "./postgresRuntimeAllowlist.ts";
+import {
+  POSTGRES_ALL_PLAYERS_ENABLED_ENV_VAR,
+  POSTGRES_TEST_PLAYER_IDS_ENV_VAR,
+  shouldUsePostgresRuntime,
+} from "./postgresRuntimeAllowlist.ts";
 
 const TEST_PLAYER_ID_1 = "v2-test-player-001";
 const TEST_PLAYER_ID_2 = "v2-test-player-002";
@@ -69,4 +73,41 @@ test("shouldUsePostgresRuntime 7. sans `env` fourni, lit process.env (aucune val
     if (original === undefined) delete process.env[POSTGRES_TEST_PLAYER_IDS_ENV_VAR];
     else process.env[POSTGRES_TEST_PLAYER_IDS_ENV_VAR] = original;
   }
+});
+
+// ===========================================================================
+// LOT V2-POSTGRES-ALL-USERS -- FARM2WIN_POSTGRES_ALL_PLAYERS_ENABLED
+// ===========================================================================
+
+test("shouldUsePostgresRuntime 8. ALL_PLAYERS_ENABLED=\"true\" -> true pour N'IMPORTE QUEL playerId, y compris un Discord ID jamais vu, sans allowlist", () => {
+  const env = { [POSTGRES_ALL_PLAYERS_ENABLED_ENV_VAR]: "true" };
+  assert.equal(shouldUsePostgresRuntime(TEST_PLAYER_ID_1, env), true);
+  assert.equal(shouldUsePostgresRuntime("un-tout-nouveau-joueur-jamais-vu", env), true);
+  assert.equal(shouldUsePostgresRuntime("", env), true, "meme une chaine vide (cas limite) suit la regle inconditionnelle");
+});
+
+test("shouldUsePostgresRuntime 9. ALL_PLAYERS_ENABLED absent/false -> comportement allowlist historique inchange (rollback)", () => {
+  const envAbsent = { [POSTGRES_TEST_PLAYER_IDS_ENV_VAR]: TEST_PLAYER_ID_1 };
+  assert.equal(shouldUsePostgresRuntime(TEST_PLAYER_ID_1, envAbsent), true, "allowlist toujours active si le flag global est absent");
+  assert.equal(shouldUsePostgresRuntime(TEST_PLAYER_ID_2, envAbsent), false);
+
+  const envFalse = { [POSTGRES_ALL_PLAYERS_ENABLED_ENV_VAR]: "false", [POSTGRES_TEST_PLAYER_IDS_ENV_VAR]: TEST_PLAYER_ID_1 };
+  assert.equal(shouldUsePostgresRuntime(TEST_PLAYER_ID_1, envFalse), true);
+  assert.equal(shouldUsePostgresRuntime(TEST_PLAYER_ID_2, envFalse), false, "un joueur hors allowlist reste sur JSON quand le flag global est explicitement false");
+});
+
+test("shouldUsePostgresRuntime 10. valeurs ambigues (\"1\", \"TRUE\", \" true \", \"yes\") ne sont JAMAIS traitees comme activees -- comparaison stricte ===\"true\"", () => {
+  for (const value of ["1", "TRUE", " true ", "yes", "on", "True"]) {
+    const env = { [POSTGRES_ALL_PLAYERS_ENABLED_ENV_VAR]: value };
+    assert.equal(
+      shouldUsePostgresRuntime(TEST_PLAYER_ID_1, env),
+      false,
+      `"${value}" ne doit pas activer le mode ALL_PLAYERS (seule la chaine exacte "true" le fait)`,
+    );
+  }
+});
+
+test("shouldUsePostgresRuntime 11. ALL_PLAYERS_ENABLED=\"true\" prime TOUJOURS, meme si l'allowlist est vide ou ne contient pas le joueur", () => {
+  const env = { [POSTGRES_ALL_PLAYERS_ENABLED_ENV_VAR]: "true", [POSTGRES_TEST_PLAYER_IDS_ENV_VAR]: "" };
+  assert.equal(shouldUsePostgresRuntime("joueur-totalement-absent-de-toute-liste", env), true);
 });
