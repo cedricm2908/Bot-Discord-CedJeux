@@ -1,5 +1,6 @@
 import { DiscordSDK, patchUrlMappings } from '@discord/embedded-app-sdk';
 import { buildWeatherViewModel, multiplierToEffectLabel } from './weatherFormat.js';
+import { clampQuantity, computeCraftPreview, computeMaxCraftable, computeSellPreview } from './quantitySelector.js';
 
 const CLIENT_ID = '1545070811713372262';
 const API_TARGET = 'workspaceapi-server-production-e501.up.railway.app';
@@ -69,6 +70,47 @@ let feedback = null;
 let refreshTimer = null;
 let weatherHelpOpen = false;
 let weatherTickTimer = null;
+// LOT ACTIVITY-UX-QUANTITIES -- quantite selectionnee PAR item vendable /
+// PAR recette, jamais une seule variable globale (chaque ligne garde son
+// propre etat, independamment des autres).
+const sellQuantities = {};
+const craftQuantities = {};
+
+// `kind` distingue les deux stores ('sell' | 'craft') pour reutiliser LA
+// MEME logique de controle [ − ][ n ][ + ][ MAX ] sur les deux sections
+// sans dupliquer le wiring d'evenements.
+function qtyStoreFor(kind) {
+  return kind === 'sell' ? sellQuantities : craftQuantities;
+}
+
+// Lit la quantite actuellement selectionnee pour `id`, la RECLAMPE contre
+// le maximum reel courant (stock/maxCraftable, qui peut avoir change
+// depuis le dernier refresh) et normalise le store en consequence --
+// applique automatiquement "reduire la quantite au nouveau maximum" (voir
+// mission section 6) sans jamais exiger d'action du joueur.
+function getQty(kind, id, max) {
+  const store = qtyStoreFor(kind);
+  const clamped = clampQuantity(store[id] ?? 1, max);
+  store[id] = clamped;
+  return clamped;
+}
+
+function setQty(kind, id, value, max) {
+  qtyStoreFor(kind)[id] = clampQuantity(value, max);
+  render();
+}
+
+// Composant visuel generique reutilise par la vente ET le craft.
+function quantityControlHtml(kind, id, quantity, max) {
+  const disabled = max <= 0;
+  return `
+    <div class="qty-control">
+      <button class="qty-btn" data-qty-minus="${id}" data-qty-kind="${kind}" ${disabled || quantity <= 1 ? 'disabled' : ''}>−</button>
+      <input class="qty-input" type="number" inputmode="numeric" min="1" max="${max}" step="1" value="${quantity}" data-qty-input="${id}" data-qty-kind="${kind}" ${disabled ? 'disabled' : ''} />
+      <button class="qty-btn" data-qty-plus="${id}" data-qty-kind="${kind}" ${disabled || quantity >= max ? 'disabled' : ''}>+</button>
+      <button class="mini-btn qty-max-btn" data-qty-setmax="${id}" data-qty-kind="${kind}" ${disabled ? 'disabled' : ''}>MAX</button>
+    </div>`;
+}
 
 function tierFor(unlockLevel) {
   const levels = Object.keys(TIER_COLORS).map(Number).sort((a, b) => a - b);
@@ -128,18 +170,33 @@ function plantCrop(plotIndex, cropId) {
 function harvestAll() { runAction(() => postAction('/activity/harvest'), 'Récolte effectuée !'); }
 function claimDaily() { runAction(() => postAction('/activity/daily'), 'Récompense quotidienne récupérée !'); }
 function toggleAutoReplant() { runAction(() => postAction('/activity/autoreplant'), 'Replantation auto mise à jour.'); }
-function sellItem(itemId) {
+// LOT ACTIVITY-UX-QUANTITIES -- la quantite reellement envoyee au backend
+// (POST /activity/sell { itemId, amount }) est TOUJOURS relue/reclampee
+// juste avant l'appel (jamais une valeur potentiellement perimee) --
+// meme routes existantes, seul le montant envoye change desormais.
+function confirmSell(itemId) {
+  const stock = currentMe?.inventory?.[itemId] ?? 0;
+  const quantity = getQty('sell', itemId, stock);
+  if (quantity < 1) return;
   const item = cropById[itemId] || recipeById[itemId];
-  runAction(() => postAction('/activity/sell', { itemId }), `${item?.name ?? itemId} vendu(e) !`);
+  runAction(() => postAction('/activity/sell', { itemId, amount: quantity }), `${quantity}× ${item?.name ?? itemId} vendu(e) !`);
+  delete sellQuantities[itemId];
 }
 function sellAll() { runAction(() => postAction('/activity/sell', { itemId: 'all' }), 'Inventaire vendu !'); }
 function buyUpgrade(kind) {
   const label = UPGRADE_LABELS[kind]?.label ?? kind;
   runAction(() => postAction('/activity/buy', { kind, quantity: 1 }), `${label} améliorée !`);
 }
-function craftRecipe(recipeId) {
+// Meme principe que confirmSell() : POST /activity/craft { recipeId,
+// quantity } -- route existante inchangee, seule la quantite envoyee
+// varie desormais selon le selecteur du joueur.
+function confirmCraft(recipeId) {
   const recipe = recipeById[recipeId];
-  runAction(() => postAction('/activity/craft', { recipeId, quantity: 1 }), `${recipe?.name ?? recipeId} fabriqué !`);
+  const maxCraftable = recipe ? computeMaxCraftable(recipe.ingredients, currentMe?.inventory ?? {}) : 0;
+  const quantity = getQty('craft', recipeId, maxCraftable);
+  if (quantity < 1) return;
+  runAction(() => postAction('/activity/craft', { recipeId, quantity }), `${quantity}× ${recipe?.name ?? recipeId} fabriqué !`);
+  delete craftQuantities[recipeId];
 }
 function claimQuestAction(index) {
   runAction(() => postAction('/activity/quest-claim', { questIndex: index }), 'Récompense de mission récupérée !');
@@ -151,6 +208,36 @@ function buyForecastAction() {
   runAction(() => postAction('/activity/forecast'), 'Prévision météo débloquée !');
 }
 function toggleWeatherHelp() { weatherHelpOpen = !weatherHelpOpen; render(); }
+
+// LOT ACTIVITY-UX-QUANTITIES -- [ − ][ n ][ + ][ MAX ] pour la vente ET le
+// craft. AUCUN de ces handlers n'appelle l'API : ils ne font que mettre a
+// jour sellQuantities/craftQuantities puis re-render() la preview
+// (gain/couts) localement -- l'appel reseau n'a lieu qu'au clic sur
+// "Vendre X"/"Fabriquer X" (confirmSell/confirmCraft ci-dessus).
+function qtyMaxFor(kind, id) {
+  if (!currentMe) return 0;
+  if (kind === 'sell') return currentMe.inventory?.[id] ?? 0;
+  const recipe = recipeById[id];
+  return recipe ? computeMaxCraftable(recipe.ingredients, currentMe.inventory ?? {}) : 0;
+}
+function handleQtyMinus(kind, id) {
+  const max = qtyMaxFor(kind, id);
+  setQty(kind, id, getQty(kind, id, max) - 1, max);
+}
+function handleQtyPlus(kind, id) {
+  const max = qtyMaxFor(kind, id);
+  setQty(kind, id, getQty(kind, id, max) + 1, max);
+}
+function handleQtySetMax(kind, id) {
+  const max = qtyMaxFor(kind, id);
+  setQty(kind, id, max, max);
+}
+function handleQtyInput(kind, id, rawValue) {
+  const max = qtyMaxFor(kind, id);
+  // Saisie vide/invalide -> clampQuantity() retombe proprement sur 1
+  // (ou 0 si max est deja 0), jamais NaN/negatif/decimal affiche.
+  setQty(kind, id, rawValue === '' ? NaN : Number(rawValue), max);
+}
 
 function scheduleRefresh() {
   if (refreshTimer) clearTimeout(refreshTimer);
@@ -208,23 +295,36 @@ function pickerHtml(me) {
     </div>`;
 }
 
+// LOT ACTIVITY-UX-QUANTITIES -- vente PAR quantite choisie (au lieu d'un
+// simple bouton "Vendre" qui vendait tout le stock de l'item en un clic).
+// "Tout vendre" (bouton global ci-dessous) reste disponible en parallele :
+// il ne fait PAS la meme chose que "MAX" sur une seule ligne (il vend TOUT
+// l'inventaire en une requete, MAX+Vendre ne vide qu'UN item) -- les deux
+// coexistent, pas de doublon fonctionnel.
 function inventoryHtml(me) {
   const entries = Object.entries(me.inventory);
   if (!entries.length) return '<p class="empty-note">Ton inventaire est vide — récolte des cultures pour commencer.</p>';
   let totalValue = 0;
-  const rows = entries.map(([itemId, amount]) => {
+  const rows = entries.map(([itemId, stock]) => {
     const item = cropById[itemId] || recipeById[itemId];
-    if (!item) return '';
+    if (!item || stock <= 0) return '';
     const unitPrice = itemUnitPrice(itemId, me.global.marketMultiplier);
-    const lineValue = unitPrice * amount;
-    totalValue += lineValue;
+    totalValue += unitPrice * stock;
+    const quantity = getQty('sell', itemId, stock);
+    const preview = computeSellPreview(stock, unitPrice, quantity);
     return `
       <div class="inv-row">
-        <span class="inv-icon">${item.emoji}</span>
-        <span class="inv-name">${item.name}</span>
-        <span class="inv-qty">×${amount}</span>
-        <span class="inv-price">💰 ${unitPrice}/u · ${lineValue} total</span>
-        <button class="mini-btn" data-sell="${itemId}">Vendre</button>
+        <div class="inv-info">
+          <span class="inv-icon">${item.emoji}</span>
+          <span class="inv-name">${item.name}</span>
+          <span class="inv-qty">Stock : ${stock}</span>
+          <span class="inv-price">${unitPrice} 🪙 / unité</span>
+        </div>
+        <div class="qty-row">
+          ${quantityControlHtml('sell', itemId, preview.quantity, stock)}
+          <span class="qty-gain">Gain : ${preview.gain} 🪙</span>
+          <button class="mini-btn qty-confirm-btn" data-sell-confirm="${itemId}" ${preview.quantity < 1 ? 'disabled' : ''}>Vendre ${preview.quantity}</button>
+        </div>
       </div>`;
   }).join('');
   return `<div class="inv-list">${rows}</div><button class="action-btn" id="sellAllBtn">🏪 Tout vendre (💰 ${totalValue})</button>`;
@@ -253,20 +353,37 @@ function upgradesHtml(me) {
     </div>`;
 }
 
-function craftingHtml() {
+// LOT ACTIVITY-UX-QUANTITIES -- quantite a fabriquer choisie par recette
+// (au lieu d'un simple bouton "Fabriquer" qui ne fabriquait qu'une unite).
+// maxCraftable/couts/resultat sont recalcules EN DIRECT (computeMaxCraftable/
+// computeCraftPreview, quantitySelector.js) a partir de recipe.ingredients
+// (RECIPES, jamais hardcode) + me.inventory -- aucun appel API pour la
+// preview, uniquement au clic sur "Fabriquer X" (confirmCraft()).
+function craftingHtml(me) {
   if (!recipes.length) return '';
   const cards = recipes.map((recipe) => {
-    const ingredients = Object.entries(recipe.ingredients).map(([cropId, qty]) => {
+    const unitIngredients = Object.entries(recipe.ingredients).map(([cropId, qty]) => {
       const crop = cropById[cropId];
       return `${qty}× ${crop?.emoji ?? ''}`;
     }).join(' + ');
+    const maxCraftable = computeMaxCraftable(recipe.ingredients, me.inventory);
+    const quantity = getQty('craft', recipe.id, maxCraftable);
+    const preview = computeCraftPreview(recipe.ingredients, me.inventory, quantity);
+    const costLines = Object.entries(preview.costs).map(([cropId, total]) => {
+      const crop = cropById[cropId];
+      const available = me.inventory[cropId] ?? 0;
+      return `<span class="craft-cost-line">${crop?.emoji ?? ''} ${total} nécessaires / ${available} disponibles</span>`;
+    }).join('');
     return `
       <div class="craft-card">
         <span class="craft-emoji">${recipe.emoji}</span>
         <span class="craft-name">${recipe.name}</span>
-        <span class="craft-ing">${ingredients}</span>
-        <span class="craft-price">💰 ${recipe.sellPrice}/u une fois vendu</span>
-        <button class="mini-btn" data-craft="${recipe.id}">Fabriquer</button>
+        <span class="craft-ing">Recette unitaire : ${unitIngredients}</span>
+        ${quantityControlHtml('craft', recipe.id, preview.quantity, maxCraftable)}
+        <div class="craft-cost">${costLines}</div>
+        <span class="craft-result">Résultat : ${preview.quantity}× ${recipe.emoji} ${recipe.name}</span>
+        ${maxCraftable === 0 ? '<span class="craft-insufficient">⚠️ Ressources insuffisantes</span>' : ''}
+        <button class="mini-btn qty-confirm-btn" data-craft-confirm="${recipe.id}" ${!preview.affordable ? 'disabled' : ''}>Fabriquer ${preview.quantity}</button>
       </div>`;
   }).join('');
   return `<div class="craft-row">${cards}</div>`;
@@ -465,14 +582,26 @@ function renderFarm() {
       .panel{ background:var(--card); border:1px solid var(--card-line); border-radius:14px; padding:14px; margin-bottom:14px; }
       .panel h3{ margin:0 0 10px; font-size:.92rem; }
       .empty-note{ font-size:.8rem; color:var(--ink-700); margin:0; }
-      .inv-list{ display:flex; flex-direction:column; gap:6px; margin-bottom:10px; }
-      .inv-row{ display:flex; align-items:center; gap:8px; font-size:.82rem; }
+      .inv-list{ display:flex; flex-direction:column; gap:8px; margin-bottom:10px; }
+      .inv-row{ display:flex; flex-direction:column; gap:6px; background:var(--stone-100); border-radius:10px; padding:8px 10px; font-size:.82rem; }
+      .inv-info{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
       .inv-icon{ font-size:1.1rem; }
-      .inv-name{ flex:1; }
-      .inv-qty{ font-family:ui-monospace, monospace; color:var(--ink-700); }
+      .inv-name{ flex:1; font-weight:600; min-width:60px; }
+      .inv-qty{ font-family:ui-monospace, monospace; color:var(--ink-700); font-size:.72rem; }
       .inv-price{ font-family:ui-monospace, monospace; font-size:.7rem; color:var(--harvest); white-space:nowrap; }
       .mini-btn{ font-family:inherit; font-size:.72rem; font-weight:600; padding:5px 10px; border-radius:7px; border:1px solid var(--card-line); background:var(--stone-100); cursor:pointer; }
       .mini-btn:disabled{ opacity:.4; cursor:not-allowed; }
+
+      .qty-row{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+      .qty-gain{ font-family:ui-monospace, monospace; font-size:.74rem; color:var(--harvest); font-weight:700; white-space:nowrap; }
+      .qty-control{ display:inline-flex; align-items:center; gap:4px; }
+      .qty-btn{ font-family:inherit; font-size:.85rem; font-weight:700; width:24px; height:24px; line-height:1; border-radius:6px; border:1px solid var(--card-line); background:var(--card); color:var(--ink-900); cursor:pointer; }
+      .qty-btn:disabled{ opacity:.35; cursor:not-allowed; }
+      .qty-input{ width:42px; text-align:center; font-family:ui-monospace, monospace; font-size:.78rem; border:1px solid var(--card-line); border-radius:6px; padding:3px 2px; background:var(--card); color:var(--ink-900); }
+      .qty-input:disabled{ opacity:.4; }
+      .qty-max-btn{ font-size:.64rem; padding:4px 7px; }
+      .qty-confirm-btn{ background:var(--leaf); color:#fff; border-color:var(--leaf); }
+      .qty-confirm-btn:disabled{ background:var(--stone-100); color:var(--ink-700); border-color:var(--card-line); }
 
       .upgrade-row{ display:grid; grid-template-columns:repeat(auto-fit, minmax(140px,1fr)); gap:8px; }
       .upgrade-card{ display:flex; flex-direction:column; align-items:center; gap:4px; background:var(--stone-100); border-radius:10px; padding:10px; }
@@ -481,12 +610,15 @@ function renderFarm() {
       .upgrade-level{ font-family:ui-monospace, monospace; font-size:.7rem; color:var(--ink-700); }
       .upgrade-price{ font-family:ui-monospace, monospace; font-size:.72rem; font-weight:700; color:var(--harvest); }
 
-      .craft-row{ display:grid; grid-template-columns:repeat(auto-fit, minmax(140px,1fr)); gap:8px; }
-      .craft-card{ display:flex; flex-direction:column; align-items:center; gap:3px; background:var(--stone-100); border-radius:10px; padding:10px; text-align:center; }
+      .craft-row{ display:grid; grid-template-columns:repeat(auto-fit, minmax(190px,1fr)); gap:8px; }
+      .craft-card{ display:flex; flex-direction:column; align-items:center; gap:4px; background:var(--stone-100); border-radius:10px; padding:10px; text-align:center; }
       .craft-emoji{ font-size:1.3rem; }
       .craft-name{ font-size:.75rem; font-weight:600; }
-      .craft-ing{ font-size:.68rem; color:var(--ink-700); font-family:ui-monospace, monospace; }
-      .craft-price{ font-size:.68rem; color:var(--harvest); font-family:ui-monospace, monospace; }
+      .craft-ing{ font-size:.66rem; color:var(--ink-700); font-family:ui-monospace, monospace; }
+      .craft-cost{ display:flex; flex-direction:column; gap:2px; }
+      .craft-cost-line{ font-size:.66rem; font-family:ui-monospace, monospace; color:var(--ink-700); }
+      .craft-result{ font-size:.7rem; font-weight:600; color:var(--harvest); font-family:ui-monospace, monospace; }
+      .craft-insufficient{ font-size:.68rem; font-weight:700; color:#8c2f2f; }
 
       .quest-list{ display:flex; flex-direction:column; gap:8px; }
       .quest-row{ display:grid; grid-template-columns:1fr auto; grid-template-areas:"label reward" "bar bar" "progress action"; gap:2px 8px; align-items:center; background:var(--stone-100); border-radius:10px; padding:8px 10px; }
@@ -574,7 +706,7 @@ function renderFarm() {
 
       <div class="panel"><h3>📦 Inventaire</h3>${inventoryHtml(me)}</div>
       <div class="panel"><h3>🛠️ Améliorations</h3>${upgradesHtml(me)}</div>
-      ${recipes.length ? `<div class="panel"><h3>🍞 Ateliers de transformation</h3>${craftingHtml()}</div>` : ''}
+      ${recipes.length ? `<div class="panel"><h3>🍞 Ateliers de transformation</h3>${craftingHtml(me)}</div>` : ''}
 
       <div class="panel"><h3>🌾 Défi du jour</h3>${challengeHtml(me)}</div>
       <div class="panel"><h3>📜 Missions quotidiennes</h3>${questsHtml(me)}</div>
@@ -595,13 +727,23 @@ function renderFarm() {
   document.getElementById('pickerClose')?.addEventListener('click', closePicker);
   document.getElementById('pickerBackdrop')?.addEventListener('click', (e) => { if (e.target.id === 'pickerBackdrop') closePicker(); });
   appEl.querySelectorAll('.crop-option').forEach((el) => el.addEventListener('click', () => plantCrop(pickerOpenForPlot, el.dataset.crop)));
-  appEl.querySelectorAll('[data-sell]').forEach((el) => el.addEventListener('click', () => sellItem(el.dataset.sell)));
   appEl.querySelectorAll('[data-buy]').forEach((el) => el.addEventListener('click', () => buyUpgrade(el.dataset.buy)));
-  appEl.querySelectorAll('[data-craft]').forEach((el) => el.addEventListener('click', () => craftRecipe(el.dataset.craft)));
   appEl.querySelectorAll('[data-quest]').forEach((el) => el.addEventListener('click', () => claimQuestAction(Number(el.dataset.quest))));
   appEl.querySelectorAll('[data-skin]').forEach((el) => el.addEventListener('click', () => chooseSkinAction(el.dataset.skin)));
   document.getElementById('forecastBtn')?.addEventListener('click', buyForecastAction);
   document.getElementById('weatherHelpToggle')?.addEventListener('click', toggleWeatherHelp);
+
+  // LOT ACTIVITY-UX-QUANTITIES -- wiring generique [ − ][ n ][ + ][ MAX ],
+  // partage entre les lignes de vente ET les cartes de craft via
+  // data-qty-kind ('sell' | 'craft'). AUCUN de ces listeners n'appelle
+  // l'API (voir handleQty*/render()) -- seuls "Vendre X"/"Fabriquer X"
+  // declenchent une requete reseau.
+  appEl.querySelectorAll('[data-qty-minus]').forEach((el) => el.addEventListener('click', () => handleQtyMinus(el.dataset.qtyKind, el.dataset.qtyMinus)));
+  appEl.querySelectorAll('[data-qty-plus]').forEach((el) => el.addEventListener('click', () => handleQtyPlus(el.dataset.qtyKind, el.dataset.qtyPlus)));
+  appEl.querySelectorAll('[data-qty-setmax]').forEach((el) => el.addEventListener('click', () => handleQtySetMax(el.dataset.qtyKind, el.dataset.qtySetmax)));
+  appEl.querySelectorAll('[data-qty-input]').forEach((el) => el.addEventListener('change', () => handleQtyInput(el.dataset.qtyKind, el.dataset.qtyInput, el.value)));
+  appEl.querySelectorAll('[data-sell-confirm]').forEach((el) => el.addEventListener('click', () => confirmSell(el.dataset.sellConfirm)));
+  appEl.querySelectorAll('[data-craft-confirm]').forEach((el) => el.addEventListener('click', () => confirmCraft(el.dataset.craftConfirm)));
 }
 
 function render() {

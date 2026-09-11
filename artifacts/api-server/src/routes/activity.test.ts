@@ -1414,6 +1414,31 @@ test("POST /activity/craft puis GET /activity/me -- TEST 5 : meme inventaire des
   assert.equal(meResult.inventory.bread, 1);
 });
 
+// LOT ACTIVITY-UX-QUANTITIES -- le frontend peut desormais envoyer une
+// quantite > 1 en UNE seule requete (selecteur [ - ][ n ][ + ][ MAX ]) :
+// verifie que le body est transmis tel quel a craftPlayerItem(), sans
+// aucune transformation/plafonnement cote route (craft() de farm.ts reste
+// seul responsable de la validation reelle -- 1-40, ingredients
+// suffisants).
+test("POST /activity/craft -- TEST 6 : quantity > 1 (selecteur frontend) -> transmise telle quelle a craftPlayerItem(), payload reflete la quantite produite", async () => {
+  const craftedPlayer = buildPlayerState({ inventory: { wheat: 1, bread: 5 } });
+  const craftPlayerItem = mock.fn(async (_playerId: string, _recipeId: ProductId, _quantity: number) => 5) as unknown as ActivityCraftDeps["craftPlayerItem"];
+  const getPlayer = mock.fn(async (_playerId: string) => craftedPlayer) as unknown as ActivityCraftDeps["getPlayer"];
+  const deps = buildCraftDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    craftPlayerItem,
+    getPlayer,
+  });
+  const req = buildFakeCraftReq("Bearer real-discord-token", { recipeId: "bread", quantity: 5 });
+  const res = buildFakeRes();
+
+  await handleActivityCraft(req as never, res as never, deps);
+
+  assert.deepEqual((craftPlayerItem as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "bread", 5]);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ inventory: Record<string, number> }];
+  assert.equal(payload.inventory.bread, 5);
+});
+
 // ===========================================================================
 // LOT ACTIVITY-PG4 -- POST /activity/daily
 // ===========================================================================

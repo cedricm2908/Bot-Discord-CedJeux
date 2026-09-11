@@ -451,3 +451,164 @@ test("PLAYER JOURNEY -- parcours complet Activity Farm2Win PostgreSQL (plant -> 
   assert.equal(finalMe.weather.forecastPurchased, true);
   assert.deepEqual(finalMe.weather.current, { key: "normal", ...WEATHER_INFO.normal });
 });
+
+// ===========================================================================
+// LOT ACTIVITY-UX-QUANTITIES -- craft en quantite >1 EN UNE SEULE requete,
+// puis vente partielle suivie d'une vente du reste ("MAX"), de bout en
+// bout contre les VRAIES fonctions farm.ts (meme fake-DB en memoire que le
+// player journey ci-dessus, fixture independante pour ne pas perturber les
+// totaux du scenario precedent).
+//
+// H. (previews) : les valeurs ci-dessous sont EXACTEMENT celles que
+// computeCraftPreview()/computeSellPreview() (quantitySelector.js, cote
+// frontend -- deja testees isolement dans quantitySelector.test.js avec
+// les memes chiffres : Pain = 3 x blé, prix blé = 4) calculeraient AVANT
+// meme d'envoyer la requete : la preview et la realite backend
+// convergent parce que les DEUX utilisent la MEME recette RECIPES/le MEME
+// prix, jamais une formule dupliquee/divergente.
+test("PLAYER JOURNEY -- LOT ACTIVITY-UX-QUANTITIES : craft quantite >1 en une requete, puis vente partielle + vente du reste (MAX), coherent de bout en bout", async () => {
+  const journeyNow = Date.now();
+
+  const dbPlayer: PlayerState = {
+    userId: TEST_PLAYER_ID,
+    coins: 0,
+    level: 10,
+    xp: 0,
+    // A. Obtenir suffisamment de blé -- seede directement l'inventaire
+    // (le chemin plant -> attendre la pousse -> récolter est déjà exercé
+    // en profondeur par le player journey principal ci-dessus ; celui-ci
+    // se concentre sur craft/sell en quantité).
+    plots: [{ cropId: null, plantedAt: null, notifiedReady: false }],
+    inventory: { wheat: 20 },
+    irrigationLevel: 0,
+    fertilizerLevel: 0,
+    lastDailyAt: null,
+    autoReplant: false,
+    weeklySnapshotCoins: 0,
+    createdAt: journeyNow,
+    updatedAt: journeyNow,
+    totalHarvested: 0,
+    quests: [],
+    questsResetAt: journeyNow,
+    plotSkin: "classic",
+    unlockedSkins: ["classic"],
+    weatherForecast: null,
+  };
+
+  const dbGlobal: GlobalState = {
+    marketMultiplier: 1,
+    previousMarketMultiplier: 1,
+    marketUpdatedAt: journeyNow,
+    weather: "normal",
+    weatherMultiplier: 1,
+    weatherChangedAt: null,
+    weatherExpiresAt: null,
+    nextWeatherAt: journeyNow,
+    nextWeatherType: "rain",
+    contract: { cropId: "carrot", required: 20, remaining: 20, bonusMultiplier: 1.6, renewedAt: journeyNow },
+    weeklyStartedAt: journeyNow,
+    dailyChallenge: {
+      cropId: "potato",
+      target: 200,
+      progress: 0,
+      contributors: [],
+      rewardCoins: 80,
+      startedAt: journeyNow,
+      completed: false,
+      rewarded: false,
+    },
+  };
+
+  async function fakeMutatePlayer(
+    _playerId: string,
+    mutator: (player: PlayerState) => void | Promise<void>,
+  ): Promise<PlayerState> {
+    await mutator(dbPlayer);
+    return dbPlayer;
+  }
+  async function fakeMutatePlayerAndGlobal(
+    _playerId: string,
+    mutator: (player: PlayerState, global: GlobalState) => void | Promise<void>,
+  ): Promise<{ player: PlayerState; global: GlobalState }> {
+    await mutator(dbPlayer, dbGlobal);
+    return { player: dbPlayer, global: dbGlobal };
+  }
+  async function fakeGetGlobalState(): Promise<GlobalState | null> {
+    return dbGlobal;
+  }
+  async function fakeGetPlayer(_playerId: string): Promise<PlayerState | null> {
+    return dbPlayer;
+  }
+  async function fakeEnsurePlayerExists(_playerId: string) {
+    return { player: dbPlayer, created: false };
+  }
+  const shouldUsePostgresRuntime = () => true;
+  const requireDiscordUser = async (_authHeader: string | undefined) => DISCORD_USER;
+  const getFarmStore = async () => poisonedJsonStore;
+
+  const commonDeps = {
+    requireDiscordUser,
+    getFarmStore,
+    shouldUsePostgresRuntime,
+    ensurePlayerExists: fakeEnsurePlayerExists,
+    getPlayer: fakeGetPlayer,
+    getGlobalState: fakeGetGlobalState,
+  };
+
+  const journeyCraftPlayerItem = (playerId: string, recipeId: ProductId, quantity: number) =>
+    craftPlayerItem(playerId, recipeId, quantity, { mutatePlayer: fakeMutatePlayer, getGlobalState: fakeGetGlobalState });
+  const journeySellPlayerItems = (playerId: string, itemId: InventoryId | "all", requestedAmount: number | null) =>
+    sellPlayerItems(playerId, itemId, requestedAmount, { mutatePlayerAndGlobal: fakeMutatePlayerAndGlobal });
+
+  const meDeps: ActivityMeDeps = { ...commonDeps };
+  async function getMe() {
+    return resolveActivityMe(DISCORD_USER, poisonedJsonStore, meDeps);
+  }
+
+  // ==========================================================================
+  // B. Craft plusieurs pains en UNE SEULE requête (quantity > 1)
+  // ==========================================================================
+  const craftDeps: ActivityCraftDeps = { ...commonDeps, craftPlayerItem: journeyCraftPlayerItem };
+  const craftResult = await resolveActivityCraft(DISCORD_USER, "bread", 5, poisonedJsonStore, craftDeps);
+  assert.equal(craftResult.inventory.wheat, 5, "20 - (3 blé x 5 pains) = 5 blés restants");
+  assert.equal(craftResult.inventory.bread, 5, "5 pains produits en UNE requête (quantity=5)");
+
+  // ==========================================================================
+  // C. Vérifier l'inventaire (persistance)
+  // ==========================================================================
+  const meAfterCraft = await getMe();
+  assert.deepEqual(meAfterCraft.inventory, craftResult.inventory, "GET /me juste après craft(quantity=5) doit refléter EXACTEMENT le même inventaire");
+
+  // ==========================================================================
+  // D. Vendre SEULEMENT une partie (amount > 1 mais < stock total : 2 sur 5)
+  // ==========================================================================
+  const sellDeps: ActivitySellDeps = { ...commonDeps, sellPlayerItems: journeySellPlayerItems };
+  const partialSellResult = await resolveActivitySell(DISCORD_USER, "bread", 2, poisonedJsonStore, sellDeps);
+  assert.equal(partialSellResult.coins, 36, "2 pains x 18 pièces (prix de vente du pain) = 36");
+  assert.equal(partialSellResult.inventory.bread, 3, "5 - 2 = 3 pains restants, PAS tout l'inventaire vendu");
+
+  // ==========================================================================
+  // E. Vérifier inventaire restant + coins
+  // ==========================================================================
+  const meAfterPartialSell = await getMe();
+  assert.equal(meAfterPartialSell.coins, 36);
+  assert.equal(meAfterPartialSell.inventory.bread, 3);
+
+  // ==========================================================================
+  // F. Vendre le reste avec "MAX" (montant EXACT du stock restant, comme le
+  // ferait le bouton MAX cote frontend -- pas itemId:"all")
+  // ==========================================================================
+  const remainingStock = meAfterPartialSell.inventory.bread ?? 0;
+  const maxSellResult = await resolveActivitySell(DISCORD_USER, "bread", remainingStock, poisonedJsonStore, sellDeps);
+  assert.equal(maxSellResult.coins, 90, "36 + (3 pains x 18 pièces) = 90");
+  assert.equal(maxSellResult.inventory.bread, undefined, "plus aucun pain -- inventaire vidé de ce type");
+
+  // ==========================================================================
+  // G. GET /me final cohérent
+  // ==========================================================================
+  const finalMe = await getMe();
+  assert.equal(finalMe.coins, maxSellResult.coins);
+  assert.deepEqual(finalMe.inventory, maxSellResult.inventory, "GET /me final doit refléter EXACTEMENT le même inventaire (aucun pain, 5 blés restants)");
+  assert.equal(finalMe.inventory.wheat, 5);
+  assert.equal(finalMe.coins, 90);
+});
