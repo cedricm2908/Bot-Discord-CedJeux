@@ -17,18 +17,21 @@ import { mock, test } from "node:test";
 import {
   handleActivityBuy,
   handleActivityCraft,
+  handleActivityDaily,
   handleActivityHarvest,
   handleActivityPlant,
   handleActivitySell,
   handleGetActivityMe,
   resolveActivityBuy,
   resolveActivityCraft,
+  resolveActivityDaily,
   resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
   resolveActivitySell,
   type ActivityBuyDeps,
   type ActivityCraftDeps,
+  type ActivityDailyDeps,
   type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
@@ -1394,4 +1397,138 @@ test("POST /activity/craft puis GET /activity/me -- TEST 5 : meme inventaire des
   assert.deepEqual(meResult.inventory, craftResult.inventory, "GET /activity/me juste apres POST /activity/craft doit refleter EXACTEMENT le meme inventaire");
   assert.equal(meResult.inventory.wheat, 3);
   assert.equal(meResult.inventory.bread, 1);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG4 -- POST /activity/daily
+// ===========================================================================
+
+function buildDailyDeps(overrides: Partial<ActivityDailyDeps> = {}): ActivityDailyDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityDailyDeps["ensurePlayerExists"],
+    claimPlayerDaily: mock.fn(async (_playerId: string) => 0) as unknown as ActivityDailyDeps["claimPlayerDaily"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityDailyDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityDailyDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeDailyReq(authHeader: string | undefined): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body: {} };
+}
+
+test("POST /activity/daily -- TEST 1 : joueur allowliste -> ensurePlayerExists + claimPlayerDaily + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const rewardedPlayer = buildPlayerState({ coins: 246, lastDailyAt: NOW });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: rewardedPlayer, created: false })) as unknown as ActivityDailyDeps["ensurePlayerExists"];
+  const claimPlayerDaily = mock.fn(async (_playerId: string) => 46) as unknown as ActivityDailyDeps["claimPlayerDaily"];
+  const getPlayer = mock.fn(async (_playerId: string) => rewardedPlayer) as unknown as ActivityDailyDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityDailyDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildDailyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    claimPlayerDaily,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeDailyReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityDaily(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((claimPlayerDaily as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((claimPlayerDaily as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number }];
+  assert.equal(payload.coins, 246, "les coins doivent refleter l'etat Postgres post-reclamation");
+});
+
+test("POST /activity/daily -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, claimPlayerDaily (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ coins: 200, lastDailyAt: null });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildDailyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityDailyDeps["ensurePlayerExists"],
+    claimPlayerDaily: mock.fn(async () => {
+      throw new Error("claimPlayerDaily (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityDailyDeps["claimPlayerDaily"],
+  });
+  const req = buildFakeDailyReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityDaily(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real claimDaily() applique");
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+test("POST /activity/daily -- TEST 3 : joueur allowliste, cooldown actif -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildDailyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    claimPlayerDaily: mock.fn(async () => {
+      throw new FarmError("Ta récompense revient dans environ 5 h.");
+    }) as unknown as ActivityDailyDeps["claimPlayerDaily"],
+  });
+  const req = buildFakeDailyReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityDaily(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Ta récompense revient dans environ 5 h.");
+});
+
+test("POST /activity/daily puis GET /activity/me -- TEST 4 : memes coins des deux cotes pour un joueur allowliste", async () => {
+  const pgPlayerState = buildPlayerState({ coins: 200, level: 3, lastDailyAt: null });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityDailyDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityDailyDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const claimPlayerDaily = mock.fn(async (_playerId: string) => {
+    const reward = 40 + pgPlayerState.level * 2;
+    pgPlayerState.coins += reward;
+    pgPlayerState.lastDailyAt = NOW;
+    return reward;
+  }) as unknown as ActivityDailyDeps["claimPlayerDaily"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityDailyDeps["ensurePlayerExists"];
+
+  const dailyResult = await resolveActivityDaily(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, claimPlayerDaily, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.coins, dailyResult.coins, "GET /activity/me juste apres POST /activity/daily doit refleter EXACTEMENT les memes coins");
+  assert.equal(meResult.coins, 246);
 });

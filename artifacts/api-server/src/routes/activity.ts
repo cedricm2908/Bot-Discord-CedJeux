@@ -24,6 +24,7 @@ import {
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
 import {
   buyPlayerUpgrade,
+  claimPlayerDaily,
   craftPlayerItem,
   harvestPlayerCrops,
   plantPlayerCrop,
@@ -772,18 +773,80 @@ router.post("/activity/craft", (req, res) => {
   void handleActivityCraft(req, res);
 });
 
-router.post("/activity/daily", async (req, res) => {
+// LOT ACTIVITY-PG4 (daily) -- meme pattern que plant/harvest/sell/buy/craft.
+// claimPlayerDaily() (farmPlayerActions.ts) reutilise claimDaily() de
+// ../farm.ts telle quelle -- y compris son cooldown de 20h porte par
+// player.lastDailyAt sur la ligne joueur elle-meme, deja protege contre
+// deux reclamations concurrentes du MEME joueur par le verrou de ligne
+// pose par mutatePlayer() (SELECT ... FOR UPDATE) : AUCUN ledger
+// reward_claims separe n'existe pour cette action, donc aucune ecriture
+// append-only supplementaire a gerer ici (voir le commentaire de
+// claimPlayerDaily() dans farmPlayerActions.ts). Erreur metier propagee
+// telle quelle (cooldown actif), deja geree par le meme catch FarmError
+// que le chemin JSON ci-dessous.
+//
+// claimPlayerDaily() retourne uniquement le montant de la recompense, pas
+// le player mis a jour -- une relecture explicite via getPlayer() est
+// donc necessaire, exactement comme pour plant/harvest/sell/buy/craft.
+export interface ActivityDailyDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  claimPlayerDaily: typeof claimPlayerDaily;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityDailyDeps: ActivityDailyDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  claimPlayerDaily,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityDaily(
+  discordUser: DiscordUser,
+  store: FarmStore,
+  deps: ActivityDailyDeps = realActivityDailyDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.claimPlayerDaily(discordUser.id);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityDaily : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityDaily : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    claimDaily(p);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityDaily(
+  req: Request,
+  res: Response,
+  deps: ActivityDailyDeps = realActivityDailyDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      claimDaily(p);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityDaily(discordUser, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -794,6 +857,10 @@ router.post("/activity/daily", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/daily", (req, res) => {
+  void handleActivityDaily(req, res);
 });
 
 router.post("/activity/quest-claim", async (req, res) => {
