@@ -2,16 +2,18 @@
 // cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
 // Postgres) + LOT ACTIVITY-PG2 (POST /activity/harvest, ecriture cote
 // Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell, POST /activity/buy) +
-// LOT ACTIVITY-PG4 (POST /activity/craft, ecriture cote Postgres). Aucune
-// connexion Neon/Railway, aucune vraie requete vers discord.com :
-// requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
-// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/
-// buyPlayerUpgrade/craftPlayerItem/getPlayer/getGlobalState sont tous
-// injectes via ActivityMeDeps/ActivityPlantDeps/ActivityHarvestDeps/
-// ActivitySellDeps/ActivityBuyDeps/ActivityCraftDeps (meme convention deps
-// que farmPlayerActions.test.ts/presenters.test.ts). Les 5 autres routes
-// Activity (daily/quest-claim/skin/forecast/autoreplant) restent hors
-// scope -- non testees ici, non modifiees dans activity.ts.
+// LOT ACTIVITY-PG4 (POST /activity/craft, POST /activity/daily, POST
+// /activity/quest-claim, ecriture cote Postgres). Aucune connexion Neon/
+// Railway, aucune vraie requete vers discord.com : requireDiscordUser/
+// getFarmStore/shouldUsePostgresRuntime/ensurePlayerExists/
+// plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/buyPlayerUpgrade/
+// craftPlayerItem/claimPlayerDaily/claimPlayerQuest/getPlayer/
+// getGlobalState sont tous injectes via ActivityMeDeps/ActivityPlantDeps/
+// ActivityHarvestDeps/ActivitySellDeps/ActivityBuyDeps/ActivityCraftDeps/
+// ActivityDailyDeps/ActivityQuestClaimDeps (meme convention deps que
+// farmPlayerActions.test.ts/presenters.test.ts). Les 2 autres routes
+// Activity (skin/forecast/autoreplant) restent hors scope -- non testees
+// ici, non modifiees dans activity.ts.
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
@@ -20,6 +22,7 @@ import {
   handleActivityDaily,
   handleActivityHarvest,
   handleActivityPlant,
+  handleActivityQuestClaim,
   handleActivitySell,
   handleGetActivityMe,
   resolveActivityBuy,
@@ -28,6 +31,7 @@ import {
   resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
+  resolveActivityQuestClaim,
   resolveActivitySell,
   type ActivityBuyDeps,
   type ActivityCraftDeps,
@@ -35,12 +39,13 @@ import {
   type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
+  type ActivityQuestClaimDeps,
   type ActivitySellDeps,
   type DiscordUser,
 } from "./activity.ts";
 import { FarmError } from "../discord/farm.ts";
 import type { FarmStore } from "../discord/store";
-import type { GlobalState, InventoryId, PlayerState, ProductId } from "../discord/types";
+import type { GlobalState, InventoryId, PlayerState, ProductId, QuestProgress } from "../discord/types";
 
 const NOW = 1_700_000_000_000;
 const TEST_PLAYER_ID = "v2-test-player-001";
@@ -1531,4 +1536,155 @@ test("POST /activity/daily puis GET /activity/me -- TEST 4 : memes coins des deu
 
   assert.equal(meResult.coins, dailyResult.coins, "GET /activity/me juste apres POST /activity/daily doit refleter EXACTEMENT les memes coins");
   assert.equal(meResult.coins, 246);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG4 -- POST /activity/quest-claim
+// ===========================================================================
+
+function buildQuest(overrides: Partial<QuestProgress> = {}): QuestProgress {
+  return {
+    type: "harvest",
+    label: "Récolter 10 cultures",
+    target: 10,
+    progress: 10,
+    rewardCoins: 50,
+    claimed: false,
+    ...overrides,
+  };
+}
+
+function buildQuestClaimDeps(overrides: Partial<ActivityQuestClaimDeps> = {}): ActivityQuestClaimDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityQuestClaimDeps["ensurePlayerExists"],
+    claimPlayerQuest: mock.fn(async (_playerId: string, _questIndex: number) => 0) as unknown as ActivityQuestClaimDeps["claimPlayerQuest"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityQuestClaimDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityQuestClaimDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeQuestClaimReq(authHeader: string | undefined, body: unknown): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body };
+}
+
+test("POST /activity/quest-claim -- TEST 1 : joueur allowliste -> ensurePlayerExists + claimPlayerQuest + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const claimedQuest = buildQuest({ claimed: true });
+  const rewardedPlayer = buildPlayerState({ coins: 250, quests: [claimedQuest] });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: rewardedPlayer, created: false })) as unknown as ActivityQuestClaimDeps["ensurePlayerExists"];
+  const claimPlayerQuest = mock.fn(async (_playerId: string, _questIndex: number) => 50) as unknown as ActivityQuestClaimDeps["claimPlayerQuest"];
+  const getPlayer = mock.fn(async (_playerId: string) => rewardedPlayer) as unknown as ActivityQuestClaimDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityQuestClaimDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildQuestClaimDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    claimPlayerQuest,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeQuestClaimReq("Bearer real-discord-token", { questIndex: 0 });
+  const res = buildFakeRes();
+
+  await handleActivityQuestClaim(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((claimPlayerQuest as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.deepEqual((claimPlayerQuest as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, 0]);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number; quests: QuestProgress[] }];
+  assert.equal(payload.coins, 250, "les coins doivent refleter l'etat Postgres post-reclamation");
+  assert.equal(payload.quests[0]!.claimed, true);
+});
+
+test("POST /activity/quest-claim -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, claimPlayerQuest (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ coins: 200, quests: [buildQuest()] });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildQuestClaimDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityQuestClaimDeps["ensurePlayerExists"],
+    claimPlayerQuest: mock.fn(async () => {
+      throw new Error("claimPlayerQuest (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityQuestClaimDeps["claimPlayerQuest"],
+  });
+  const req = buildFakeQuestClaimReq("Bearer real-discord-token", { questIndex: 0 });
+  const res = buildFakeRes();
+
+  await handleActivityQuestClaim(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real claimQuest() applique");
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+test("POST /activity/quest-claim -- TEST 3 : joueur allowliste, mission deja reclamee -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildQuestClaimDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    claimPlayerQuest: mock.fn(async () => {
+      throw new FarmError("Cette mission a déjà été récupérée.");
+    }) as unknown as ActivityQuestClaimDeps["claimPlayerQuest"],
+  });
+  const req = buildFakeQuestClaimReq("Bearer real-discord-token", { questIndex: 0 });
+  const res = buildFakeRes();
+
+  await handleActivityQuestClaim(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Cette mission a déjà été récupérée.");
+});
+
+test("POST /activity/quest-claim puis GET /activity/me -- TEST 4 : memes coins et meme etat de quete des deux cotes pour un joueur allowliste", async () => {
+  const pgPlayerState = buildPlayerState({ coins: 200, quests: [buildQuest()] });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityQuestClaimDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityQuestClaimDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const claimPlayerQuest = mock.fn(async (_playerId: string, questIndex: number) => {
+    const quest = pgPlayerState.quests[questIndex]!;
+    quest.claimed = true;
+    pgPlayerState.coins += quest.rewardCoins;
+    return quest.rewardCoins;
+  }) as unknown as ActivityQuestClaimDeps["claimPlayerQuest"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityQuestClaimDeps["ensurePlayerExists"];
+
+  const questResult = await resolveActivityQuestClaim(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    0,
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, claimPlayerQuest, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.coins, questResult.coins, "GET /activity/me juste apres POST /activity/quest-claim doit refleter EXACTEMENT les memes coins");
+  assert.deepEqual(meResult.quests, questResult.quests, "GET /activity/me juste apres POST /activity/quest-claim doit refleter EXACTEMENT le meme etat de quete");
+  assert.equal(meResult.coins, 250);
+  assert.equal(meResult.quests[0]!.claimed, true);
 });

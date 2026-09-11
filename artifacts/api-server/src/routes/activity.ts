@@ -25,6 +25,7 @@ import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/far
 import {
   buyPlayerUpgrade,
   claimPlayerDaily,
+  claimPlayerQuest,
   craftPlayerItem,
   harvestPlayerCrops,
   plantPlayerCrop,
@@ -863,19 +864,76 @@ router.post("/activity/daily", (req, res) => {
   void handleActivityDaily(req, res);
 });
 
-router.post("/activity/quest-claim", async (req, res) => {
+// LOT ACTIVITY-PG4 (quest-claim) -- meme pattern que plant/harvest/sell/
+// buy/craft/daily. claimPlayerQuest() (farmPlayerActions.ts) reutilise
+// claimQuest() de ../farm.ts telle quelle : quete inexistante, deja
+// reclamee ou pas encore terminee levent toutes une FarmError, deja geree
+// par le meme catch FarmError que le chemin JSON ci-dessous.
+//
+// claimPlayerQuest() retourne uniquement le montant de la recompense, pas
+// le player mis a jour -- une relecture explicite via getPlayer() est
+// donc necessaire, exactement comme pour les LOTs precedents.
+export interface ActivityQuestClaimDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  claimPlayerQuest: typeof claimPlayerQuest;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityQuestClaimDeps: ActivityQuestClaimDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  claimPlayerQuest,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityQuestClaim(
+  discordUser: DiscordUser,
+  questIndex: number,
+  store: FarmStore,
+  deps: ActivityQuestClaimDeps = realActivityQuestClaimDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.claimPlayerQuest(discordUser.id, questIndex);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityQuestClaim : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityQuestClaim : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    claimQuest(p, questIndex);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityQuestClaim(
+  req: Request,
+  res: Response,
+  deps: ActivityQuestClaimDeps = realActivityQuestClaimDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
     }
     const questIndex = typeof req.body?.questIndex === "number" ? req.body.questIndex : -1;
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      claimQuest(p, questIndex);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityQuestClaim(discordUser, questIndex, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -886,6 +944,10 @@ router.post("/activity/quest-claim", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/quest-claim", (req, res) => {
+  void handleActivityQuestClaim(req, res);
 });
 
 router.post("/activity/skin", async (req, res) => {
