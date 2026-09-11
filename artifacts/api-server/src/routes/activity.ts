@@ -24,6 +24,7 @@ import {
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
 import {
   buyPlayerUpgrade,
+  buyPlayerWeatherForecast,
   choosePlayerSkin,
   claimPlayerDaily,
   claimPlayerQuest,
@@ -1038,18 +1039,79 @@ router.post("/activity/skin", (req, res) => {
   void handleActivitySkin(req, res);
 });
 
-router.post("/activity/forecast", async (req, res) => {
+// LOT ACTIVITY-PG4 (forecast) -- meme pattern que les LOTs precedents.
+// buyPlayerWeatherForecast() (farmPlayerActions.ts) reutilise
+// buyWeatherForecast() de ../farm.ts telle quelle -- y compris son cout en
+// pieces et sa lecture de global.nextWeatherType, deja tous integres a la
+// primitive elle-meme (voir son commentaire dans farmPlayerActions.ts :
+// elle lit global_state UNE FOIS via getGlobalState(), jamais verrouille
+// ni ecrit). Erreurs metier propagees telles quelles (pieces
+// insuffisantes, prevision deja achetee, global_state introuvable), deja
+// gerees par le meme catch FarmError que le chemin JSON ci-dessous.
+//
+// buyPlayerWeatherForecast() retourne uniquement la prevision achetee, pas
+// le player mis a jour -- une relecture explicite via getPlayer() est
+// donc necessaire, exactement comme pour plant/harvest/sell/buy/craft/
+// daily/quest-claim.
+export interface ActivityForecastDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  buyPlayerWeatherForecast: typeof buyPlayerWeatherForecast;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityForecastDeps: ActivityForecastDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  buyPlayerWeatherForecast,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityForecast(
+  discordUser: DiscordUser,
+  store: FarmStore,
+  deps: ActivityForecastDeps = realActivityForecastDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.buyPlayerWeatherForecast(discordUser.id);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityForecast : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityForecast : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    buyWeatherForecast(p, store.global);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityForecast(
+  req: Request,
+  res: Response,
+  deps: ActivityForecastDeps = realActivityForecastDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      buyWeatherForecast(p, store.global);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityForecast(discordUser, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -1060,6 +1122,10 @@ router.post("/activity/forecast", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/forecast", (req, res) => {
+  void handleActivityForecast(req, res);
 });
 
 router.post("/activity/autoreplant", async (req, res) => {

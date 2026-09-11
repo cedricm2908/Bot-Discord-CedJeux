@@ -20,6 +20,7 @@ import {
   handleActivityBuy,
   handleActivityCraft,
   handleActivityDaily,
+  handleActivityForecast,
   handleActivityHarvest,
   handleActivityPlant,
   handleActivityQuestClaim,
@@ -29,6 +30,7 @@ import {
   resolveActivityBuy,
   resolveActivityCraft,
   resolveActivityDaily,
+  resolveActivityForecast,
   resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
@@ -38,6 +40,7 @@ import {
   type ActivityBuyDeps,
   type ActivityCraftDeps,
   type ActivityDailyDeps,
+  type ActivityForecastDeps,
   type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
@@ -1840,4 +1843,137 @@ test("POST /activity/skin puis GET /activity/me -- TEST 5 : meme theme des deux 
 
   assert.equal(meResult.plotSkin, skinResult.plotSkin, "GET /activity/me juste apres POST /activity/skin doit refleter EXACTEMENT le meme theme");
   assert.equal(meResult.plotSkin, "autumn");
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG4 -- POST /activity/forecast
+// ===========================================================================
+
+function buildForecastDeps(overrides: Partial<ActivityForecastDeps> = {}): ActivityForecastDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityForecastDeps["ensurePlayerExists"],
+    buyPlayerWeatherForecast: mock.fn(async (_playerId: string) => "rain") as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityForecastDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityForecastDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeForecastReq(authHeader: string | undefined): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body: {} };
+}
+
+test("POST /activity/forecast -- TEST 1 : joueur allowliste -> ensurePlayerExists + buyPlayerWeatherForecast + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const forecastPlayer = buildPlayerState({ coins: 150, weatherForecast: "rain" });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: forecastPlayer, created: false })) as unknown as ActivityForecastDeps["ensurePlayerExists"];
+  const buyPlayerWeatherForecast = mock.fn(async (_playerId: string) => "rain") as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"];
+  const getPlayer = mock.fn(async (_playerId: string) => forecastPlayer) as unknown as ActivityForecastDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityForecastDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildForecastDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    buyPlayerWeatherForecast,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeForecastReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityForecast(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((buyPlayerWeatherForecast as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((buyPlayerWeatherForecast as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number }];
+  assert.equal(payload.coins, 150, "les coins doivent refleter l'etat Postgres post-achat");
+});
+
+test("POST /activity/forecast -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, buyPlayerWeatherForecast (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ coins: 200 });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildForecastDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityForecastDeps["ensurePlayerExists"],
+    buyPlayerWeatherForecast: mock.fn(async () => {
+      throw new Error("buyPlayerWeatherForecast (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"],
+  });
+  const req = buildFakeForecastReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityForecast(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real buyWeatherForecast() applique");
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+test("POST /activity/forecast -- TEST 3 : joueur allowliste, pieces insuffisantes -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildForecastDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    buyPlayerWeatherForecast: mock.fn(async () => {
+      throw new FarmError("Il te faut 30 pièces pour une prévision météo.");
+    }) as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"],
+  });
+  const req = buildFakeForecastReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityForecast(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Il te faut 30 pièces pour une prévision météo.");
+});
+
+test("POST /activity/forecast puis GET /activity/me -- TEST 4 : memes coins des deux cotes pour un joueur allowliste", async () => {
+  const pgPlayerState = buildPlayerState({ coins: 200, weatherForecast: null });
+  const pgGlobal = buildGlobalState({ nextWeatherType: "pests" });
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityForecastDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityForecastDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const buyPlayerWeatherForecast = mock.fn(async (_playerId: string) => {
+    pgPlayerState.coins -= 30;
+    pgPlayerState.weatherForecast = pgGlobal.nextWeatherType;
+    return pgGlobal.nextWeatherType;
+  }) as unknown as ActivityForecastDeps["buyPlayerWeatherForecast"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityForecastDeps["ensurePlayerExists"];
+
+  const forecastResult = await resolveActivityForecast(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, buyPlayerWeatherForecast, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.coins, forecastResult.coins, "GET /activity/me juste apres POST /activity/forecast doit refleter EXACTEMENT les memes coins");
+  assert.equal(meResult.coins, 170);
 });
