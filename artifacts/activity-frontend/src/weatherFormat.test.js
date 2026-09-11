@@ -3,7 +3,7 @@
 // mission QA "ameliorer l'interface meteo".
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildWeatherViewModel, formatCountdown, multiplierToEffectLabel } from './weatherFormat.js';
+import { buildWeatherTimelineLabel, buildWeatherViewModel, formatCountdown, multiplierToEffectLabel } from './weatherFormat.js';
 
 const NOW = 1_700_000_000_000;
 
@@ -97,4 +97,72 @@ test('buildWeatherViewModel -- météo active (pluie) avec bonus positif -> curr
   const vm = buildWeatherViewModel(me, NOW);
 
   assert.equal(vm.current.effectLabel, '+25 %');
+});
+
+// ===========================================================================
+// LOT ACTIVITY-UX-WEATHER-TIMELINE -- UN SEUL compte a rebours central
+// (meteo actuelle qui se termine == prochaine meteo qui commence, le MEME
+// instant, jamais deux timers separes).
+// ===========================================================================
+
+test('buildWeatherViewModel -- expose un SEUL champ countdown (pas de countdown distinct par carte, meme instant pour les deux)', () => {
+  const me = buildMe({
+    forecastPurchased: true,
+    forecast: { key: 'rain', label: 'Pluie bénie', emoji: '☔', multiplier: 1.25 },
+  });
+  const vm = buildWeatherViewModel(me, NOW);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(vm, 'countdown'), true);
+  assert.equal(vm.forecast.countdown, undefined, "le sous-objet forecast ne doit jamais porter son propre countdown -- un seul timer, au niveau racine du modele");
+});
+
+test('buildWeatherTimelineLabel -- CAS C : formate le timer central a partir du countdown deja calcule', () => {
+  assert.equal(buildWeatherTimelineLabel('08:42'), 'Changement météo dans 08:42');
+});
+
+test('buildWeatherViewModel + buildWeatherTimelineLabel -- CAS A : forecast verrouille -> meteo actuelle visible, timer central visible, prochaine meteo cachee, UN SEUL countdown rendu', () => {
+  const me = buildMe();
+  const vm = buildWeatherViewModel(me, NOW);
+  const timeline = buildWeatherTimelineLabel(vm.countdown);
+
+  assert.equal(vm.current.label, 'Normal', 'météo actuelle visible');
+  assert.equal(timeline, 'Changement météo dans 08:42', 'timer central visible, calculé une seule fois');
+  assert.equal(vm.forecast, null, 'prochaine météo cachée tant que non achetée');
+});
+
+test('buildWeatherViewModel + buildWeatherTimelineLabel -- CAS B : forecast debloque -> meteo actuelle visible, timer central visible, prochaine meteo visible, aucun deuxieme timer dans le modele de prevision', () => {
+  const me = buildMe({
+    forecastPurchased: true,
+    forecast: { key: 'pests', label: 'Invasion de parasites', emoji: '🐛', multiplier: 0.75 },
+  });
+  const vm = buildWeatherViewModel(me, NOW);
+  const timeline = buildWeatherTimelineLabel(vm.countdown);
+
+  assert.equal(vm.current.label, 'Normal');
+  assert.equal(timeline, 'Changement météo dans 08:42');
+  assert.equal(vm.forecast.label, 'Invasion de parasites', 'prochaine météo visible');
+  assert.equal(Object.keys(vm.forecast).sort().join(','), 'effectLabel,emoji,key,label', "le forecast ne porte AUCUNE cle countdown/arrivee -- le timer central est la seule source, jamais dupliquee dans la carte prevision");
+});
+
+test('buildWeatherTimelineLabel -- CAS D : expiration (countdown deja a 00:00) -> affiche 00:00, aucune simulation locale de changement', () => {
+  const me = buildMe();
+  const vm = buildWeatherViewModel(me, NOW + 10 * 60 * 1000); // "now" 10 min apres nextChangeAt : deja expire
+  const timeline = buildWeatherTimelineLabel(vm.countdown);
+
+  assert.equal(vm.countdown, '00:00');
+  assert.equal(timeline, 'Changement météo dans 00:00');
+  assert.equal(vm.current.key, 'normal', "la meteo COURANTE affichee reste EXACTEMENT celle du payload backend recu -- aucune bascule locale vers la prochaine meteo, meme a 00:00");
+});
+
+test('buildWeatherViewModel -- CAS E : le verrouillage forecast reste strictement identique (forecastPurchased/forecast inchange par ce LOT presentation-only)', () => {
+  const locked = buildWeatherViewModel(buildMe(), NOW);
+  assert.equal(locked.forecastPurchased, false);
+  assert.equal(locked.forecast, null);
+
+  const unlocked = buildWeatherViewModel(
+    buildMe({ forecastPurchased: true, forecast: { key: 'rain', label: 'Pluie bénie', emoji: '☔', multiplier: 1.25 } }),
+    NOW,
+  );
+  assert.equal(unlocked.forecastPurchased, true);
+  assert.ok(unlocked.forecast);
 });

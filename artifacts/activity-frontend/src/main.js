@@ -1,5 +1,5 @@
 import { DiscordSDK, patchUrlMappings } from '@discord/embedded-app-sdk';
-import { buildWeatherViewModel, multiplierToEffectLabel } from './weatherFormat.js';
+import { buildWeatherTimelineLabel, buildWeatherViewModel, multiplierToEffectLabel } from './weatherFormat.js';
 import { clampQuantity, computeCraftPreview, computeMaxCraftable, computeSellPreview } from './quantitySelector.js';
 
 const CLIENT_ID = '1545070811713372262';
@@ -252,23 +252,25 @@ function scheduleRefresh() {
   }, 12000);
 }
 
-// Fait vivre le compte a rebours meteo (parcelle "Changement dans MM:SS")
+// LOT ACTIVITY-UX-WEATHER-TIMELINE -- fait vivre l'UNIQUE compte a rebours
+// central meteo ("Changement météo dans MM:SS", #weatherTimelineCountdown)
 // cote client SANS jamais interroger l'API chaque seconde : ne met a jour
-// QUE le texte des noeuds DOM dedies (#weatherCountdown/#forecastCountdown),
-// jamais un render() complet (qui reconstruirait toute la page a chaque
-// tick). L'etat serveur reel (GET /activity/me, toutes les 12s via
-// scheduleRefresh()) reste la SEULE source de verite -- quand le compte a
-// rebours atteint 00:00, on ne simule JAMAIS localement le changement de
-// meteo : le texte reste a 00:00 jusqu'au prochain refresh reel.
+// QUE ce texte, jamais un render() complet (qui reconstruirait toute la
+// page a chaque tick). La meteo actuelle qui se termine et la prochaine
+// meteo qui commence sont le MEME instant (weather.nextChangeAt) -- donc
+// UN SEUL noeud DOM cible, plus les deux #weatherCountdown/
+// #forecastCountdown dupliques du LOT precedent. L'etat serveur reel
+// (GET /activity/me, toutes les 12s via scheduleRefresh()) reste la SEULE
+// source de verite -- quand le compte a rebours atteint 00:00, on ne
+// simule JAMAIS localement le changement de meteo : le texte reste a
+// 00:00 jusqu'au prochain refresh reel.
 function scheduleWeatherTick() {
   if (weatherTickTimer) clearInterval(weatherTickTimer);
   weatherTickTimer = setInterval(() => {
     if (!currentMe) return;
     const vm = buildWeatherViewModel(currentMe);
-    const currentEl = document.getElementById('weatherCountdown');
-    if (currentEl) currentEl.textContent = `Changement dans ${vm.countdown}`;
-    const forecastEl = document.getElementById('forecastCountdown');
-    if (forecastEl) forecastEl.textContent = `Arrive dans ${vm.countdown}`;
+    const timelineEl = document.getElementById('weatherTimelineCountdown');
+    if (timelineEl) timelineEl.textContent = buildWeatherTimelineLabel(vm.countdown);
   }, 1000);
 }
 
@@ -441,15 +443,30 @@ function challengeHtml(me) {
     </div>`;
 }
 
-// LOT ACTIVITY-UX-WEATHER -- section météo complète : météo actuelle +
-// effet réel + compte à rebours (D. temps restant) ; prévision VERROUILLÉE
-// tant qu'elle n'est pas achetée (aucune fuite du nom/icône/multiplicateur
-// de la prochaine météo -- me.weather.forecast reste `null` côté backend
+// LOT ACTIVITY-UX-WEATHER-TIMELINE -- section météo complète : météo
+// actuelle + effet réel (SANS timer -- déplacé vers le bloc central) ;
+// UN SEUL compte à rebours central entre les deux cartes, représentant le
+// changement météo (la météo actuelle qui se termine et la prochaine qui
+// commence sont le MEME instant, weather.nextChangeAt -- jamais deux
+// timers identiques affichés séparément) ; prévision VERROUILLÉE tant
+// qu'elle n'est pas achetée (aucune fuite du nom/icône/multiplicateur de
+// la prochaine météo -- me.weather.forecast reste `null` côté backend
 // tant que POST /activity/forecast n'a pas été appelé avec succès) puis
-// détaillée après achat ; panneau d'aide repliable listant TOUTES les
-// météos réelles (weatherTypes, dérivé de GET /activity/crops).
+// détaillée après achat, SANS son propre timer non plus ; panneau d'aide
+// repliable listant TOUTES les météos réelles (weatherTypes, dérivé de
+// GET /activity/crops).
 function weatherSectionHtml(me) {
   const vm = buildWeatherViewModel(me);
+
+  // Visible que la prévision soit verrouillée ou débloquée : le joueur
+  // sait TOUJOURS quand la météo va changer, même s'il ignore encore ce
+  // qui arrivera (voir mission section 5).
+  const timelineHtml = `
+    <div class="weather-timeline">
+      <span class="weather-timeline-arrow">↓</span>
+      <span class="weather-timeline-text" id="weatherTimelineCountdown">${buildWeatherTimelineLabel(vm.countdown)}</span>
+      <span class="weather-timeline-arrow">↓</span>
+    </div>`;
 
   const forecastBody = vm.forecastPurchased && vm.forecast
     ? `
@@ -460,7 +477,6 @@ function weatherSectionHtml(me) {
           <span class="weather-name">${vm.forecast.label}</span>
         </div>
         <span class="weather-effect">Rendement prévu : ${vm.forecast.effectLabel}</span>
-        <span class="weather-countdown" id="forecastCountdown">Arrive dans ${vm.countdown}</span>
       </div>`
     : `
       <div class="weather-forecast locked">
@@ -488,8 +504,8 @@ function weatherSectionHtml(me) {
           <span class="weather-name">${vm.current.label}</span>
         </div>
         <span class="weather-effect">Rendement : ${vm.current.effectLabel}</span>
-        <span class="weather-countdown" id="weatherCountdown">Changement dans ${vm.countdown}</span>
       </div>
+      ${timelineHtml}
       ${forecastBody}
       <button class="weather-help-toggle" id="weatherHelpToggle">ⓘ Effets météo ${weatherHelpOpen ? '▲' : '▼'}</button>
       ${helpBody}
@@ -652,7 +668,9 @@ function renderFarm() {
       .weather-emoji{ font-size:1.2rem; }
       .weather-name{ font-size:.85rem; font-weight:700; }
       .weather-effect{ font-size:.76rem; color:var(--harvest); font-family:ui-monospace, monospace; font-weight:600; }
-      .weather-countdown{ font-size:.7rem; color:var(--ink-700); font-family:ui-monospace, monospace; }
+      .weather-timeline{ display:flex; align-items:center; justify-content:center; gap:6px; padding:2px 0; }
+      .weather-timeline-text{ font-size:.7rem; font-weight:600; color:var(--ink-700); font-family:ui-monospace, monospace; text-align:center; }
+      .weather-timeline-arrow{ font-size:.7rem; color:var(--card-line); line-height:1; }
       .weather-forecast{ display:flex; flex-direction:column; gap:4px; border-radius:10px; padding:10px 12px; }
       .weather-forecast.locked{ background:var(--stone-100); }
       .weather-forecast.unlocked{ background:linear-gradient(135deg, var(--stone-100), #e6ddf4); }

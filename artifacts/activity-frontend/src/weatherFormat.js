@@ -59,3 +59,14 @@ export function buildWeatherViewModel(me, now = Date.now()) {
       : null,
   };
 }
+
+// LOT ACTIVITY-UX-WEATHER-TIMELINE -- libelle du compte a rebours CENTRAL
+// et UNIQUE representant le changement meteo (meteo actuelle -> prochaine
+// meteo). buildWeatherViewModel() n'expose deja qu'UN SEUL `countdown`
+// (voir ci-dessus) : la meteo actuelle qui se termine et la prochaine
+// meteo qui commence sont le MEME instant, donc UNE seule chaine de texte
+// -- jamais une par carte (ni dans la carte meteo actuelle, ni dans la
+// carte prevision).
+export function buildWeatherTimelineLabel(countdown) {
+  return `Changement météo dans ${countdown}`;
+}
