@@ -1,22 +1,22 @@
-// Tests de routes/activity.ts -- LOT A (GET /activity/me, lecture seule
-// cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
-// Postgres) + LOT ACTIVITY-PG2 (POST /activity/harvest, ecriture cote
-// Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell, POST /activity/buy) +
-// LOT ACTIVITY-PG4 (POST /activity/craft, POST /activity/daily, POST
-// /activity/quest-claim, ecriture cote Postgres). Aucune connexion Neon/
-// Railway, aucune vraie requete vers discord.com : requireDiscordUser/
-// getFarmStore/shouldUsePostgresRuntime/ensurePlayerExists/
-// plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/buyPlayerUpgrade/
-// craftPlayerItem/claimPlayerDaily/claimPlayerQuest/getPlayer/
-// getGlobalState sont tous injectes via ActivityMeDeps/ActivityPlantDeps/
-// ActivityHarvestDeps/ActivitySellDeps/ActivityBuyDeps/ActivityCraftDeps/
-// ActivityDailyDeps/ActivityQuestClaimDeps (meme convention deps que
-// farmPlayerActions.test.ts/presenters.test.ts). Les 2 autres routes
-// Activity (skin/forecast/autoreplant) restent hors scope -- non testees
-// ici, non modifiees dans activity.ts.
+// Tests de routes/activity.ts -- TOUTES les routes de mutation Activity
+// sont maintenant migrees vers PostgreSQL pour les joueurs allowlistes :
+// LOT A (GET /activity/me, lecture seule) + LOT ACTIVITY-PG1 (plant) +
+// LOT ACTIVITY-PG2 (harvest) + LOT ACTIVITY-PG3 (sell, buy) + LOT
+// ACTIVITY-PG4 (craft, daily, quest-claim, skin, forecast, autoreplant).
+// Aucune connexion Neon/Railway, aucune vraie requete vers discord.com :
+// requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
+// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/
+// buyPlayerUpgrade/craftPlayerItem/claimPlayerDaily/claimPlayerQuest/
+// choosePlayerSkin/buyPlayerWeatherForecast/togglePlayerAutoReplant/
+// getPlayer/getGlobalState sont tous injectes via ActivityMeDeps/
+// ActivityPlantDeps/ActivityHarvestDeps/ActivitySellDeps/ActivityBuyDeps/
+// ActivityCraftDeps/ActivityDailyDeps/ActivityQuestClaimDeps/
+// ActivitySkinDeps/ActivityForecastDeps/ActivityAutoreplantDeps (meme
+// convention deps que farmPlayerActions.test.ts/presenters.test.ts).
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
+  handleActivityAutoreplant,
   handleActivityBuy,
   handleActivityCraft,
   handleActivityDaily,
@@ -27,6 +27,7 @@ import {
   handleActivitySell,
   handleActivitySkin,
   handleGetActivityMe,
+  resolveActivityAutoreplant,
   resolveActivityBuy,
   resolveActivityCraft,
   resolveActivityDaily,
@@ -37,6 +38,7 @@ import {
   resolveActivityQuestClaim,
   resolveActivitySell,
   resolveActivitySkin,
+  type ActivityAutoreplantDeps,
   type ActivityBuyDeps,
   type ActivityCraftDeps,
   type ActivityDailyDeps,
@@ -1976,4 +1978,115 @@ test("POST /activity/forecast puis GET /activity/me -- TEST 4 : memes coins des 
 
   assert.equal(meResult.coins, forecastResult.coins, "GET /activity/me juste apres POST /activity/forecast doit refleter EXACTEMENT les memes coins");
   assert.equal(meResult.coins, 170);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG4 -- POST /activity/autoreplant
+// ===========================================================================
+
+function buildAutoreplantDeps(overrides: Partial<ActivityAutoreplantDeps> = {}): ActivityAutoreplantDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityAutoreplantDeps["ensurePlayerExists"],
+    togglePlayerAutoReplant: mock.fn(async (_playerId: string) => true) as unknown as ActivityAutoreplantDeps["togglePlayerAutoReplant"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityAutoreplantDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityAutoreplantDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeAutoreplantReq(authHeader: string | undefined): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body: {} };
+}
+
+test("POST /activity/autoreplant -- TEST 1 : joueur allowliste -> ensurePlayerExists + togglePlayerAutoReplant + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const toggledPlayer = buildPlayerState({ autoReplant: true });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: toggledPlayer, created: false })) as unknown as ActivityAutoreplantDeps["ensurePlayerExists"];
+  const togglePlayerAutoReplant = mock.fn(async (_playerId: string) => true) as unknown as ActivityAutoreplantDeps["togglePlayerAutoReplant"];
+  const getPlayer = mock.fn(async (_playerId: string) => toggledPlayer) as unknown as ActivityAutoreplantDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityAutoreplantDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildAutoreplantDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    togglePlayerAutoReplant,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeAutoreplantReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityAutoreplant(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((togglePlayerAutoReplant as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((togglePlayerAutoReplant as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ autoReplant: boolean }];
+  assert.equal(payload.autoReplant, true, "le flag doit refleter l'etat Postgres post-bascule");
+});
+
+test("POST /activity/autoreplant -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve (p.autoReplant = !p.autoReplant inline), togglePlayerAutoReplant (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ autoReplant: false });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildAutoreplantDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityAutoreplantDeps["ensurePlayerExists"],
+    togglePlayerAutoReplant: mock.fn(async () => {
+      throw new Error("togglePlayerAutoReplant (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityAutoreplantDeps["togglePlayerAutoReplant"],
+  });
+  const req = buildFakeAutoreplantReq("Bearer real-discord-token");
+  const res = buildFakeRes();
+
+  await handleActivityAutoreplant(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ autoReplant: boolean }];
+  assert.equal(payload.autoReplant, true, "false -> true via le toggle JSON inline inchange");
+});
+
+test("POST /activity/autoreplant puis GET /activity/me -- TEST 3 : meme flag des deux cotes pour un joueur allowliste", async () => {
+  const pgPlayerState = buildPlayerState({ autoReplant: false });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityAutoreplantDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityAutoreplantDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const togglePlayerAutoReplant = mock.fn(async (_playerId: string) => {
+    pgPlayerState.autoReplant = !pgPlayerState.autoReplant;
+    return pgPlayerState.autoReplant;
+  }) as unknown as ActivityAutoreplantDeps["togglePlayerAutoReplant"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityAutoreplantDeps["ensurePlayerExists"];
+
+  const autoreplantResult = await resolveActivityAutoreplant(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, togglePlayerAutoReplant, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.autoReplant, autoreplantResult.autoReplant, "GET /activity/me juste apres POST /activity/autoreplant doit refleter EXACTEMENT le meme flag");
+  assert.equal(meResult.autoReplant, true);
 });

@@ -32,6 +32,7 @@ import {
   harvestPlayerCrops,
   plantPlayerCrop,
   sellPlayerItems,
+  togglePlayerAutoReplant,
 } from "../discord/db/farmPlayerActions.ts";
 import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
@@ -1128,24 +1129,87 @@ router.post("/activity/forecast", (req, res) => {
   void handleActivityForecast(req, res);
 });
 
-router.post("/activity/autoreplant", async (req, res) => {
+// LOT ACTIVITY-PG4 (autoreplant) -- meme pattern que les LOTs precedents.
+// togglePlayerAutoReplant() (farmPlayerActions.ts) reutilise
+// toggleAutoReplant() de ../farm.ts (regle triviale sans cout ni niveau
+// requis -- aucune FarmError possible, d'ou l'absence historique de
+// branche `instanceof FarmError` dans ce handler, conservee telle quelle
+// ci-dessous). Le chemin JSON garde `p.autoReplant = !p.autoReplant`
+// inline EXACTEMENT comme avant -- aucune modification de comportement
+// pour les joueurs non allowlistes.
+//
+// togglePlayerAutoReplant() retourne uniquement le nouveau booleen, pas le
+// player mis a jour -- une relecture explicite via getPlayer() est donc
+// necessaire, exactement comme pour les LOTs precedents.
+export interface ActivityAutoreplantDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  togglePlayerAutoReplant: typeof togglePlayerAutoReplant;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityAutoreplantDeps: ActivityAutoreplantDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  togglePlayerAutoReplant,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityAutoreplant(
+  discordUser: DiscordUser,
+  store: FarmStore,
+  deps: ActivityAutoreplantDeps = realActivityAutoreplantDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.togglePlayerAutoReplant(discordUser.id);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityAutoreplant : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityAutoreplant : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    p.autoReplant = !p.autoReplant;
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityAutoreplant(
+  req: Request,
+  res: Response,
+  deps: ActivityAutoreplantDeps = realActivityAutoreplantDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      p.autoReplant = !p.autoReplant;
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityAutoreplant(discordUser, store, deps));
   } catch (error) {
     res.status(500).json({
       error: "Erreur serveur",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/autoreplant", (req, res) => {
+  void handleActivityAutoreplant(req, res);
 });
 
 export default router;
