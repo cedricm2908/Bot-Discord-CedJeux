@@ -1,20 +1,25 @@
-// Tests de routes/activity.ts -- LOT A (GET /activity/me UNIQUEMENT,
-// lecture seule cote Postgres). Aucune connexion Neon/Railway, aucune
-// vraie requete vers discord.com : requireDiscordUser/getFarmStore/
-// shouldUsePostgresRuntime/ensurePlayerExists/getPlayer/getGlobalState
-// sont tous injectes via ActivityMeDeps (meme convention deps que
-// farmPlayerActions.test.ts/presenters.test.ts). Les 10 autres routes
-// Activity (plant/harvest/sell/buy/craft/daily/quest-claim/skin/forecast/
-// autoreplant) restent hors scope de ce LOT -- non testees ici, non
-// modifiees dans activity.ts.
+// Tests de routes/activity.ts -- LOT A (GET /activity/me, lecture seule
+// cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
+// Postgres). Aucune connexion Neon/Railway, aucune vraie requete vers
+// discord.com : requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
+// ensurePlayerExists/plantPlayerCrop/getPlayer/getGlobalState sont tous
+// injectes via ActivityMeDeps/ActivityPlantDeps (meme convention deps que
+// farmPlayerActions.test.ts/presenters.test.ts). Les 9 autres routes
+// Activity (harvest/sell/buy/craft/daily/quest-claim/skin/forecast/
+// autoreplant) restent hors scope -- non testees ici, non modifiees dans
+// activity.ts.
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
+  handleActivityPlant,
   handleGetActivityMe,
   resolveActivityMe,
+  resolveActivityPlant,
   type ActivityMeDeps,
+  type ActivityPlantDeps,
   type DiscordUser,
 } from "./activity.ts";
+import { FarmError } from "../discord/farm.ts";
 import type { FarmStore } from "../discord/store";
 import type { GlobalState, PlayerState } from "../discord/types";
 
@@ -383,4 +388,187 @@ test("GET /activity/me -- Postgres (allowliste) : AUCUN reset de quetes n'est de
   assert.equal(jsonSave.mock.calls.length, 0, "aucune primitive d'ecriture n'est disponible/appelee dans la branche Postgres de LOT A");
   const [payload] = res.json.mock.calls[0]!.arguments as [{ quests: unknown[] }];
   assert.deepEqual(payload.quests, stalePgPlayer.quests, "le PlayerState Postgres, y compris ses quetes perimees, est retourne SANS mutation -- reset explicitement reserve au LOT B");
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG1 -- POST /activity/plant
+// ===========================================================================
+
+function buildPlantDeps(overrides: Partial<ActivityPlantDeps> = {}): ActivityPlantDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityPlantDeps["ensurePlayerExists"],
+    plantPlayerCrop: mock.fn(async (_playerId: string, _cropId: string, _plot: number | null) => 1) as unknown as ActivityPlantDeps["plantPlayerCrop"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityPlantDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityPlantDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakePlantReq(authHeader: string | undefined, body: unknown): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body };
+}
+
+// ===========================================================================
+// TEST 1 -- joueur allowliste Postgres
+// ===========================================================================
+
+test("POST /activity/plant -- TEST 1 : joueur allowliste -> ensurePlayerExists + plantPlayerCrop + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const plantedPlayer = buildPlayerState({
+    plots: [
+      { cropId: "wheat", plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false },
+      { cropId: "carrot", plantedAt: NOW, notifiedReady: false },
+    ],
+  });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: plantedPlayer, created: false })) as unknown as ActivityPlantDeps["ensurePlayerExists"];
+  const plantPlayerCrop = mock.fn(async (_playerId: string, _cropId: string, _plot: number | null) => 2) as unknown as ActivityPlantDeps["plantPlayerCrop"];
+  const getPlayer = mock.fn(async (_playerId: string) => plantedPlayer) as unknown as ActivityPlantDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityPlantDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildPlantDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    plantPlayerCrop,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakePlantReq("Bearer real-discord-token", { cropId: "carrot", plot: 2 });
+  const res = buildFakeRes();
+
+  await handleActivityPlant(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((plantPlayerCrop as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.deepEqual((plantPlayerCrop as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "carrot", 2]);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.status.mock.calls.length, 0, "pas d'erreur : 200 implicite via res.json");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ plots: { index: number; cropId?: string; empty?: boolean }[] }];
+  assert.equal(payload.plots[1]!.cropId, "carrot", "le plot plante doit apparaitre dans la reponse, refletant l'etat Postgres fraichement relu");
+});
+
+// ===========================================================================
+// TEST 2 -- joueur non allowliste
+// ===========================================================================
+
+test("POST /activity/plant -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, aucune primitive Postgres appelee", async () => {
+  const jsonPlayer = buildPlayerState({
+    plots: [
+      { cropId: "wheat", plantedAt: NOW, notifiedReady: false },
+      { cropId: "carrot", plantedAt: NOW, notifiedReady: false },
+    ],
+  });
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, _mutator: (p: PlayerState) => void) => jsonPlayer);
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildPlantDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityPlantDeps["ensurePlayerExists"],
+    plantPlayerCrop: mock.fn(async () => {
+      throw new Error("plantPlayerCrop (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityPlantDeps["plantPlayerCrop"],
+    getPlayer: mock.fn(async () => {
+      throw new Error("getPlayer (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityPlantDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => {
+      throw new Error("getGlobalState (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityPlantDeps["getGlobalState"],
+  });
+  const req = buildFakePlantReq("Bearer real-discord-token", { cropId: "carrot", plot: 2 });
+  const res = buildFakeRes();
+
+  await handleActivityPlant(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange");
+  assert.equal(jsonMutatePlayer.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ plots: { index: number; cropId?: string; empty?: boolean }[] }];
+  assert.equal(payload.plots[1]!.cropId, "carrot");
+});
+
+// ===========================================================================
+// TEST 3 -- erreur metier (parcelle deja occupee) : meme semantique FarmError
+// ===========================================================================
+
+test("POST /activity/plant -- TEST 3 : plantPlayerCrop (Postgres) rejette avec FarmError -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildPlantDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    plantPlayerCrop: mock.fn(async () => {
+      throw new FarmError("La parcelle 1 est déjà occupée.");
+    }) as unknown as ActivityPlantDeps["plantPlayerCrop"],
+  });
+  const req = buildFakePlantReq("Bearer real-discord-token", { cropId: "wheat", plot: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityPlant(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls.length, 1);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400, "meme statut que le chemin JSON pour une FarmError -- semantique d'erreur inchangee");
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "La parcelle 1 est déjà occupée.");
+});
+
+// ===========================================================================
+// TEST 4 -- coherence read-after-write : POST /plant puis GET /me
+// ===========================================================================
+
+test("POST /activity/plant puis GET /activity/me -- TEST 4 : meme etat de parcelle des deux cotes pour un joueur allowliste (plus de decalage JSON/Postgres)", async () => {
+  // Simule une "table Postgres" en memoire, mutee par le mock
+  // plantPlayerCrop exactement comme le ferait la vraie primitive
+  // (farmPlayerActions.ts -> mutatePlayer -> plant()), puis relue par les
+  // DEUX resolveurs (plant et me) via le meme getPlayer.
+  const pgPlayerState = buildPlayerState({
+    plots: [
+      { cropId: null, plantedAt: null, notifiedReady: false },
+      { cropId: null, plantedAt: null, notifiedReady: false },
+    ],
+  });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityPlantDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityPlantDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const plantPlayerCrop = mock.fn(async (_playerId: string, cropId: string, plotNumber: number | null) => {
+    const index = (plotNumber ?? 1) - 1;
+    pgPlayerState.plots[index] = { cropId: cropId as PlayerState["plots"][number]["cropId"], plantedAt: NOW, notifiedReady: false };
+    return plotNumber ?? 1;
+  }) as unknown as ActivityPlantDeps["plantPlayerCrop"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityPlantDeps["ensurePlayerExists"];
+
+  const plantResult = await resolveActivityPlant(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    "carrot",
+    2,
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, plantPlayerCrop, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.deepEqual(
+    meResult.plots[1],
+    plantResult.plots[1],
+    "GET /activity/me juste apres POST /activity/plant doit refleter EXACTEMENT la meme parcelle plantee -- plus de decalage entre les deux routes",
+  );
+  assert.equal(meResult.plots[1]!.cropId, "carrot");
 });

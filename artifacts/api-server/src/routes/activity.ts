@@ -22,9 +22,10 @@ import {
   xpToNextLevel,
 } from "../discord/farm.ts";
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
+import { plantPlayerCrop } from "../discord/db/farmPlayerActions.ts";
 import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
-import type { CropId, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
+import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
 
 const router: IRouter = Router();
 
@@ -50,7 +51,13 @@ async function requireDiscordUser(
   return (await userResponse.json()) as DiscordUser;
 }
 
-function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: FarmStore) {
+// Ne prend que le GlobalState (jamais un FarmStore complet) : cette
+// fonction ne lit historiquement que `store.global`, jamais aucune autre
+// methode FarmStore (getPlayer/mutatePlayer/save). La signature reflete
+// cette dependance reelle -- cela evite aux appelants Postgres (qui n'ont
+// jamais de FarmStore JSON, seulement un GlobalState lu via
+// getGlobalState()) tout cast "as unknown as FarmStore".
+function buildMePayload(discordUser: DiscordUser, player: PlayerState, global: GlobalState) {
   const now = Date.now();
   return {
     user: { id: discordUser.id, username: discordUser.global_name ?? discordUser.username },
@@ -61,7 +68,7 @@ function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: Fa
     irrigationLevel: player.irrigationLevel,
     fertilizerLevel: player.fertilizerLevel,
     autoReplant: player.autoReplant,
-    inventoryValue: totalInventoryValue(player, store.global),
+    inventoryValue: totalInventoryValue(player, global),
     inventory: Object.fromEntries(
       Object.entries(player.inventory).filter(([, amount]) => (amount ?? 0) > 0),
     ),
@@ -74,12 +81,12 @@ function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: Fa
         percent: growthPercent(player, index, now),
         plantedAt: plot.plantedAt,
         growMinutes: growMinutes(player, plot.cropId),
-        price: currentCropPrice(store.global, plot.cropId),
+        price: currentCropPrice(global, plot.cropId),
       };
     }),
     global: {
-      weather: store.global.weather,
-      marketMultiplier: store.global.marketMultiplier,
+      weather: global.weather,
+      marketMultiplier: global.marketMultiplier,
     },
     totalHarvested: player.totalHarvested,
     quests: player.quests,
@@ -95,12 +102,12 @@ function buildMePayload(discordUser: DiscordUser, player: PlayerState, store: Fa
       unlocked: player.unlockedSkins.includes(id) || player.level >= PLOT_SKINS[id].unlockLevel,
     })),
     dailyChallenge: {
-      cropId: store.global.dailyChallenge.cropId,
-      target: store.global.dailyChallenge.target,
-      progress: store.global.dailyChallenge.progress,
-      rewardCoins: store.global.dailyChallenge.rewardCoins,
-      completed: store.global.dailyChallenge.completed,
-      contributed: store.global.dailyChallenge.contributors.includes(player.userId),
+      cropId: global.dailyChallenge.cropId,
+      target: global.dailyChallenge.target,
+      progress: global.dailyChallenge.progress,
+      rewardCoins: global.dailyChallenge.rewardCoins,
+      completed: global.dailyChallenge.completed,
+      contributed: global.dailyChallenge.contributors.includes(player.userId),
     },
     weatherForecast: player.weatherForecast,
   };
@@ -172,11 +179,11 @@ export async function resolveActivityMe(
     }
     // LOT A = lecture seule : PAS de resetQuestsIfNeeded/mutatePlayer ici,
     // volontairement reserve au LOT B (voir en-tete de section ci-dessus).
-    return buildMePayload(discordUser, player, { global } as unknown as FarmStore);
+    return buildMePayload(discordUser, player, global);
   }
   const player = store.getPlayer(discordUser.id);
   if (resetQuestsIfNeeded(player)) await store.save();
-  return buildMePayload(discordUser, player, store);
+  return buildMePayload(discordUser, player, store.global);
 }
 
 export async function handleGetActivityMe(
@@ -246,9 +253,77 @@ router.get("/activity/crops", (_req, res) => {
   res.json({ crops: CROPS, recipes: RECIPES });
 });
 
-router.post("/activity/plant", async (req, res) => {
+// ===========================================================================
+// LOT ACTIVITY-PG1 -- POST /activity/plant, joueur allowliste UNIQUEMENT.
+// ===========================================================================
+//
+// Meme structure resolveXxx/handleXxx + deps injectables que
+// resolveActivityMe/handleGetActivityMe (LOT A) ci-dessus -- permet de
+// verifier precisement, en test, que store.mutatePlayer (JSON) n'est
+// jamais appele pour un joueur allowliste et inversement.
+//
+// Reutilise plantPlayerCrop() (farmPlayerActions.ts), deja existante et
+// deja testee, exactement la meme primitive que les slash commands
+// Postgres -- AUCUNE regle metier dupliquee/reimplementee ici. Erreur
+// metier (ex. parcelle deja occupee) levee par plant() (farm.ts) a
+// l'interieur de plantPlayerCrop() : remonte telle quelle jusqu'au catch
+// FarmError de handleActivityPlant, identique au chemin JSON -- aucun
+// traitement special.
+export interface ActivityPlantDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  plantPlayerCrop: typeof plantPlayerCrop;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityPlantDeps: ActivityPlantDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  plantPlayerCrop,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityPlant(
+  discordUser: DiscordUser,
+  cropId: CropId,
+  plotNumber: number | null,
+  store: FarmStore,
+  deps: ActivityPlantDeps = realActivityPlantDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.plantPlayerCrop(discordUser.id, cropId, plotNumber);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityPlant : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityPlant : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    plant(p, cropId, plotNumber);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityPlant(
+  req: Request,
+  res: Response,
+  deps: ActivityPlantDeps = realActivityPlantDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
@@ -259,11 +334,8 @@ router.post("/activity/plant", async (req, res) => {
       res.status(400).json({ error: "Culture invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      plant(p, cropId, plotNumber);
-    });
-    res.json(buildMePayload(discordUser, player, store));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityPlant(discordUser, cropId, plotNumber, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -274,6 +346,10 @@ router.post("/activity/plant", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/plant", (req, res) => {
+  void handleActivityPlant(req, res);
 });
 
 router.post("/activity/harvest", async (req, res) => {
@@ -292,7 +368,7 @@ router.post("/activity/harvest", async (req, res) => {
       res.status(400).json({ error: "Aucune parcelle n'est prête pour le moment." });
       return;
     }
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -318,7 +394,7 @@ router.post("/activity/sell", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       sell(p, store.global, itemId, amount);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -348,7 +424,7 @@ router.post("/activity/buy", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       buyUpgrade(p, kind, quantity);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -378,7 +454,7 @@ router.post("/activity/craft", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       craft(p, recipeId, quantity);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -402,7 +478,7 @@ router.post("/activity/daily", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       claimDaily(p);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -427,7 +503,7 @@ router.post("/activity/quest-claim", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       claimQuest(p, questIndex);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -456,7 +532,7 @@ router.post("/activity/skin", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       chooseSkin(p, skinId);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -480,7 +556,7 @@ router.post("/activity/forecast", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       buyWeatherForecast(p, store.global);
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -504,7 +580,7 @@ router.post("/activity/autoreplant", async (req, res) => {
     const player = await store.mutatePlayer(discordUser.id, (p) => {
       p.autoReplant = !p.autoReplant;
     });
-    res.json(buildMePayload(discordUser, player, store));
+    res.json(buildMePayload(discordUser, player, store.global));
   } catch (error) {
     res.status(500).json({
       error: "Erreur serveur",
