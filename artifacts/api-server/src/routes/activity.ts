@@ -22,7 +22,7 @@ import {
   xpToNextLevel,
 } from "../discord/farm.ts";
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
-import { plantPlayerCrop } from "../discord/db/farmPlayerActions.ts";
+import { harvestPlayerCrops, plantPlayerCrop } from "../discord/db/farmPlayerActions.ts";
 import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
 import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
@@ -352,23 +352,110 @@ router.post("/activity/plant", (req, res) => {
   void handleActivityPlant(req, res);
 });
 
-router.post("/activity/harvest", async (req, res) => {
+// ===========================================================================
+// LOT ACTIVITY-PG2 -- POST /activity/harvest, joueur allowliste UNIQUEMENT.
+// ===========================================================================
+//
+// Meme structure resolveXxx/handleXxx + deps injectables que
+// resolveActivityPlant/handleActivityPlant (LOT ACTIVITY-PG1) ci-dessus.
+//
+// Reutilise harvestPlayerCrops() (farmPlayerActions.ts), deja existante et
+// deja testee, exactement la meme primitive que les slash commands
+// Postgres (mutatePlayerAndGlobal, verrouille joueur+global ensemble --
+// necessaire car harvest() mute aussi le defi quotidien). AUCUNE regle
+// metier dupliquee/reimplementee ici -- le calcul de rendement (round
+// final apres multiplicateur meteo) vit exclusivement dans harvest()
+// (farm.ts), inchange.
+//
+// harvestPlayerCrops() retourne { result, global } mais PAS le player mis
+// a jour (mutatePlayerAndGlobal() le retourne, mais harvestPlayerCrops()
+// ne le propage pas) -- une relecture explicite via getPlayer() est donc
+// necessaire, exactement comme demande. Pour rester coherent avec le
+// pattern deja etabli par resolveActivityPlant (une seule source de
+// verite : une relecture fraiche post-ecriture plutot que de reutiliser
+// une valeur de retour partielle), l'etat global est lui aussi relu via
+// getGlobalState() plutot que de reutiliser celui deja renvoye par
+// harvestPlayerCrops().
+//
+// "Aucune parcelle prete" : harvest() (farm.ts) ne leve pas d'erreur dans
+// ce cas (result.harvested reste un tableau vide) -- c'est le HANDLER,
+// cote V1 JSON comme cote Postgres, qui traduit ce cas en 400, IDENTIQUE
+// dans les deux branches (meme message, meme statut).
+export interface ActivityHarvestDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  harvestPlayerCrops: typeof harvestPlayerCrops;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityHarvestDeps: ActivityHarvestDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  harvestPlayerCrops,
+  getPlayer,
+  getGlobalState,
+};
+
+export type ActivityHarvestResult =
+  | { status: 200; payload: ReturnType<typeof buildMePayload> }
+  | { status: 400; error: string };
+
+export async function resolveActivityHarvest(
+  discordUser: DiscordUser,
+  store: FarmStore,
+  deps: ActivityHarvestDeps = realActivityHarvestDeps,
+): Promise<ActivityHarvestResult> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    const { result } = await deps.harvestPlayerCrops(discordUser.id);
+    if (!result.harvested.length) {
+      return { status: 400, error: "Aucune parcelle n'est prête pour le moment." };
+    }
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityHarvest : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityHarvest : global_state introuvable.");
+    }
+    return { status: 200, payload: buildMePayload(discordUser, player, global) };
+  }
+  let result: ReturnType<typeof harvest> | undefined;
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    result = harvest(p, store.global);
+  });
+  if (!result?.harvested.length) {
+    return { status: 400, error: "Aucune parcelle n'est prête pour le moment." };
+  }
+  return { status: 200, payload: buildMePayload(discordUser, player, store.global) };
+}
+
+export async function handleActivityHarvest(
+  req: Request,
+  res: Response,
+  deps: ActivityHarvestDeps = realActivityHarvestDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
     }
-    const store = await getFarmStore();
-    let result: ReturnType<typeof harvest> | undefined;
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      result = harvest(p, store.global);
-    });
-    if (!result?.harvested.length) {
-      res.status(400).json({ error: "Aucune parcelle n'est prête pour le moment." });
+    const store = await deps.getFarmStore();
+    const outcome = await resolveActivityHarvest(discordUser, store, deps);
+    if (outcome.status === 400) {
+      res.status(400).json({ error: outcome.error });
       return;
     }
-    res.json(buildMePayload(discordUser, player, store.global));
+    res.json(outcome.payload);
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -379,6 +466,10 @@ router.post("/activity/harvest", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/harvest", (req, res) => {
+  void handleActivityHarvest(req, res);
 });
 
 router.post("/activity/sell", async (req, res) => {

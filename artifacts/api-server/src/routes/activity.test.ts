@@ -1,20 +1,24 @@
 // Tests de routes/activity.ts -- LOT A (GET /activity/me, lecture seule
 // cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
+// Postgres) + LOT ACTIVITY-PG2 (POST /activity/harvest, ecriture cote
 // Postgres). Aucune connexion Neon/Railway, aucune vraie requete vers
 // discord.com : requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
-// ensurePlayerExists/plantPlayerCrop/getPlayer/getGlobalState sont tous
-// injectes via ActivityMeDeps/ActivityPlantDeps (meme convention deps que
-// farmPlayerActions.test.ts/presenters.test.ts). Les 9 autres routes
-// Activity (harvest/sell/buy/craft/daily/quest-claim/skin/forecast/
-// autoreplant) restent hors scope -- non testees ici, non modifiees dans
-// activity.ts.
+// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/getPlayer/
+// getGlobalState sont tous injectes via ActivityMeDeps/ActivityPlantDeps/
+// ActivityHarvestDeps (meme convention deps que farmPlayerActions.test.ts/
+// presenters.test.ts). Les 8 autres routes Activity (sell/buy/craft/daily/
+// quest-claim/skin/forecast/autoreplant) restent hors scope -- non
+// testees ici, non modifiees dans activity.ts.
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
+  handleActivityHarvest,
   handleActivityPlant,
   handleGetActivityMe,
+  resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
+  type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
   type DiscordUser,
@@ -571,4 +575,196 @@ test("POST /activity/plant puis GET /activity/me -- TEST 4 : meme etat de parcel
     "GET /activity/me juste apres POST /activity/plant doit refleter EXACTEMENT la meme parcelle plantee -- plus de decalage entre les deux routes",
   );
   assert.equal(meResult.plots[1]!.cropId, "carrot");
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG2 -- POST /activity/harvest
+// ===========================================================================
+
+function buildHarvestDeps(overrides: Partial<ActivityHarvestDeps> = {}): ActivityHarvestDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityHarvestDeps["ensurePlayerExists"],
+    harvestPlayerCrops: mock.fn(async (_playerId: string) => ({
+      result: { harvested: [{ cropId: "wheat" as const, amount: 4, xp: 2, replanted: false }], totalXp: 2, leveledUpTo: 1 },
+      global: buildGlobalState(),
+    })) as unknown as ActivityHarvestDeps["harvestPlayerCrops"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityHarvestDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityHarvestDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+// ===========================================================================
+// TEST 1 -- joueur allowliste Postgres
+// ===========================================================================
+
+test("POST /activity/harvest -- TEST 1 : joueur allowliste -> ensurePlayerExists + harvestPlayerCrops + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const harvestedPlayer = buildPlayerState({
+    plots: [
+      { cropId: null, plantedAt: null, notifiedReady: false },
+      { cropId: null, plantedAt: null, notifiedReady: false },
+    ],
+    inventory: { wheat: 9 },
+    xp: 12,
+    totalHarvested: 16,
+  });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: harvestedPlayer, created: false })) as unknown as ActivityHarvestDeps["ensurePlayerExists"];
+  const harvestPlayerCrops = mock.fn(async (_playerId: string) => ({
+    result: { harvested: [{ cropId: "wheat" as const, amount: 4, xp: 2, replanted: false }], totalXp: 2, leveledUpTo: 1 },
+    global: buildGlobalState(),
+  })) as unknown as ActivityHarvestDeps["harvestPlayerCrops"];
+  const getPlayer = mock.fn(async (_playerId: string) => harvestedPlayer) as unknown as ActivityHarvestDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityHarvestDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildHarvestDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    harvestPlayerCrops,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakePlantReq("Bearer real-discord-token", {});
+  const res = buildFakeRes();
+
+  await handleActivityHarvest(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((harvestPlayerCrops as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((harvestPlayerCrops as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.status.mock.calls.length, 0, "pas d'erreur : 200 implicite via res.json");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ plots: { index: number; empty?: boolean }[]; inventory: Record<string, number>; xp: number; totalHarvested: number }];
+  assert.equal(payload.plots[0]!.empty, true, "la parcelle recoltee doit redevenir vide dans la reponse");
+  assert.equal(payload.inventory.wheat, 9, "l'inventaire doit refleter l'etat Postgres post-recolte");
+  assert.equal(payload.xp, 12);
+  assert.equal(payload.totalHarvested, 16);
+});
+
+// ===========================================================================
+// TEST 2 -- joueur non allowliste
+// ===========================================================================
+
+test("POST /activity/harvest -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, harvestPlayerCrops (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ plots: [{ cropId: "wheat", plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false }] });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildHarvestDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityHarvestDeps["ensurePlayerExists"],
+    harvestPlayerCrops: mock.fn(async () => {
+      throw new Error("harvestPlayerCrops (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityHarvestDeps["harvestPlayerCrops"],
+    getPlayer: mock.fn(async () => {
+      throw new Error("getPlayer (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityHarvestDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => {
+      throw new Error("getGlobalState (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityHarvestDeps["getGlobalState"],
+  });
+  const req = buildFakePlantReq("Bearer real-discord-token", {});
+  const res = buildFakeRes();
+
+  await handleActivityHarvest(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real harvest() applique");
+  assert.equal(jsonMutatePlayer.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+// ===========================================================================
+// TEST 3 -- aucune parcelle prete : meme statut/message que le chemin JSON
+// ===========================================================================
+
+test("POST /activity/harvest -- TEST 3 : joueur allowliste, aucune parcelle prete -> 400 avec le MEME message que le chemin JSON, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildHarvestDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    harvestPlayerCrops: mock.fn(async () => ({
+      result: { harvested: [], totalXp: 0, leveledUpTo: 1 },
+      global: buildGlobalState(),
+    })) as unknown as ActivityHarvestDeps["harvestPlayerCrops"],
+  });
+  const req = buildFakePlantReq("Bearer real-discord-token", {});
+  const res = buildFakeRes();
+
+  await handleActivityHarvest(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls.length, 1);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Aucune parcelle n'est prête pour le moment.", "message identique au chemin JSON V1, aucune difference semantique Activity/slash command");
+});
+
+// ===========================================================================
+// TEST 4 -- coherence read-after-write : POST /harvest puis GET /me
+// ===========================================================================
+
+test("POST /activity/harvest puis GET /activity/me -- TEST 4 : meme etat de parcelle/inventaire des deux cotes pour un joueur allowliste", async () => {
+  // Simule une "table Postgres" en memoire, mutee par le mock
+  // harvestPlayerCrops exactement comme le ferait la vraie primitive
+  // (farmPlayerActions.ts -> mutatePlayerAndGlobal -> harvest()), puis
+  // relue par les DEUX resolveurs (harvest et me) via le meme getPlayer.
+  const pgPlayerState = buildPlayerState({
+    plots: [{ cropId: "wheat", plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false }],
+    inventory: {},
+  });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityHarvestDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityHarvestDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const harvestPlayerCrops = mock.fn(async (_playerId: string) => {
+    pgPlayerState.plots[0] = { cropId: null, plantedAt: null, notifiedReady: false };
+    pgPlayerState.inventory.wheat = (pgPlayerState.inventory.wheat ?? 0) + 4;
+    return {
+      result: { harvested: [{ cropId: "wheat" as const, amount: 4, xp: 2, replanted: false }], totalXp: 2, leveledUpTo: 1 },
+      global: pgGlobal,
+    };
+  }) as unknown as ActivityHarvestDeps["harvestPlayerCrops"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityHarvestDeps["ensurePlayerExists"];
+
+  const harvestOutcome = await resolveActivityHarvest(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, harvestPlayerCrops, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+  assert.equal(harvestOutcome.status, 200);
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const harvestPayload = harvestOutcome.status === 200 ? harvestOutcome.payload : null;
+  assert.ok(harvestPayload);
+  assert.deepEqual(
+    meResult.plots[0],
+    harvestPayload.plots[0],
+    "GET /activity/me juste apres POST /activity/harvest doit refleter EXACTEMENT le meme etat de parcelle -- plus de decalage entre les deux routes",
+  );
+  assert.equal(meResult.plots[0]!.empty, true);
+  assert.deepEqual(meResult.inventory, harvestPayload.inventory);
+  assert.equal(meResult.inventory.wheat, 4);
 });
