@@ -24,6 +24,7 @@ import {
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
 import {
   buyPlayerUpgrade,
+  craftPlayerItem,
   harvestPlayerCrops,
   plantPlayerCrop,
   sellPlayerItems,
@@ -678,9 +679,71 @@ router.post("/activity/buy", (req, res) => {
   void handleActivityBuy(req, res);
 });
 
-router.post("/activity/craft", async (req, res) => {
+// LOT ACTIVITY-PG4 (craft) -- meme pattern que plant/harvest/sell/buy.
+// craftPlayerItem() (farmPlayerActions.ts) reutilise craft() de ../farm.ts
+// telle quelle : quantite hors bornes et ingredients insuffisants levent
+// tous une FarmError, deja geree par le meme catch FarmError que le
+// chemin JSON ci-dessous, sans traitement special. La validation de
+// `recipeId` (400 "Recette invalide") reste commune aux deux chemins.
+//
+// craftPlayerItem() retourne uniquement la quantite fabriquee, pas le
+// player mis a jour -- une relecture explicite via getPlayer() est donc
+// necessaire, exactement comme pour plant/harvest/sell/buy.
+export interface ActivityCraftDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  craftPlayerItem: typeof craftPlayerItem;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityCraftDeps: ActivityCraftDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  craftPlayerItem,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityCraft(
+  discordUser: DiscordUser,
+  recipeId: ProductId,
+  quantity: number,
+  store: FarmStore,
+  deps: ActivityCraftDeps = realActivityCraftDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.craftPlayerItem(discordUser.id, recipeId, quantity);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityCraft : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityCraft : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    craft(p, recipeId, quantity);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityCraft(
+  req: Request,
+  res: Response,
+  deps: ActivityCraftDeps = realActivityCraftDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
@@ -691,11 +754,8 @@ router.post("/activity/craft", async (req, res) => {
       res.status(400).json({ error: "Recette invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      craft(p, recipeId, quantity);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityCraft(discordUser, recipeId, quantity, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -706,6 +766,10 @@ router.post("/activity/craft", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/craft", (req, res) => {
+  void handleActivityCraft(req, res);
 });
 
 router.post("/activity/daily", async (req, res) => {

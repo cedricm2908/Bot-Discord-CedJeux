@@ -1,30 +1,34 @@
 // Tests de routes/activity.ts -- LOT A (GET /activity/me, lecture seule
 // cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
 // Postgres) + LOT ACTIVITY-PG2 (POST /activity/harvest, ecriture cote
-// Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell puis POST /activity/buy,
-// ecriture cote Postgres). Aucune connexion Neon/Railway, aucune vraie
-// requete vers discord.com : requireDiscordUser/getFarmStore/
-// shouldUsePostgresRuntime/ensurePlayerExists/plantPlayerCrop/
-// harvestPlayerCrops/sellPlayerItems/buyPlayerUpgrade/getPlayer/
-// getGlobalState sont tous injectes via ActivityMeDeps/ActivityPlantDeps/
-// ActivityHarvestDeps/ActivitySellDeps/ActivityBuyDeps (meme convention
-// deps que farmPlayerActions.test.ts/presenters.test.ts). Les 6 autres
-// routes Activity (craft/daily/quest-claim/skin/forecast/autoreplant)
-// restent hors scope -- non testees ici, non modifiees dans activity.ts.
+// Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell, POST /activity/buy) +
+// LOT ACTIVITY-PG4 (POST /activity/craft, ecriture cote Postgres). Aucune
+// connexion Neon/Railway, aucune vraie requete vers discord.com :
+// requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
+// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/
+// buyPlayerUpgrade/craftPlayerItem/getPlayer/getGlobalState sont tous
+// injectes via ActivityMeDeps/ActivityPlantDeps/ActivityHarvestDeps/
+// ActivitySellDeps/ActivityBuyDeps/ActivityCraftDeps (meme convention deps
+// que farmPlayerActions.test.ts/presenters.test.ts). Les 5 autres routes
+// Activity (daily/quest-claim/skin/forecast/autoreplant) restent hors
+// scope -- non testees ici, non modifiees dans activity.ts.
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
   handleActivityBuy,
+  handleActivityCraft,
   handleActivityHarvest,
   handleActivityPlant,
   handleActivitySell,
   handleGetActivityMe,
   resolveActivityBuy,
+  resolveActivityCraft,
   resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
   resolveActivitySell,
   type ActivityBuyDeps,
+  type ActivityCraftDeps,
   type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
@@ -33,7 +37,7 @@ import {
 } from "./activity.ts";
 import { FarmError } from "../discord/farm.ts";
 import type { FarmStore } from "../discord/store";
-import type { GlobalState, InventoryId, PlayerState } from "../discord/types";
+import type { GlobalState, InventoryId, PlayerState, ProductId } from "../discord/types";
 
 const NOW = 1_700_000_000_000;
 const TEST_PLAYER_ID = "v2-test-player-001";
@@ -1233,4 +1237,161 @@ test("POST /activity/buy puis GET /activity/me -- TEST 6 : memes coins, memes pa
   assert.equal(meResult.fertilizerLevel, buyResult.fertilizerLevel, "meme niveau d'engrais des deux cotes");
   assert.equal(meResult.coins, 300);
   assert.equal(meResult.irrigationLevel, 2);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG4 -- POST /activity/craft
+// ===========================================================================
+
+function buildCraftDeps(overrides: Partial<ActivityCraftDeps> = {}): ActivityCraftDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityCraftDeps["ensurePlayerExists"],
+    craftPlayerItem: mock.fn(async (_playerId: string, _recipeId: ProductId, _quantity: number) => 0) as unknown as ActivityCraftDeps["craftPlayerItem"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityCraftDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityCraftDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeCraftReq(authHeader: string | undefined, body: unknown): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body };
+}
+
+test("POST /activity/craft -- TEST 1 : joueur allowliste -> ensurePlayerExists + craftPlayerItem + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const craftedPlayer = buildPlayerState({ inventory: { wheat: 2, bread: 1 } });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: craftedPlayer, created: false })) as unknown as ActivityCraftDeps["ensurePlayerExists"];
+  const craftPlayerItem = mock.fn(async (_playerId: string, _recipeId: ProductId, _quantity: number) => 1) as unknown as ActivityCraftDeps["craftPlayerItem"];
+  const getPlayer = mock.fn(async (_playerId: string) => craftedPlayer) as unknown as ActivityCraftDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityCraftDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildCraftDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    craftPlayerItem,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeCraftReq("Bearer real-discord-token", { recipeId: "bread", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityCraft(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((craftPlayerItem as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.deepEqual((craftPlayerItem as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "bread", 1]);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ inventory: Record<string, number> }];
+  assert.equal(payload.inventory.bread, 1, "l'inventaire doit refleter l'etat Postgres post-craft");
+  assert.equal(payload.inventory.wheat, 2);
+});
+
+test("POST /activity/craft -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, craftPlayerItem (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ inventory: { wheat: 3 } });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildCraftDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityCraftDeps["ensurePlayerExists"],
+    craftPlayerItem: mock.fn(async () => {
+      throw new Error("craftPlayerItem (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityCraftDeps["craftPlayerItem"],
+  });
+  const req = buildFakeCraftReq("Bearer real-discord-token", { recipeId: "bread", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityCraft(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real craft() applique");
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+test("POST /activity/craft -- TEST 3 : joueur allowliste, craftPlayerItem (Postgres) rejette avec FarmError -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildCraftDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    craftPlayerItem: mock.fn(async () => {
+      throw new FarmError("Tu n'as pas assez de cultures pour cette recette.");
+    }) as unknown as ActivityCraftDeps["craftPlayerItem"],
+  });
+  const req = buildFakeCraftReq("Bearer real-discord-token", { recipeId: "bread", quantity: 5 });
+  const res = buildFakeRes();
+
+  await handleActivityCraft(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Tu n'as pas assez de cultures pour cette recette.");
+});
+
+test("POST /activity/craft -- TEST 4 : recipeId absent -> 400 'Recette invalide', aucune primitive appelee", async () => {
+  const deps = buildCraftDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists ne doit jamais etre appele si recipeId est absent");
+    }) as unknown as ActivityCraftDeps["ensurePlayerExists"],
+    craftPlayerItem: mock.fn(async () => {
+      throw new Error("craftPlayerItem ne doit jamais etre appele si recipeId est absent");
+    }) as unknown as ActivityCraftDeps["craftPlayerItem"],
+  });
+  const req = buildFakeCraftReq("Bearer real-discord-token", {});
+  const res = buildFakeRes();
+
+  await handleActivityCraft(req as never, res as never, deps);
+
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Recette invalide");
+});
+
+test("POST /activity/craft puis GET /activity/me -- TEST 5 : meme inventaire des deux cotes pour un joueur allowliste", async () => {
+  const pgPlayerState = buildPlayerState({ inventory: { wheat: 6 } });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityCraftDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityCraftDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const craftPlayerItem = mock.fn(async (_playerId: string, recipeId: ProductId, quantity: number) => {
+    pgPlayerState.inventory.wheat = (pgPlayerState.inventory.wheat ?? 0) - 3 * quantity;
+    pgPlayerState.inventory[recipeId] = (pgPlayerState.inventory[recipeId] ?? 0) + quantity;
+    return quantity;
+  }) as unknown as ActivityCraftDeps["craftPlayerItem"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityCraftDeps["ensurePlayerExists"];
+
+  const craftResult = await resolveActivityCraft(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    "bread",
+    1,
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, craftPlayerItem, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.deepEqual(meResult.inventory, craftResult.inventory, "GET /activity/me juste apres POST /activity/craft doit refleter EXACTEMENT le meme inventaire");
+  assert.equal(meResult.inventory.wheat, 3);
+  assert.equal(meResult.inventory.bread, 1);
 });
