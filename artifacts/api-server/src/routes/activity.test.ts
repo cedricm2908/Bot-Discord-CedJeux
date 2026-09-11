@@ -1,26 +1,30 @@
 // Tests de routes/activity.ts -- LOT A (GET /activity/me, lecture seule
 // cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
 // Postgres) + LOT ACTIVITY-PG2 (POST /activity/harvest, ecriture cote
-// Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell, ecriture cote
-// Postgres). Aucune connexion Neon/Railway, aucune vraie requete vers
-// discord.com : requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
-// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/
-// getPlayer/getGlobalState sont tous injectes via ActivityMeDeps/
-// ActivityPlantDeps/ActivityHarvestDeps/ActivitySellDeps (meme convention
-// deps que farmPlayerActions.test.ts/presenters.test.ts). Les 7 autres
-// routes Activity (buy/craft/daily/quest-claim/skin/forecast/autoreplant)
+// Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell puis POST /activity/buy,
+// ecriture cote Postgres). Aucune connexion Neon/Railway, aucune vraie
+// requete vers discord.com : requireDiscordUser/getFarmStore/
+// shouldUsePostgresRuntime/ensurePlayerExists/plantPlayerCrop/
+// harvestPlayerCrops/sellPlayerItems/buyPlayerUpgrade/getPlayer/
+// getGlobalState sont tous injectes via ActivityMeDeps/ActivityPlantDeps/
+// ActivityHarvestDeps/ActivitySellDeps/ActivityBuyDeps (meme convention
+// deps que farmPlayerActions.test.ts/presenters.test.ts). Les 6 autres
+// routes Activity (craft/daily/quest-claim/skin/forecast/autoreplant)
 // restent hors scope -- non testees ici, non modifiees dans activity.ts.
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
+  handleActivityBuy,
   handleActivityHarvest,
   handleActivityPlant,
   handleActivitySell,
   handleGetActivityMe,
+  resolveActivityBuy,
   resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
   resolveActivitySell,
+  type ActivityBuyDeps,
   type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
@@ -949,4 +953,284 @@ test("POST /activity/sell puis GET /activity/me -- TEST 4 : memes coins et meme 
   assert.deepEqual(meResult.inventory, sellResult.inventory, "GET /activity/me juste apres POST /activity/sell doit refleter EXACTEMENT le meme inventaire");
   assert.equal(meResult.coins, 245);
   assert.equal(meResult.inventory.wheat, 2);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG3 -- POST /activity/buy
+// ===========================================================================
+
+function buildBuyDeps(overrides: Partial<ActivityBuyDeps> = {}): ActivityBuyDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivityBuyDeps["ensurePlayerExists"],
+    buyPlayerUpgrade: mock.fn(async (_playerId: string, _kind: "plots" | "irrigation" | "fertilizer", _quantity: number) => ({
+      bought: 0,
+      spent: 0,
+    })) as unknown as ActivityBuyDeps["buyPlayerUpgrade"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivityBuyDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivityBuyDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeBuyReq(authHeader: string | undefined, body: unknown): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body };
+}
+
+// ===========================================================================
+// TEST 1 -- achat parcelle Postgres
+// ===========================================================================
+
+test("POST /activity/buy -- TEST 1 : joueur allowliste, kind=plots -> ensurePlayerExists + buyPlayerUpgrade + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const boughtPlayer = buildPlayerState({
+    coins: 80,
+    plots: [
+      { cropId: "wheat", plantedAt: NOW - 10 * 60 * 1000, notifiedReady: false },
+      { cropId: null, plantedAt: null, notifiedReady: false },
+      { cropId: null, plantedAt: null, notifiedReady: false },
+    ],
+  });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: boughtPlayer, created: false })) as unknown as ActivityBuyDeps["ensurePlayerExists"];
+  const buyPlayerUpgrade = mock.fn(async (_playerId: string, _kind: "plots" | "irrigation" | "fertilizer", _quantity: number) => ({
+    bought: 1,
+    spent: 120,
+  })) as unknown as ActivityBuyDeps["buyPlayerUpgrade"];
+  const getPlayer = mock.fn(async (_playerId: string) => boughtPlayer) as unknown as ActivityBuyDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivityBuyDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildBuyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    buyPlayerUpgrade,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeBuyReq("Bearer real-discord-token", { kind: "plots", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityBuy(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((buyPlayerUpgrade as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.deepEqual((buyPlayerUpgrade as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "plots", 1]);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.status.mock.calls.length, 0, "pas d'erreur : 200 implicite via res.json");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number; plots: unknown[] }];
+  assert.equal(payload.coins, 80, "les coins doivent refleter l'etat Postgres post-achat");
+  assert.equal(payload.plots.length, 3, "le nombre de parcelles doit refleter l'etat Postgres post-achat");
+});
+
+// ===========================================================================
+// TEST 2 -- achat irrigation Postgres
+// ===========================================================================
+
+test("POST /activity/buy -- TEST 2 : joueur allowliste, kind=irrigation -> niveau irrigation augmente, coins diminuent, payload a jour", async () => {
+  const boughtPlayer = buildPlayerState({ coins: 0, irrigationLevel: 2 });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: boughtPlayer, created: false })) as unknown as ActivityBuyDeps["ensurePlayerExists"];
+  const buyPlayerUpgrade = mock.fn(async (_playerId: string, _kind: "plots" | "irrigation" | "fertilizer", _quantity: number) => ({
+    bought: 1,
+    spent: 200,
+  })) as unknown as ActivityBuyDeps["buyPlayerUpgrade"];
+  const getPlayer = mock.fn(async (_playerId: string) => boughtPlayer) as unknown as ActivityBuyDeps["getPlayer"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildBuyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    buyPlayerUpgrade,
+    getPlayer,
+  });
+  const req = buildFakeBuyReq("Bearer real-discord-token", { kind: "irrigation", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityBuy(req as never, res as never, deps);
+
+  assert.deepEqual((buyPlayerUpgrade as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "irrigation", 1]);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number; irrigationLevel: number }];
+  assert.equal(payload.coins, 0);
+  assert.equal(payload.irrigationLevel, 2);
+});
+
+// ===========================================================================
+// TEST 3 -- achat engrais Postgres
+// ===========================================================================
+
+test("POST /activity/buy -- TEST 3 : joueur allowliste, kind=fertilizer -> niveau engrais augmente, coins diminuent, payload a jour", async () => {
+  const boughtPlayer = buildPlayerState({ coins: 0, fertilizerLevel: 1 });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: boughtPlayer, created: false })) as unknown as ActivityBuyDeps["ensurePlayerExists"];
+  const buyPlayerUpgrade = mock.fn(async (_playerId: string, _kind: "plots" | "irrigation" | "fertilizer", _quantity: number) => ({
+    bought: 1,
+    spent: 200,
+  })) as unknown as ActivityBuyDeps["buyPlayerUpgrade"];
+  const getPlayer = mock.fn(async (_playerId: string) => boughtPlayer) as unknown as ActivityBuyDeps["getPlayer"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildBuyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    buyPlayerUpgrade,
+    getPlayer,
+  });
+  const req = buildFakeBuyReq("Bearer real-discord-token", { kind: "fertilizer", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityBuy(req as never, res as never, deps);
+
+  assert.deepEqual((buyPlayerUpgrade as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "fertilizer", 1]);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number; fertilizerLevel: number }];
+  assert.equal(payload.coins, 0);
+  assert.equal(payload.fertilizerLevel, 1);
+});
+
+// ===========================================================================
+// TEST 4 -- joueur non allowliste
+// ===========================================================================
+
+test("POST /activity/buy -- TEST 4 : joueur non allowliste -> chemin JSON V1 conserve, buyPlayerUpgrade (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ coins: 200 });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildBuyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityBuyDeps["ensurePlayerExists"],
+    buyPlayerUpgrade: mock.fn(async () => {
+      throw new Error("buyPlayerUpgrade (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityBuyDeps["buyPlayerUpgrade"],
+    getPlayer: mock.fn(async () => {
+      throw new Error("getPlayer (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityBuyDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => {
+      throw new Error("getGlobalState (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivityBuyDeps["getGlobalState"],
+  });
+  const req = buildFakeBuyReq("Bearer real-discord-token", { kind: "plots", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityBuy(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real buyUpgrade() applique");
+  assert.equal(jsonMutatePlayer.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+// ===========================================================================
+// TEST 5 -- achat impossible : meme FarmError
+// ===========================================================================
+
+test("POST /activity/buy -- TEST 5 : joueur allowliste, buyPlayerUpgrade (Postgres) rejette avec FarmError -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildBuyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    buyPlayerUpgrade: mock.fn(async () => {
+      throw new FarmError("Achat impossible : niveau maximum atteint ou pièces insuffisantes.");
+    }) as unknown as ActivityBuyDeps["buyPlayerUpgrade"],
+  });
+  const req = buildFakeBuyReq("Bearer real-discord-token", { kind: "plots", quantity: 1 });
+  const res = buildFakeRes();
+
+  await handleActivityBuy(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls.length, 1);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400, "meme statut que le chemin JSON pour une FarmError -- semantique d'erreur inchangee");
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Achat impossible : niveau maximum atteint ou pièces insuffisantes.");
+});
+
+test("POST /activity/buy -- TEST 5bis : kind absent -> 400 'Amélioration invalide', identique aux deux chemins, aucune primitive appelee", async () => {
+  const deps = buildBuyDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists ne doit jamais etre appele si kind est absent");
+    }) as unknown as ActivityBuyDeps["ensurePlayerExists"],
+    buyPlayerUpgrade: mock.fn(async () => {
+      throw new Error("buyPlayerUpgrade ne doit jamais etre appele si kind est absent");
+    }) as unknown as ActivityBuyDeps["buyPlayerUpgrade"],
+  });
+  const req = buildFakeBuyReq("Bearer real-discord-token", {});
+  const res = buildFakeRes();
+
+  await handleActivityBuy(req as never, res as never, deps);
+
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Amélioration invalide");
+});
+
+// ===========================================================================
+// TEST 6 -- coherence read-after-write : POST /buy puis GET /me
+// ===========================================================================
+
+test("POST /activity/buy puis GET /activity/me -- TEST 6 : memes coins, memes parcelles, meme irrigation et meme engrais des deux cotes pour un joueur allowliste", async () => {
+  // Simule une "table Postgres" en memoire, mutee par le mock
+  // buyPlayerUpgrade exactement comme le ferait la vraie primitive
+  // (farmPlayerActions.ts -> mutatePlayer -> buyUpgrade()), puis relue par
+  // les DEUX resolveurs (buy et me) via le meme getPlayer.
+  const pgPlayerState = buildPlayerState({ coins: 500, irrigationLevel: 1, fertilizerLevel: 0 });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityBuyDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivityBuyDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const buyPlayerUpgrade = mock.fn(async (_playerId: string, kind: "plots" | "irrigation" | "fertilizer", _quantity: number) => {
+    const cost = 200;
+    pgPlayerState.coins -= cost;
+    if (kind === "irrigation") {
+      pgPlayerState.irrigationLevel += 1;
+    } else if (kind === "fertilizer") {
+      pgPlayerState.fertilizerLevel += 1;
+    } else {
+      pgPlayerState.plots.push({ cropId: null, plantedAt: null, notifiedReady: false });
+    }
+    return { bought: 1, spent: cost };
+  }) as unknown as ActivityBuyDeps["buyPlayerUpgrade"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivityBuyDeps["ensurePlayerExists"];
+
+  const buyResult = await resolveActivityBuy(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    "irrigation",
+    1,
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, buyPlayerUpgrade, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.coins, buyResult.coins, "GET /activity/me juste apres POST /activity/buy doit refleter EXACTEMENT les memes coins");
+  assert.equal(meResult.plots.length, buyResult.plots.length, "meme nombre de parcelles des deux cotes");
+  assert.equal(meResult.irrigationLevel, buyResult.irrigationLevel, "meme niveau d'irrigation des deux cotes");
+  assert.equal(meResult.fertilizerLevel, buyResult.fertilizerLevel, "meme niveau d'engrais des deux cotes");
+  assert.equal(meResult.coins, 300);
+  assert.equal(meResult.irrigationLevel, 2);
 });

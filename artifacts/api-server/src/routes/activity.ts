@@ -22,7 +22,12 @@ import {
   xpToNextLevel,
 } from "../discord/farm.ts";
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
-import { harvestPlayerCrops, plantPlayerCrop, sellPlayerItems } from "../discord/db/farmPlayerActions.ts";
+import {
+  buyPlayerUpgrade,
+  harvestPlayerCrops,
+  plantPlayerCrop,
+  sellPlayerItems,
+} from "../discord/db/farmPlayerActions.ts";
 import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
 import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
@@ -577,9 +582,74 @@ router.post("/activity/sell", (req, res) => {
   void handleActivitySell(req, res);
 });
 
-router.post("/activity/buy", async (req, res) => {
+// LOT ACTIVITY-PG3 (buy) -- meme pattern que plant/harvest/sell.
+// buyPlayerUpgrade() (farmPlayerActions.ts) reutilise buyUpgrade() de
+// ../farm.ts telle quelle : quantite hors bornes, niveau maximum atteint
+// et pieces insuffisantes levent tous une FarmError, deja geree par le
+// meme catch FarmError que le chemin JSON ci-dessous, sans traitement
+// special. La validation de `kind` (400 "Amélioration invalide") reste
+// commune aux deux chemins, avant meme de savoir si le joueur est
+// allowliste -- comportement inchange par rapport au handler JSON
+// precedent.
+//
+// buyPlayerUpgrade() retourne { bought, spent } mais PAS le player mis a
+// jour -- une relecture explicite via getPlayer() est donc necessaire,
+// exactement comme pour plant/harvest/sell.
+export interface ActivityBuyDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  buyPlayerUpgrade: typeof buyPlayerUpgrade;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivityBuyDeps: ActivityBuyDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  buyPlayerUpgrade,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivityBuy(
+  discordUser: DiscordUser,
+  kind: "plots" | "irrigation" | "fertilizer",
+  quantity: number,
+  store: FarmStore,
+  deps: ActivityBuyDeps = realActivityBuyDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.buyPlayerUpgrade(discordUser.id, kind, quantity);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivityBuy : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivityBuy : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    buyUpgrade(p, kind, quantity);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivityBuy(
+  req: Request,
+  res: Response,
+  deps: ActivityBuyDeps = realActivityBuyDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
@@ -590,11 +660,8 @@ router.post("/activity/buy", async (req, res) => {
       res.status(400).json({ error: "Amélioration invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      buyUpgrade(p, kind, quantity);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivityBuy(discordUser, kind, quantity, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -605,6 +672,10 @@ router.post("/activity/buy", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/buy", (req, res) => {
+  void handleActivityBuy(req, res);
 });
 
 router.post("/activity/craft", async (req, res) => {
