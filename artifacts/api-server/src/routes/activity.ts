@@ -24,6 +24,7 @@ import {
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
 import {
   buyPlayerUpgrade,
+  choosePlayerSkin,
   claimPlayerDaily,
   claimPlayerQuest,
   craftPlayerItem,
@@ -950,9 +951,66 @@ router.post("/activity/quest-claim", (req, res) => {
   void handleActivityQuestClaim(req, res);
 });
 
-router.post("/activity/skin", async (req, res) => {
+// LOT ACTIVITY-PG4 (skin) -- meme pattern que les LOTs precedents.
+// choosePlayerSkin() (farmPlayerActions.ts) reutilise chooseSkin() de
+// ../farm.ts telle quelle : theme inexistant ou niveau insuffisant levent
+// une FarmError, deja geree par le meme catch FarmError que le chemin
+// JSON ci-dessous. La validation de `skinId` (400 "Thème invalide") reste
+// commune aux deux chemins.
+//
+// A LA DIFFERENCE de plant/harvest/sell/buy/craft/daily/quest-claim,
+// choosePlayerSkin() retourne DEJA le PlayerState complet mis a jour
+// (chooseSkin() ne renvoie rien, donc farmPlayerActions.ts renvoie
+// directement ce que mutatePlayer() a lu/verrouille/ecrit) -- aucune
+// relecture separee via getPlayer() n'est necessaire ni utile ici. Seul
+// global_state est encore relu via getGlobalState(), pour rester coherent
+// avec la forme de buildMePayload().
+export interface ActivitySkinDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  choosePlayerSkin: typeof choosePlayerSkin;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivitySkinDeps: ActivitySkinDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  choosePlayerSkin,
+  getGlobalState,
+};
+
+export async function resolveActivitySkin(
+  discordUser: DiscordUser,
+  skinId: PlotSkinId,
+  store: FarmStore,
+  deps: ActivitySkinDeps = realActivitySkinDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    const player = await deps.choosePlayerSkin(discordUser.id, skinId);
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivitySkin : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    chooseSkin(p, skinId);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivitySkin(
+  req: Request,
+  res: Response,
+  deps: ActivitySkinDeps = realActivitySkinDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
@@ -962,11 +1020,8 @@ router.post("/activity/skin", async (req, res) => {
       res.status(400).json({ error: "Thème invalide" });
       return;
     }
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      chooseSkin(p, skinId);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivitySkin(discordUser, skinId, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -977,6 +1032,10 @@ router.post("/activity/skin", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/skin", (req, res) => {
+  void handleActivitySkin(req, res);
 });
 
 router.post("/activity/forecast", async (req, res) => {

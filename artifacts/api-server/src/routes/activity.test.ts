@@ -24,6 +24,7 @@ import {
   handleActivityPlant,
   handleActivityQuestClaim,
   handleActivitySell,
+  handleActivitySkin,
   handleGetActivityMe,
   resolveActivityBuy,
   resolveActivityCraft,
@@ -33,6 +34,7 @@ import {
   resolveActivityPlant,
   resolveActivityQuestClaim,
   resolveActivitySell,
+  resolveActivitySkin,
   type ActivityBuyDeps,
   type ActivityCraftDeps,
   type ActivityDailyDeps,
@@ -41,11 +43,12 @@ import {
   type ActivityPlantDeps,
   type ActivityQuestClaimDeps,
   type ActivitySellDeps,
+  type ActivitySkinDeps,
   type DiscordUser,
 } from "./activity.ts";
 import { FarmError } from "../discord/farm.ts";
 import type { FarmStore } from "../discord/store";
-import type { GlobalState, InventoryId, PlayerState, ProductId, QuestProgress } from "../discord/types";
+import type { GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId, QuestProgress } from "../discord/types";
 
 const NOW = 1_700_000_000_000;
 const TEST_PLAYER_ID = "v2-test-player-001";
@@ -1687,4 +1690,154 @@ test("POST /activity/quest-claim puis GET /activity/me -- TEST 4 : memes coins e
   assert.deepEqual(meResult.quests, questResult.quests, "GET /activity/me juste apres POST /activity/quest-claim doit refleter EXACTEMENT le meme etat de quete");
   assert.equal(meResult.coins, 250);
   assert.equal(meResult.quests[0]!.claimed, true);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG4 -- POST /activity/skin
+// ===========================================================================
+
+function buildSkinDeps(overrides: Partial<ActivitySkinDeps> = {}): ActivitySkinDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivitySkinDeps["ensurePlayerExists"],
+    choosePlayerSkin: mock.fn(async (_playerId: string, _skinId: PlotSkinId) => buildPlayerState()) as unknown as ActivitySkinDeps["choosePlayerSkin"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivitySkinDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeSkinReq(authHeader: string | undefined, body: unknown): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body };
+}
+
+test("POST /activity/skin -- TEST 1 : joueur allowliste -> ensurePlayerExists + choosePlayerSkin + getGlobalState Postgres (PAS de getPlayer separe, choosePlayerSkin renvoie deja le player), store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const skinnedPlayer = buildPlayerState({ level: 10, plotSkin: "autumn", unlockedSkins: ["classic", "autumn"] });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: skinnedPlayer, created: false })) as unknown as ActivitySkinDeps["ensurePlayerExists"];
+  const choosePlayerSkin = mock.fn(async (_playerId: string, _skinId: PlotSkinId) => skinnedPlayer) as unknown as ActivitySkinDeps["choosePlayerSkin"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivitySkinDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildSkinDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    choosePlayerSkin,
+    getGlobalState,
+  });
+  const req = buildFakeSkinReq("Bearer real-discord-token", { skinId: "autumn" });
+  const res = buildFakeRes();
+
+  await handleActivitySkin(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((choosePlayerSkin as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.deepEqual((choosePlayerSkin as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "autumn"]);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ plotSkin: string }];
+  assert.equal(payload.plotSkin, "autumn", "le theme doit refleter l'etat Postgres post-choix");
+});
+
+test("POST /activity/skin -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, choosePlayerSkin (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ level: 10 });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildSkinDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivitySkinDeps["ensurePlayerExists"],
+    choosePlayerSkin: mock.fn(async () => {
+      throw new Error("choosePlayerSkin (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivitySkinDeps["choosePlayerSkin"],
+  });
+  const req = buildFakeSkinReq("Bearer real-discord-token", { skinId: "autumn" });
+  const res = buildFakeRes();
+
+  await handleActivitySkin(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real chooseSkin() applique");
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+test("POST /activity/skin -- TEST 3 : joueur allowliste, niveau insuffisant -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildSkinDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    choosePlayerSkin: mock.fn(async () => {
+      throw new FarmError("Ce thème se débloque au niveau 8.");
+    }) as unknown as ActivitySkinDeps["choosePlayerSkin"],
+  });
+  const req = buildFakeSkinReq("Bearer real-discord-token", { skinId: "autumn" });
+  const res = buildFakeRes();
+
+  await handleActivitySkin(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Ce thème se débloque au niveau 8.");
+});
+
+test("POST /activity/skin -- TEST 4 : skinId absent -> 400 'Thème invalide', aucune primitive appelee", async () => {
+  const deps = buildSkinDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists ne doit jamais etre appele si skinId est absent");
+    }) as unknown as ActivitySkinDeps["ensurePlayerExists"],
+    choosePlayerSkin: mock.fn(async () => {
+      throw new Error("choosePlayerSkin ne doit jamais etre appele si skinId est absent");
+    }) as unknown as ActivitySkinDeps["choosePlayerSkin"],
+  });
+  const req = buildFakeSkinReq("Bearer real-discord-token", {});
+  const res = buildFakeRes();
+
+  await handleActivitySkin(req as never, res as never, deps);
+
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Thème invalide");
+});
+
+test("POST /activity/skin puis GET /activity/me -- TEST 5 : meme theme des deux cotes pour un joueur allowliste", async () => {
+  const pgPlayerState = buildPlayerState({ level: 10, plotSkin: "classic", unlockedSkins: ["classic"] });
+  const pgGlobal = buildGlobalState();
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivitySkinDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivityMeDeps["getPlayer"];
+  const choosePlayerSkin = mock.fn(async (_playerId: string, skinId: PlotSkinId) => {
+    pgPlayerState.plotSkin = skinId;
+    if (!pgPlayerState.unlockedSkins.includes(skinId)) pgPlayerState.unlockedSkins.push(skinId);
+    return pgPlayerState;
+  }) as unknown as ActivitySkinDeps["choosePlayerSkin"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivitySkinDeps["ensurePlayerExists"];
+
+  const skinResult = await resolveActivitySkin(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    "autumn",
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, choosePlayerSkin, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.plotSkin, skinResult.plotSkin, "GET /activity/me juste apres POST /activity/skin doit refleter EXACTEMENT le meme theme");
+  assert.equal(meResult.plotSkin, "autumn");
 });
