@@ -22,7 +22,7 @@ import {
   xpToNextLevel,
 } from "../discord/farm.ts";
 import { ensurePlayerExists, getGlobalState, getPlayer } from "../discord/db/farmRepository.ts";
-import { harvestPlayerCrops, plantPlayerCrop } from "../discord/db/farmPlayerActions.ts";
+import { harvestPlayerCrops, plantPlayerCrop, sellPlayerItems } from "../discord/db/farmPlayerActions.ts";
 import { shouldUsePostgresRuntime } from "../discord/postgresRuntimeAllowlist.ts";
 import type { FarmStore } from "../discord/store";
 import type { CropId, GlobalState, InventoryId, PlayerState, PlotSkinId, ProductId } from "../discord/types";
@@ -472,20 +472,95 @@ router.post("/activity/harvest", (req, res) => {
   void handleActivityHarvest(req, res);
 });
 
-router.post("/activity/sell", async (req, res) => {
+// ===========================================================================
+// LOT ACTIVITY-PG3 -- POST /activity/sell, joueur allowliste UNIQUEMENT.
+// ===========================================================================
+//
+// Meme structure resolveXxx/handleXxx + deps injectables que
+// resolveActivityPlant/handleActivityPlant (LOT ACTIVITY-PG1) ci-dessus.
+//
+// Reutilise sellPlayerItems() (farmPlayerActions.ts), deja existante et
+// deja testee, exactement la meme primitive que les slash commands
+// Postgres (mutatePlayerAndGlobal, verrouille joueur+global ensemble --
+// necessaire car sell() mute aussi contract.remaining). AUCUNE regle
+// metier dupliquee/reimplementee ici -- prix marche (currentCropPrice/
+// productPrice), bonus de contrat et validations d'inventaire vivent
+// exclusivement dans sell() (farm.ts), inchange.
+//
+// Contrairement a harvestPlayerCrops() ("aucune parcelle prete" = resultat
+// vide, pas une erreur), sell() leve une FarmError explicite pour toute
+// vente invalide (aucune ressource, quantite hors bornes) -- deja geree
+// par le meme catch FarmError que le chemin JSON ci-dessous, sans
+// traitement special.
+//
+// sellPlayerItems() retourne { result, global } mais PAS le player mis a
+// jour -- une relecture explicite via getPlayer() est donc necessaire,
+// exactement comme pour plant/harvest. L'etat global est lui aussi relu
+// via getGlobalState() plutot que de reutiliser celui deja renvoye par
+// sellPlayerItems(), pour rester coherent avec les LOTs precedents.
+export interface ActivitySellDeps {
+  requireDiscordUser: typeof requireDiscordUser;
+  getFarmStore: typeof getFarmStore;
+  shouldUsePostgresRuntime: typeof shouldUsePostgresRuntime;
+  ensurePlayerExists: typeof ensurePlayerExists;
+  sellPlayerItems: typeof sellPlayerItems;
+  getPlayer: typeof getPlayer;
+  getGlobalState: typeof getGlobalState;
+}
+
+const realActivitySellDeps: ActivitySellDeps = {
+  requireDiscordUser,
+  getFarmStore,
+  shouldUsePostgresRuntime,
+  ensurePlayerExists,
+  sellPlayerItems,
+  getPlayer,
+  getGlobalState,
+};
+
+export async function resolveActivitySell(
+  discordUser: DiscordUser,
+  itemId: InventoryId | "all",
+  amount: number | null,
+  store: FarmStore,
+  deps: ActivitySellDeps = realActivitySellDeps,
+): Promise<ReturnType<typeof buildMePayload>> {
+  if (deps.shouldUsePostgresRuntime(discordUser.id)) {
+    await deps.ensurePlayerExists(discordUser.id);
+    await deps.sellPlayerItems(discordUser.id, itemId, amount);
+    const player = await deps.getPlayer(discordUser.id);
+    if (!player) {
+      throw new Error(
+        `resolveActivitySell : joueur "${discordUser.id}" introuvable apres ensurePlayerExists -- etat incoherent.`,
+      );
+    }
+    const global = await deps.getGlobalState();
+    if (!global) {
+      throw new Error("resolveActivitySell : global_state introuvable.");
+    }
+    return buildMePayload(discordUser, player, global);
+  }
+  const player = await store.mutatePlayer(discordUser.id, (p) => {
+    sell(p, store.global, itemId, amount);
+  });
+  return buildMePayload(discordUser, player, store.global);
+}
+
+export async function handleActivitySell(
+  req: Request,
+  res: Response,
+  deps: ActivitySellDeps = realActivitySellDeps,
+): Promise<void> {
   try {
-    const discordUser = await requireDiscordUser(req.headers.authorization);
+    const discordUser = await deps.requireDiscordUser(req.headers.authorization);
     if (!discordUser) {
       res.status(401).json({ error: "Token Discord invalide" });
       return;
     }
     const itemId = (req.body?.itemId as InventoryId | "all" | undefined) ?? "all";
     const amount = typeof req.body?.amount === "number" ? req.body.amount : null;
-    const store = await getFarmStore();
-    const player = await store.mutatePlayer(discordUser.id, (p) => {
-      sell(p, store.global, itemId, amount);
-    });
-    res.json(buildMePayload(discordUser, player, store.global));
+    const store = await deps.getFarmStore();
+    res.json(await resolveActivitySell(discordUser, itemId, amount, store, deps));
   } catch (error) {
     if (error instanceof FarmError) {
       res.status(400).json({ error: error.message });
@@ -496,6 +571,10 @@ router.post("/activity/sell", async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+router.post("/activity/sell", (req, res) => {
+  void handleActivitySell(req, res);
 });
 
 router.post("/activity/buy", async (req, res) => {

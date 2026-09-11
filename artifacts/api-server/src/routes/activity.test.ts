@@ -1,31 +1,35 @@
 // Tests de routes/activity.ts -- LOT A (GET /activity/me, lecture seule
 // cote Postgres) + LOT ACTIVITY-PG1 (POST /activity/plant, ecriture cote
 // Postgres) + LOT ACTIVITY-PG2 (POST /activity/harvest, ecriture cote
+// Postgres) + LOT ACTIVITY-PG3 (POST /activity/sell, ecriture cote
 // Postgres). Aucune connexion Neon/Railway, aucune vraie requete vers
 // discord.com : requireDiscordUser/getFarmStore/shouldUsePostgresRuntime/
-// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/getPlayer/
-// getGlobalState sont tous injectes via ActivityMeDeps/ActivityPlantDeps/
-// ActivityHarvestDeps (meme convention deps que farmPlayerActions.test.ts/
-// presenters.test.ts). Les 8 autres routes Activity (sell/buy/craft/daily/
-// quest-claim/skin/forecast/autoreplant) restent hors scope -- non
-// testees ici, non modifiees dans activity.ts.
+// ensurePlayerExists/plantPlayerCrop/harvestPlayerCrops/sellPlayerItems/
+// getPlayer/getGlobalState sont tous injectes via ActivityMeDeps/
+// ActivityPlantDeps/ActivityHarvestDeps/ActivitySellDeps (meme convention
+// deps que farmPlayerActions.test.ts/presenters.test.ts). Les 7 autres
+// routes Activity (buy/craft/daily/quest-claim/skin/forecast/autoreplant)
+// restent hors scope -- non testees ici, non modifiees dans activity.ts.
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import {
   handleActivityHarvest,
   handleActivityPlant,
+  handleActivitySell,
   handleGetActivityMe,
   resolveActivityHarvest,
   resolveActivityMe,
   resolveActivityPlant,
+  resolveActivitySell,
   type ActivityHarvestDeps,
   type ActivityMeDeps,
   type ActivityPlantDeps,
+  type ActivitySellDeps,
   type DiscordUser,
 } from "./activity.ts";
 import { FarmError } from "../discord/farm.ts";
 import type { FarmStore } from "../discord/store";
-import type { GlobalState, PlayerState } from "../discord/types";
+import type { GlobalState, InventoryId, PlayerState } from "../discord/types";
 
 const NOW = 1_700_000_000_000;
 const TEST_PLAYER_ID = "v2-test-player-001";
@@ -767,4 +771,182 @@ test("POST /activity/harvest puis GET /activity/me -- TEST 4 : meme etat de parc
   assert.equal(meResult.plots[0]!.empty, true);
   assert.deepEqual(meResult.inventory, harvestPayload.inventory);
   assert.equal(meResult.inventory.wheat, 4);
+});
+
+// ===========================================================================
+// LOT ACTIVITY-PG3 -- POST /activity/sell
+// ===========================================================================
+
+function buildSellDeps(overrides: Partial<ActivitySellDeps> = {}): ActivitySellDeps {
+  return {
+    requireDiscordUser: mock.fn(async (_authHeader: string | undefined) => ({ id: TEST_PLAYER_ID, username: "tester" }) as DiscordUser),
+    getFarmStore: mock.fn(async () => buildFakeStore()),
+    shouldUsePostgresRuntime: mock.fn((_playerId: string) => false),
+    ensurePlayerExists: mock.fn(async (_playerId: string) => ({ player: buildPlayerState(), created: false })) as unknown as ActivitySellDeps["ensurePlayerExists"],
+    sellPlayerItems: mock.fn(async (_playerId: string, _itemId: string, _amount: number | null) => ({
+      result: { earned: 0, sold: {} },
+      global: buildGlobalState(),
+    })) as unknown as ActivitySellDeps["sellPlayerItems"],
+    getPlayer: mock.fn(async (_playerId: string) => buildPlayerState()) as unknown as ActivitySellDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => buildGlobalState()) as unknown as ActivitySellDeps["getGlobalState"],
+    ...overrides,
+  };
+}
+
+function buildFakeSellReq(authHeader: string | undefined, body: unknown): { headers: { authorization: string | undefined }; body: unknown } {
+  return { headers: { authorization: authHeader }, body };
+}
+
+// ===========================================================================
+// TEST 1 -- joueur allowliste Postgres
+// ===========================================================================
+
+test("POST /activity/sell -- TEST 1 : joueur allowliste -> ensurePlayerExists + sellPlayerItems + getPlayer + getGlobalState Postgres, store.mutatePlayer (JSON) JAMAIS appele", async () => {
+  const soldPlayer = buildPlayerState({
+    coins: 260,
+    inventory: { wheat: 1 },
+  });
+  const ensurePlayerExists = mock.fn(async (_playerId: string) => ({ player: soldPlayer, created: false })) as unknown as ActivitySellDeps["ensurePlayerExists"];
+  const sellPlayerItems = mock.fn(async (_playerId: string, _itemId: string, _amount: number | null) => ({
+    result: { earned: 60, sold: { wheat: 4 } },
+    global: buildGlobalState(),
+  })) as unknown as ActivitySellDeps["sellPlayerItems"];
+  const getPlayer = mock.fn(async (_playerId: string) => soldPlayer) as unknown as ActivitySellDeps["getPlayer"];
+  const getGlobalState = mock.fn(async () => buildGlobalState()) as unknown as ActivitySellDeps["getGlobalState"];
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele pour un joueur allowliste");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildSellDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists,
+    sellPlayerItems,
+    getPlayer,
+    getGlobalState,
+  });
+  const req = buildFakeSellReq("Bearer real-discord-token", { itemId: "wheat", amount: 4 });
+  const res = buildFakeRes();
+
+  await handleActivitySell(req as never, res as never, deps);
+
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((ensurePlayerExists as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal((sellPlayerItems as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.deepEqual((sellPlayerItems as unknown as ReturnType<typeof mock.fn>).mock.calls[0]!.arguments, [TEST_PLAYER_ID, "wheat", 4]);
+  assert.equal((getPlayer as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal((getGlobalState as unknown as ReturnType<typeof mock.fn>).mock.calls.length, 1);
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0, "store.mutatePlayer (JSON) ne doit jamais etre appele");
+  assert.equal(res.status.mock.calls.length, 0, "pas d'erreur : 200 implicite via res.json");
+  assert.equal(res.json.mock.calls.length, 1);
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ coins: number; inventory: Record<string, number> }];
+  assert.equal(payload.coins, 260, "les coins doivent refleter l'etat Postgres post-vente");
+  assert.equal(payload.inventory.wheat, 1, "l'inventaire doit refleter l'etat Postgres post-vente");
+});
+
+// ===========================================================================
+// TEST 2 -- joueur non allowliste
+// ===========================================================================
+
+test("POST /activity/sell -- TEST 2 : joueur non allowliste -> chemin JSON V1 conserve, sellPlayerItems (Postgres) jamais appele", async () => {
+  const jsonMutatePlayer = mock.fn(async (_playerId: string, mutator: (p: PlayerState) => void) => {
+    const player = buildPlayerState({ coins: 200, inventory: { wheat: 5 } });
+    mutator(player);
+    return player;
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildSellDeps({
+    shouldUsePostgresRuntime: mock.fn(() => false),
+    getFarmStore: mock.fn(async () => store),
+    ensurePlayerExists: mock.fn(async () => {
+      throw new Error("ensurePlayerExists (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivitySellDeps["ensurePlayerExists"],
+    sellPlayerItems: mock.fn(async () => {
+      throw new Error("sellPlayerItems (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivitySellDeps["sellPlayerItems"],
+    getPlayer: mock.fn(async () => {
+      throw new Error("getPlayer (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivitySellDeps["getPlayer"],
+    getGlobalState: mock.fn(async () => {
+      throw new Error("getGlobalState (Postgres) ne doit jamais etre appele pour un joueur non allowliste");
+    }) as unknown as ActivitySellDeps["getGlobalState"],
+  });
+  const req = buildFakeSellReq("Bearer real-discord-token", { itemId: "wheat", amount: 2 });
+  const res = buildFakeRes();
+
+  await handleActivitySell(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 1, "store.mutatePlayer (JSON) doit etre appele -- chemin V1 inchange, real sell() applique");
+  assert.equal(jsonMutatePlayer.mock.calls[0]!.arguments[0], TEST_PLAYER_ID);
+  assert.equal(res.json.mock.calls.length, 1);
+});
+
+// ===========================================================================
+// TEST 3 -- inventaire insuffisant / quantite invalide : meme FarmError
+// ===========================================================================
+
+test("POST /activity/sell -- TEST 3 : joueur allowliste, sellPlayerItems (Postgres) rejette avec FarmError -> 400 avec le meme message, aucun repli JSON", async () => {
+  const jsonMutatePlayer = mock.fn(async () => {
+    throw new Error("store.mutatePlayer (JSON) ne doit jamais etre appele en cas d'erreur Postgres");
+  });
+  const store = { mutatePlayer: jsonMutatePlayer, global: buildGlobalState() } as unknown as FarmStore;
+  const deps = buildSellDeps({
+    shouldUsePostgresRuntime: mock.fn(() => true),
+    getFarmStore: mock.fn(async () => store),
+    sellPlayerItems: mock.fn(async () => {
+      throw new FarmError("Tu n'as aucune ressource de ce type à vendre.");
+    }) as unknown as ActivitySellDeps["sellPlayerItems"],
+  });
+  const req = buildFakeSellReq("Bearer real-discord-token", { itemId: "wheat", amount: 999 });
+  const res = buildFakeRes();
+
+  await handleActivitySell(req as never, res as never, deps);
+
+  assert.equal(jsonMutatePlayer.mock.calls.length, 0);
+  assert.equal(res.status.mock.calls.length, 1);
+  assert.equal(res.status.mock.calls[0]!.arguments[0], 400, "meme statut que le chemin JSON pour une FarmError -- semantique d'erreur inchangee");
+  const [payload] = res.json.mock.calls[0]!.arguments as [{ error: string }];
+  assert.equal(payload.error, "Tu n'as aucune ressource de ce type à vendre.");
+});
+
+// ===========================================================================
+// TEST 4 -- coherence read-after-write : POST /sell puis GET /me
+// ===========================================================================
+
+test("POST /activity/sell puis GET /activity/me -- TEST 4 : memes coins et meme inventaire des deux cotes pour un joueur allowliste", async () => {
+  // Simule une "table Postgres" en memoire, mutee par le mock
+  // sellPlayerItems exactement comme le ferait la vraie primitive
+  // (farmPlayerActions.ts -> mutatePlayerAndGlobal -> sell()), puis relue
+  // par les DEUX resolveurs (sell et me) via le meme getPlayer.
+  const pgPlayerState = buildPlayerState({ coins: 200, inventory: { wheat: 5 } });
+  const pgGlobal = buildGlobalState();
+  const sharedGetPlayer = mock.fn(async (_playerId: string) => pgPlayerState) as unknown as ActivitySellDeps["getPlayer"] & ActivityMeDeps["getPlayer"];
+  const sharedGetGlobalState = mock.fn(async () => pgGlobal) as unknown as ActivitySellDeps["getGlobalState"] & ActivityMeDeps["getGlobalState"];
+  const sellPlayerItems = mock.fn(async (_playerId: string, itemId: InventoryId | "all", amount: number | null) => {
+    const sold = Math.min(amount ?? 0, pgPlayerState.inventory[itemId as InventoryId] ?? 0);
+    pgPlayerState.inventory[itemId as InventoryId] = (pgPlayerState.inventory[itemId as InventoryId] ?? 0) - sold;
+    pgPlayerState.coins += sold * 15;
+    return { result: { earned: sold * 15, sold: { [itemId]: sold } }, global: pgGlobal };
+  }) as unknown as ActivitySellDeps["sellPlayerItems"];
+  const shouldUsePostgresRuntime = mock.fn(() => true);
+  const ensurePlayerExists = mock.fn(async () => ({ player: pgPlayerState, created: false })) as unknown as ActivitySellDeps["ensurePlayerExists"];
+
+  const sellResult = await resolveActivitySell(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    "wheat",
+    3,
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, sellPlayerItems, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  const meResult = await resolveActivityMe(
+    { id: TEST_PLAYER_ID, username: "tester" },
+    buildFakeStore(),
+    { requireDiscordUser: mock.fn(), getFarmStore: mock.fn(), shouldUsePostgresRuntime, ensurePlayerExists, getPlayer: sharedGetPlayer, getGlobalState: sharedGetGlobalState },
+  );
+
+  assert.equal(meResult.coins, sellResult.coins, "GET /activity/me juste apres POST /activity/sell doit refleter EXACTEMENT les memes coins");
+  assert.deepEqual(meResult.inventory, sellResult.inventory, "GET /activity/me juste apres POST /activity/sell doit refleter EXACTEMENT le meme inventaire");
+  assert.equal(meResult.coins, 245);
+  assert.equal(meResult.inventory.wheat, 2);
 });
