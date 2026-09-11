@@ -3,8 +3,9 @@ import cors from "cors";
 import pinoHttp from "pino-http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import router from "./routes";
-import { logger } from "./lib/logger";
+import router from "./routes/index.ts";
+import { logger } from "./lib/logger.ts";
+import { configureActivityStatic } from "./activityStatic.ts";
 
 const app: Express = express();
 
@@ -47,20 +48,13 @@ app.use(express.urlencoded({ extended: true }));
 // répertoire FRÈRE du bundle dist/index.mjs (jamais dedans). Résolu depuis
 // import.meta.url (jamais process.cwd(), instable selon le contexte de
 // lancement) pour fonctionner identiquement en local et sur Railway.
-// Route explicite pour /activity et /activity/ AVANT le middleware static,
-// garantissant zéro redirection 301/302 quel que soit le comportement de
-// express.static pour un chemin sans slash final -- voir l'audit
-// d'architecture Railway-only. Remplace la page de test du LOT A.
+// Logique de routage/cache extraite dans activityStatic.ts (LOT
+// ACTIVITY-CACHE) -- voir ce fichier pour le detail des en-tetes Cache-Control.
 const activityStaticDir = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../dist-static/activity",
 );
-const activityIndexHtmlPath = path.join(activityStaticDir, "index.html");
-
-app.get(["/activity", "/activity/"], (_req, res) => {
-  res.sendFile(activityIndexHtmlPath);
-});
-app.use("/activity", express.static(activityStaticDir, { redirect: false }));
+configureActivityStatic(app, activityStaticDir);
 
 app.use("/api", router);
 
