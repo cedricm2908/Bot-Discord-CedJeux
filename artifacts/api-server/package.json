@@ -18,7 +18,8 @@
     "test:player-global-sell-concurrency": "tsx src/discord/db/testMutatePlayerAndGlobalSellConcurrency.ts",
     "test:weekly-claim-concurrency": "tsx src/discord/db/testWeeklyClaimConcurrency.ts",
     "test:daily-reward-concurrency": "tsx src/discord/db/testDailyChallengeRewardConcurrency.ts",
-    "test:ready-plot-claim": "tsx src/discord/db/testReadyPlotNotificationClaim.ts"
+    "test:ready-plot-claim": "tsx src/discord/db/testReadyPlotNotificationClaim.ts",
+    "migrate-json-players": "tsx src/discord/db/migrateJsonPlayers.ts"
   },
   "dependencies": {
     "@workspace/api-zod": "workspace:*",
